@@ -18,6 +18,21 @@ import { resolveState } from '../services/state-resolution';
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
 const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
 
+/**
+ * Get the request body from either the federation auth middleware buffer
+ * (which already consumed it for signature verification) or from c.req.json()
+ * as a fallback for endpoints not behind federation auth.
+ */
+async function getFederationBody<T = any>(c: any): Promise<T> {
+  // The federation auth middleware stores the parsed body on the context
+  const buffered = c.get('federationBody');
+  if (buffered !== undefined) {
+    return buffered as T;
+  }
+  // Fallback: body wasn't consumed by middleware (e.g., unauthenticated endpoint)
+  return await getFederationBody(c) as T;
+}
+
 const app = new Hono<AppEnv>();
 
 // GET /_matrix/federation/v1/version - Server version info (unauthenticated)
@@ -205,7 +220,7 @@ app.post('/_matrix/key/v2/query', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -495,7 +510,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1210,7 +1225,7 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1364,7 +1379,7 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1448,7 +1463,7 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1630,7 +1645,7 @@ app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1671,7 +1686,7 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1719,7 +1734,7 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1809,7 +1824,7 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -2002,7 +2017,7 @@ app.post('/_matrix/federation/v1/user/keys/query', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -2107,7 +2122,7 @@ app.post('/_matrix/federation/v1/user/keys/claim', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -2422,7 +2437,7 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -2780,7 +2795,7 @@ app.post('/_matrix/federation/v1/publicRooms', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -3194,7 +3209,7 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
