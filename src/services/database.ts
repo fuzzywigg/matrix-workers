@@ -253,12 +253,14 @@ export async function getRoom(db: D1Database, roomId: string): Promise<Room | nu
 
 // Event operations
 export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
-  // Get the next stream ordering
-  const lastOrdering = await db.prepare(
-    `SELECT MAX(stream_ordering) as max_ordering FROM events`
-  ).first<{ max_ordering: number | null }>();
+  // Atomically allocate the next stream ordering using UPDATE...RETURNING.
+  // This avoids the race condition where two concurrent calls both read
+  // MAX(stream_ordering) and generate the same value.
+  const posResult = await db.prepare(
+    `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
+  ).first<{ position: number }>();
 
-  const streamOrdering = (lastOrdering?.max_ordering ?? 0) + 1;
+  const streamOrdering = posResult?.position ?? 1;
 
   await db.prepare(
     `INSERT INTO events (event_id, room_id, sender, event_type, state_key, content,
