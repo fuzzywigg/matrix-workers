@@ -583,13 +583,17 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           if (signatureValid) break;
         }
 
-        if (!signatureValid && pduOrigin !== origin) {
-          // PDU from third party without valid signature
-          pduResults[eventId] = { error: 'Invalid signature' };
+        if (!signatureValid) {
+          // Reject ALL PDUs with invalid signatures, regardless of origin.
+          // A PDU from the sending server's own origin must still be properly signed.
+          const reason = pduOrigin !== origin
+            ? 'Third-party PDU without valid signature'
+            : 'PDU from origin server without valid signature';
+          pduResults[eventId] = { error: reason };
           await c.env.DB.prepare(
             `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
              VALUES (?, ?, ?, ?, 0, ?)`
-          ).bind(eventId, pduOrigin, roomId, Date.now(), 'Invalid signature').run();
+          ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
           continue;
         }
       }
@@ -1085,11 +1089,13 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
   }
 
   // Build auth chain by recursively collecting auth events
+  // Cap at 500 events to prevent unbounded memory consumption
+  const MAX_AUTH_CHAIN_SIZE = 500;
   const authChain: PDU[] = [];
   const visited = new Set<string>();
   const toProcess = JSON.parse(event.auth_events) as string[];
 
-  while (toProcess.length > 0) {
+  while (toProcess.length > 0 && authChain.length < MAX_AUTH_CHAIN_SIZE) {
     const authId = toProcess.shift()!;
     if (visited.has(authId)) continue;
     visited.add(authId);
@@ -1147,7 +1153,8 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
 // GET /_matrix/federation/v1/backfill/:roomId - Fetch historical events
 app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
-  const limit = Math.min(parseInt(c.req.query('limit') || '100', 10), 1000);
+  const rawLimit = parseInt(c.req.query('limit') || '100', 10);
+  const limit = Math.max(1, Math.min(isNaN(rawLimit) ? 100 : rawLimit, 1000));
   const vParam = c.req.query('v'); // Starting event IDs
 
   // Verify room exists
@@ -1159,8 +1166,19 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Parse starting event IDs
-  const startEventIds = vParam ? vParam.split(',') : [];
+  // Verify the requesting server has membership in this room
+  const origin = (c as any).get('federationOrigin');
+  if (origin) {
+    const hasMember = await c.env.DB.prepare(
+      `SELECT 1 FROM room_memberships WHERE room_id = ? AND user_id LIKE ? AND membership = 'join' LIMIT 1`
+    ).bind(roomId, `%:${origin}`).first();
+    if (!hasMember) {
+      return c.json({ errcode: 'M_FORBIDDEN', error: 'Requesting server has no users in this room' }, 403);
+    }
+  }
+
+  // Parse starting event IDs (cap at 20 to prevent oversized IN queries)
+  const startEventIds = vParam ? vParam.split(',').slice(0, 20) : [];
 
   let events: any[];
   if (startEventIds.length > 0) {
@@ -1230,8 +1248,8 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  const earliestEvents = body.earliest_events || [];
-  const latestEvents = body.latest_events || [];
+  const earliestEvents = (body.earliest_events || []).slice(0, 20);
+  const latestEvents = (body.latest_events || []).slice(0, 20);
   const limit = Math.min(body.limit || 10, 100);
   const minDepth = body.min_depth || 0;
 
@@ -1242,6 +1260,17 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
+  }
+
+  // Verify the requesting server has membership in this room
+  const missingEventsOrigin = (c as any).get('federationOrigin');
+  if (missingEventsOrigin) {
+    const hasMember = await c.env.DB.prepare(
+      `SELECT 1 FROM room_memberships WHERE room_id = ? AND user_id LIKE ? AND membership = 'join' LIMIT 1`
+    ).bind(roomId, `%:${missingEventsOrigin}`).first();
+    if (!hasMember) {
+      return c.json({ errcode: 'M_FORBIDDEN', error: 'Requesting server has no users in this room' }, 403);
+    }
   }
 
   // Walk backwards from latest_events to earliest_events
@@ -1757,6 +1786,16 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
+  // Validate the sender belongs to the authenticated origin server
+  const inviteOrigin = (c as any).get('federationOrigin');
+  const senderServer = inviteEvent.sender?.split(':')[1];
+  if (inviteOrigin && senderServer && senderServer !== inviteOrigin) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'Sender does not belong to the authenticated origin server' },
+      403
+    );
+  }
+
   // Validate the invite is for a local user
   const stateKey = inviteEvent.state_key;
   if (!stateKey || !stateKey.includes(':')) {
@@ -1861,6 +1900,16 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
       400
+    );
+  }
+
+  // Validate the sender belongs to the authenticated origin server
+  const v2InviteOrigin = (c as any).get('federationOrigin');
+  const v2SenderServer = inviteEvent.sender?.split(':')[1];
+  if (v2InviteOrigin && v2SenderServer && v2SenderServer !== v2InviteOrigin) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'Sender does not belong to the authenticated origin server' },
+      403
     );
   }
 
