@@ -323,6 +323,24 @@ export async function verifyContentHash(
   return actualHash === expectedHash;
 }
 
+// Validate password strength. Returns null if valid, or an error message.
+export function validatePasswordStrength(password: string): string | null {
+  if (!password || password.length < 8) {
+    return 'Password must be at least 8 characters long';
+  }
+  if (password.length > 1000) {
+    return 'Password must be at most 1000 characters long';
+  }
+  // Check for at least one letter and one number/symbol for basic complexity
+  if (!/[a-zA-Z]/.test(password)) {
+    return 'Password must contain at least one letter';
+  }
+  if (!/[0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) {
+    return 'Password must contain at least one number or special character';
+  }
+  return null;
+}
+
 // Generate a random string for CSRF tokens, etc.
 export function generateRandomString(length: number = 32): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';

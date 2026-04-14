@@ -946,9 +946,13 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
   }
 
-  // Process room subscriptions
+  // Process room subscriptions (capped to prevent DoS via oversized requests)
   if (body.room_subscriptions) {
-    for (const [roomId, subscription] of Object.entries(body.room_subscriptions)) {
+    const subscriptionEntries = Object.entries(body.room_subscriptions);
+    if (subscriptionEntries.length > 100) {
+      return c.json({ errcode: 'M_TOO_LARGE', error: 'Too many room subscriptions (max 100 per request)' }, 400);
+    }
+    for (const [roomId, subscription] of subscriptionEntries) {
       // Check if user has access to this room
       const membershipResult = await db.prepare(`
         SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
@@ -1619,9 +1623,13 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     }
   }
 
-  // Process room subscriptions
+  // Process room subscriptions (capped to prevent DoS)
   if (body.room_subscriptions) {
-    for (const [roomId, subscription] of Object.entries(body.room_subscriptions)) {
+    const msc4186Entries = Object.entries(body.room_subscriptions);
+    if (msc4186Entries.length > 100) {
+      return c.json({ errcode: 'M_TOO_LARGE', error: 'Too many room subscriptions (max 100 per request)' }, 400);
+    }
+    for (const [roomId, subscription] of msc4186Entries) {
       const membershipResult = await db.prepare(`
         SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
       `).bind(roomId, userId).first() as { membership: string } | null;
