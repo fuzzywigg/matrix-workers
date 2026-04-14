@@ -820,7 +820,9 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   const CACHED_STATE_TYPES = ['m.room.name', 'm.room.avatar', 'm.room.topic', 'm.room.canonical_alias', 'm.room.member'];
   if (CACHED_STATE_TYPES.includes(eventType)) {
     // Non-blocking cache invalidation
-    invalidateRoomCache(c.env.CACHE, roomId).catch(() => {});
+    invalidateRoomCache(c.env.CACHE, roomId).catch((err) => {
+      console.warn(`[rooms] Cache invalidation failed for room ${roomId}:`, err);
+    });
   }
 
   // Update membership table if this is a membership event
