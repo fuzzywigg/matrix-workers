@@ -1442,9 +1442,10 @@ app.post('/admin/api/idp/providers', requireAuth(), requireAdmin, async (c) => {
   try {
     await fetchOIDCDiscovery(issuer_url);
   } catch (err) {
+    console.error('[admin] OIDC discovery fetch failed:', err);
     return c.json({
       errcode: 'M_INVALID_PARAM',
-      error: `Failed to fetch OIDC discovery from issuer: ${err}`,
+      error: 'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.',
     }, 400);
   }
 
@@ -1552,9 +1553,10 @@ app.put('/admin/api/idp/providers/:id', requireAuth(), requireAdmin, async (c) =
     try {
       await fetchOIDCDiscovery(body.issuer_url);
     } catch (err) {
+      console.error('[admin] OIDC discovery fetch failed on update:', err);
       return c.json({
         errcode: 'M_INVALID_PARAM',
-        error: `Failed to fetch OIDC discovery from issuer: ${err}`,
+        error: 'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.',
       }, 400);
     }
     updates.push('issuer_url = ?');
