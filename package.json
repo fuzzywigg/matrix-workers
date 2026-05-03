@@ -15,7 +15,7 @@
   "dependencies": {
     "@cloudflare/workers-types": "^4.20241127.0",
     "hono": "^4.6.0",
-    "uuid": "^10.0.0"
+    "uuid": "^14.0.0"
   },
   "devDependencies": {
     "@types/uuid": "^10.0.0",
