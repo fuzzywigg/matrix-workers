@@ -79,7 +79,7 @@ export class FederationDurableObject extends DurableObject<Env> {
     };
 
     // Check queue size to prevent unbounded growth when remote server is down
-    const allQueueKeys = await this.ctx.storage.list({ prefix: `queue:${data.destination}:` });
+    const allQueueKeys = await this.ctx.storage.list({ prefix: `queue:${data.destination}:`, limit: 10000 });
     if (allQueueKeys.size >= 10000) {
       console.warn(`[federation] Queue for ${data.destination} full (${allQueueKeys.size} events), rejecting`);
       return new Response(JSON.stringify({

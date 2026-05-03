@@ -30,7 +30,7 @@ async function getFederationBody<T = any>(c: any): Promise<T> {
     return buffered as T;
   }
   // Fallback: body wasn't consumed by middleware (e.g., unauthenticated endpoint)
-  return await getFederationBody(c) as T;
+  return await c.req.json() as T;
 }
 
 const app = new Hono<AppEnv>();
@@ -1170,8 +1170,8 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
   const origin = (c as any).get('federationOrigin');
   if (origin) {
     const hasMember = await c.env.DB.prepare(
-      `SELECT 1 FROM room_memberships WHERE room_id = ? AND user_id LIKE ? AND membership = 'join' LIMIT 1`
-    ).bind(roomId, `%:${origin}`).first();
+      `SELECT 1 FROM room_memberships WHERE room_id = ? AND SUBSTR(user_id, INSTR(user_id, ':') + 1) = ? AND membership = 'join' LIMIT 1`
+    ).bind(roomId, origin).first();
     if (!hasMember) {
       return c.json({ errcode: 'M_FORBIDDEN', error: 'Requesting server has no users in this room' }, 403);
     }
@@ -1266,8 +1266,8 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
   const missingEventsOrigin = (c as any).get('federationOrigin');
   if (missingEventsOrigin) {
     const hasMember = await c.env.DB.prepare(
-      `SELECT 1 FROM room_memberships WHERE room_id = ? AND user_id LIKE ? AND membership = 'join' LIMIT 1`
-    ).bind(roomId, `%:${missingEventsOrigin}`).first();
+      `SELECT 1 FROM room_memberships WHERE room_id = ? AND SUBSTR(user_id, INSTR(user_id, ':') + 1) = ? AND membership = 'join' LIMIT 1`
+    ).bind(roomId, missingEventsOrigin).first();
     if (!hasMember) {
       return c.json({ errcode: 'M_FORBIDDEN', error: 'Requesting server has no users in this room' }, 403);
     }
