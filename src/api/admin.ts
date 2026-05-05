@@ -132,8 +132,8 @@ app.get('/admin/api/stats/history', requireAuth(), requireAdmin, async (c) => {
 // GET /admin/api/users - List all users
 app.get('/admin/api/users', requireAuth(), requireAdmin, async (c) => {
   const db = c.env.DB;
-  const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
-  const offset = parseInt(c.req.query('offset') || '0');
+  const limit = Math.max(1, Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 100));
+  const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10) || 0);
   const search = c.req.query('search');
 
   let query = `
@@ -300,8 +300,8 @@ app.post('/admin/api/users/:userId/reset-password', requireAuth(), requireAdmin,
 // GET /admin/api/rooms - List all rooms
 app.get('/admin/api/rooms', requireAuth(), requireAdmin, async (c) => {
   const db = c.env.DB;
-  const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
-  const offset = parseInt(c.req.query('offset') || '0');
+  const limit = Math.max(1, Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 100));
+  const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10) || 0);
 
   const rooms = await db.prepare(`
     SELECT r.room_id, r.room_version, r.is_public, r.creator_id, r.created_at,
@@ -577,8 +577,8 @@ app.get('/admin/api/federation/servers', requireAuth(), requireAdmin, async (c) 
 // GET /admin/api/media - List media files
 app.get('/admin/api/media', requireAuth(), requireAdmin, async (c) => {
   const db = c.env.DB;
-  const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
-  const offset = parseInt(c.req.query('offset') || '0');
+  const limit = Math.max(1, Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 100));
+  const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10) || 0);
 
   const media = await db.prepare(`
     SELECT media_id, user_id, content_type, content_length, filename, created_at, quarantined
@@ -1111,8 +1111,8 @@ app.get('/admin/api/rooms/:roomId/events', requireAuth(), requireAdmin, async (c
 // GET /admin/api/reports - Get content reports (proxy to existing endpoint format)
 app.get('/admin/api/reports', requireAuth(), requireAdmin, async (c) => {
   const db = c.env.DB;
-  const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
-  const offset = parseInt(c.req.query('offset') || '0');
+  const limit = Math.max(1, Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 100));
+  const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10) || 0);
   const resolved = c.req.query('resolved');
 
   let query = `
@@ -1442,9 +1442,10 @@ app.post('/admin/api/idp/providers', requireAuth(), requireAdmin, async (c) => {
   try {
     await fetchOIDCDiscovery(issuer_url);
   } catch (err) {
+    console.error('[admin] OIDC discovery fetch failed:', err);
     return c.json({
       errcode: 'M_INVALID_PARAM',
-      error: `Failed to fetch OIDC discovery from issuer: ${err}`,
+      error: 'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.',
     }, 400);
   }
 
@@ -1552,9 +1553,10 @@ app.put('/admin/api/idp/providers/:id', requireAuth(), requireAdmin, async (c) =
     try {
       await fetchOIDCDiscovery(body.issuer_url);
     } catch (err) {
+      console.error('[admin] OIDC discovery fetch failed on update:', err);
       return c.json({
         errcode: 'M_INVALID_PARAM',
-        error: `Failed to fetch OIDC discovery from issuer: ${err}`,
+        error: 'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.',
       }, 400);
     }
     updates.push('issuer_url = ?');

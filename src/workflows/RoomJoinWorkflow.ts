@@ -17,6 +17,7 @@ import {
   getRoomEvents,
   getMembership,
 } from '../services/database';
+import { federationGet, federationPut } from '../services/federation-keys';
 
 // Parameters passed when triggering the workflow
 export interface JoinParams {
@@ -140,7 +141,7 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     }
   }
 
-  // Make a make_join request to a remote server
+  // Make an authenticated make_join request to a remote server
   private async makeJoinRequest(
     remoteServer: string,
     roomId: string,
@@ -148,14 +149,15 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   ): Promise<{ room_version: string; event: any }> {
     console.log('[RoomJoinWorkflow] Making make_join request', { remoteServer, roomId, userId });
 
-    const url = `https://${remoteServer}/_matrix/federation/v1/make_join/${encodeURIComponent(roomId)}/${encodeURIComponent(userId)}`;
+    const path = `/_matrix/federation/v1/make_join/${encodeURIComponent(roomId)}/${encodeURIComponent(userId)}`;
 
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    });
+    const response = await federationGet(
+      remoteServer,
+      path,
+      this.env.SERVER_NAME,
+      this.env.DB,
+      this.env.CACHE
+    );
 
     if (!response.ok) {
       const error = await response.text();
@@ -235,7 +237,7 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     return event;
   }
 
-  // Send a send_join request to a remote server
+  // Send an authenticated send_join request to a remote server
   private async sendJoinRequest(
     remoteServer: string,
     roomId: string,
@@ -243,15 +245,16 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   ): Promise<any> {
     console.log('[RoomJoinWorkflow] Sending send_join request', { remoteServer, roomId, eventId: joinEvent.event_id });
 
-    const url = `https://${remoteServer}/_matrix/federation/v1/send_join/${encodeURIComponent(roomId)}/${encodeURIComponent(joinEvent.event_id)}`;
+    const path = `/_matrix/federation/v1/send_join/${encodeURIComponent(roomId)}/${encodeURIComponent(joinEvent.event_id)}`;
 
-    const response = await fetch(url, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(joinEvent),
-    });
+    const response = await federationPut(
+      remoteServer,
+      path,
+      joinEvent,
+      this.env.SERVER_NAME,
+      this.env.DB,
+      this.env.CACHE
+    );
 
     if (!response.ok) {
       const error = await response.text();

@@ -288,7 +288,9 @@ export class SyncDurableObject extends DurableObject<Env> {
 
   private async getPendingEvents(since: number): Promise<PendingEvent[]> {
     const events: PendingEvent[] = [];
-    const allKeys = await this.ctx.storage.list({ prefix: 'event:' });
+    // Limit the storage scan to prevent memory exhaustion on DOs
+    // that have accumulated many undelivered events
+    const allKeys = await this.ctx.storage.list({ prefix: 'event:', limit: 1000 });
 
     for (const [, value] of allKeys) {
       const event = value as PendingEvent;
@@ -346,15 +348,30 @@ export class SyncDurableObject extends DurableObject<Env> {
     }
   }
 
-  // Cleanup old events (run periodically via alarm)
+  // Cleanup old events and stale connection state (run periodically via alarm)
   async alarm(): Promise<void> {
-    const cutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
+    const eventCutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
+    const connectionCutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
 
-    const allKeys = await this.ctx.storage.list({ prefix: 'event:' });
+    // Clean up old pending events
+    const allKeys = await this.ctx.storage.list({ prefix: 'event:', limit: 1000 });
     for (const [key, value] of allKeys) {
       const event = value as PendingEvent;
-      if (event.timestamp < cutoff) {
+      if (event.timestamp < eventCutoff) {
         await this.ctx.storage.delete(key);
+      }
+    }
+
+    // Clean up in-memory pending events list
+    this.pendingEvents = this.pendingEvents.filter(e => e.timestamp >= eventCutoff);
+
+    // Clean up stale sliding sync connection states
+    const syncKeys = await this.ctx.storage.list({ prefix: 'sliding_sync:', limit: 100 });
+    for (const [key, value] of syncKeys) {
+      const state = value as SlidingSyncConnectionState;
+      if (state.lastAccess && state.lastAccess < connectionCutoff) {
+        await this.ctx.storage.delete(key);
+        this.slidingSyncStates.delete(key);
       }
     }
 
