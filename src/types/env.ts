@@ -28,6 +28,13 @@ export interface Env {
   SERVER_NAME: string;
   SERVER_VERSION: string;
 
+  // Rate-limit IP source trust.
+  // - On Cloudflare, CF-Connecting-IP is set by the edge and is authoritative.
+  // - Set TRUST_FORWARDED_FOR="true" only when the worker sits behind a
+  //   different trusted proxy that authenticates and rewrites X-Forwarded-For.
+  //   Otherwise the header is client-spoofable and must NOT be trusted.
+  TRUST_FORWARDED_FOR?: string;
+
   // Support contact info (optional)
   ADMIN_CONTACT_EMAIL?: string;
   ADMIN_CONTACT_MXID?: string;

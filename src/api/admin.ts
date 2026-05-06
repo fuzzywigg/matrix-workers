@@ -10,6 +10,7 @@ import { generateLoginToken, generateOpaqueId } from '../utils/ids';
 import { hashToken } from '../utils/crypto';
 import { encryptSecret } from './oidc-auth';
 import { fetchOIDCDiscovery } from '../services/oidc';
+import { logAdminAction } from '../services/admin-audit';
 
 const app = new Hono<AppEnv>();
 
@@ -244,6 +245,16 @@ app.put('/admin/api/users/:userId', requireAuth(), requireAdmin, async (c) => {
 
   await db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE user_id = ?`).bind(...params).run();
 
+  await logAdminAction(c, {
+    action: 'user.update',
+    target: userId,
+    details: {
+      display_name: display_name !== undefined,
+      admin: admin !== undefined ? !!admin : undefined,
+      deactivated: deactivated !== undefined ? !!deactivated : undefined,
+    },
+  });
+
   return c.json({ success: true });
 });
 
@@ -263,6 +274,8 @@ app.delete('/admin/api/users/:userId', requireAuth(), requireAdmin, async (c) =>
   // Invalidate stats cache
   await invalidateStatsCache(c.env);
 
+  await logAdminAction(c, { action: 'user.deactivate', target: userId });
+
   return c.json({ success: true });
 });
 
@@ -280,6 +293,12 @@ app.post('/admin/api/users/:userId/reset-password', requireAuth(), requireAdmin,
 
   const { password } = body;
   if (!password) {
+    await logAdminAction(c, {
+      action: 'user.reset_password',
+      target: userId,
+      success: false,
+      details: { reason: 'missing_password' },
+    });
     return Errors.missingParam('password').toResponse();
   }
 
@@ -293,6 +312,8 @@ app.post('/admin/api/users/:userId/reset-password', requireAuth(), requireAdmin,
 
   // Revoke all access tokens to force re-login
   await db.prepare('DELETE FROM access_tokens WHERE user_id = ?').bind(userId).run();
+
+  await logAdminAction(c, { action: 'user.reset_password', target: userId });
 
   return c.json({ success: true });
 });
@@ -410,6 +431,8 @@ app.delete('/admin/api/rooms/:roomId', requireAuth(), requireAdmin, async (c) =>
 
   // Invalidate stats cache
   await invalidateStatsCache(c.env);
+
+  await logAdminAction(c, { action: 'room.delete', target: roomId });
 
   return c.json({ success: true });
 });
@@ -671,6 +694,8 @@ app.post('/admin/api/make-admin', requireAuth(), requireAdmin, async (c) => {
     'UPDATE users SET admin = 1, updated_at = ? WHERE user_id = ?'
   ).bind(Date.now(), user_id).run();
 
+  await logAdminAction(c, { action: 'user.make_admin', target: user_id });
+
   return c.json({ success: true });
 });
 
@@ -697,6 +722,8 @@ app.post('/admin/api/remove-admin', requireAuth(), requireAdmin, async (c) => {
   await c.env.DB.prepare(
     'UPDATE users SET admin = 0, updated_at = ? WHERE user_id = ?'
   ).bind(Date.now(), user_id).run();
+
+  await logAdminAction(c, { action: 'user.remove_admin', target: user_id });
 
   return c.json({ success: true });
 });
@@ -776,6 +803,8 @@ app.delete('/admin/api/users/:userId/purge', requireAuth(), requireAdmin, async 
 
   // Invalidate stats cache
   await invalidateStatsCache(c.env);
+
+  await logAdminAction(c, { action: 'user.purge', target: userId });
 
   return c.json({ success: true });
 });
@@ -1275,6 +1304,68 @@ app.post('/admin/api/server-notice', requireAuth(), requireAdmin, async (c) => {
   return c.json({ success: true, devices_notified: devices.results.length });
 });
 
+// GET /admin/api/audit - Recent admin audit log entries (paginated)
+//
+// Defaults to the most recent 100 entries. Filterable by actor, target, and
+// action. The log is append-only at the application level; the table has no
+// DELETE/UPDATE codepath in src/.
+app.get('/admin/api/audit', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+
+  const limit = Math.max(1, Math.min(parseInt(c.req.query('limit') || '100', 10) || 100, 500));
+  const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10) || 0);
+  const actor = c.req.query('actor') || null;
+  const target = c.req.query('target') || null;
+  const action = c.req.query('action') || null;
+
+  const conds: string[] = [];
+  const params: any[] = [];
+  if (actor) { conds.push('actor_user_id = ?'); params.push(actor); }
+  if (target) { conds.push('target = ?'); params.push(target); }
+  if (action) { conds.push('action = ?'); params.push(action); }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+  const rows = await db.prepare(
+    `SELECT id, ts, actor_user_id, action, target, ip, success, details
+     FROM admin_audit_log ${where}
+     ORDER BY ts DESC
+     LIMIT ? OFFSET ?`,
+  ).bind(...params, limit, offset).all<{
+    id: number;
+    ts: number;
+    actor_user_id: string;
+    action: string;
+    target: string | null;
+    ip: string | null;
+    success: number;
+    details: string | null;
+  }>();
+
+  const totalRow = await db.prepare(
+    `SELECT COUNT(*) as count FROM admin_audit_log ${where}`,
+  ).bind(...params).first<{ count: number }>();
+
+  return c.json({
+    entries: rows.results.map((r) => ({
+      id: r.id,
+      ts: r.ts,
+      actor_user_id: r.actor_user_id,
+      action: r.action,
+      target: r.target,
+      ip: r.ip,
+      success: r.success === 1,
+      details: r.details ? safeParseJson(r.details) : null,
+    })),
+    total: totalRow?.count ?? 0,
+    limit,
+    offset,
+  });
+});
+
+function safeParseJson(s: string): unknown {
+  try { return JSON.parse(s); } catch { return s; }
+}
+
 // GET /admin/api/registration - Get registration status (via AdminDurableObject)
 app.get('/admin/api/registration', requireAuth(), requireAdmin, async (c) => {
   const adminDO = getAdminDO(c.env);
@@ -1308,8 +1399,18 @@ app.put('/admin/api/registration', requireAuth(), requireAdmin, async (c) => {
   });
 
   if (!response.ok) {
+    await logAdminAction(c, {
+      action: 'config.registration.update',
+      success: false,
+      details: { enabled },
+    });
     return new Response('Failed to update config', { status: 500 });
   }
+
+  await logAdminAction(c, {
+    action: 'config.registration.update',
+    details: { enabled },
+  });
 
   return c.json({ success: true, enabled });
 });
@@ -1925,6 +2026,8 @@ app.post('/_synapse/admin/v1/deactivate/:userId', requireAuth(), requireAdmin, a
   // Invalidate stats cache
   await invalidateStatsCache(c.env);
 
+  await logAdminAction(c, { action: 'user.deactivate', target: userId });
+
   return c.json({ id_server_unbind_result: 'success' });
 });
 
@@ -1963,6 +2066,12 @@ app.post('/_synapse/admin/v1/reset_password/:userId', requireAuth(), requireAdmi
   if (logout_devices !== false) {
     await db.prepare('DELETE FROM access_tokens WHERE user_id = ?').bind(userId).run();
   }
+
+  await logAdminAction(c, {
+    action: 'user.reset_password',
+    target: userId,
+    details: { logout_devices: logout_devices !== false },
+  });
 
   return c.json({});
 });
