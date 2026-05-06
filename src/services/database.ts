@@ -1,6 +1,34 @@
 // Database service layer for D1
 
 import type { User, Device, Room, PDU, Membership, Env } from '../types';
+import { MatrixApiError } from '../utils/errors';
+import { ErrorCodes } from '../types';
+
+// D1 has an approximate 1MB per-row size cap. We validate event size on the
+// way in to fail fast with M_TOO_LARGE rather than silently corrupting data.
+// EVENT_CONTENT_SOFT_CAP: per-field soft cap matching Matrix spec guidance (64KB content).
+// EVENT_ROW_HARD_CAP: full serialized PDU hard cap, leaves headroom under D1's 1MB limit.
+const EVENT_CONTENT_SOFT_CAP = 65_536;
+const EVENT_ROW_HARD_CAP = 921_600;
+
+export function validateEventSize(event: PDU): void {
+  const contentJson = JSON.stringify(event.content ?? {});
+  if (contentJson.length > EVENT_CONTENT_SOFT_CAP) {
+    throw new MatrixApiError(
+      ErrorCodes.M_TOO_LARGE,
+      `Event content exceeds ${EVENT_CONTENT_SOFT_CAP} byte limit (got ${contentJson.length})`,
+      413
+    );
+  }
+  const fullJson = JSON.stringify(event);
+  if (fullJson.length > EVENT_ROW_HARD_CAP) {
+    throw new MatrixApiError(
+      ErrorCodes.M_TOO_LARGE,
+      `Serialized event exceeds ${EVENT_ROW_HARD_CAP} byte D1 row limit (got ${fullJson.length})`,
+      413
+    );
+  }
+}
 
 // User operations
 export async function createUser(
@@ -253,6 +281,9 @@ export async function getRoom(db: D1Database, roomId: string): Promise<Room | nu
 
 // Event operations
 export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
+  // Validate row size against D1's ~1MB per-row cap before any write.
+  validateEventSize(event);
+
   // Atomically allocate the next stream ordering using UPDATE...RETURNING.
   // This avoids the race condition where two concurrent calls both read
   // MAX(stream_ordering) and generate the same value.
@@ -636,48 +667,63 @@ export async function getEventsSince(
   }));
 }
 
-// Batch retrieve events by IDs
+// Batch retrieve events by IDs.
+// D1 has limits on placeholders per statement and on response size; we page
+// through the input list to keep individual queries bounded.
+const GET_EVENTS_PAGE_SIZE = 100;
+
 export async function getEventsByIds(db: D1Database, eventIds: string[]): Promise<PDU[]> {
   if (eventIds.length === 0) return [];
 
-  // D1 doesn't support array binding, so we batch with placeholders
-  const placeholders = eventIds.map(() => '?').join(', ');
-  const result = await db.prepare(
-    `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures
-     FROM events WHERE event_id IN (${placeholders})`
-  ).bind(...eventIds).all<{
-    event_id: string;
-    room_id: string;
-    sender: string;
-    event_type: string;
-    state_key: string | null;
-    content: string;
-    origin_server_ts: number;
-    unsigned: string | null;
-    depth: number;
-    auth_events: string;
-    prev_events: string;
-    hashes: string | null;
-    signatures: string | null;
-  }>();
+  const out: PDU[] = [];
+  for (let i = 0; i < eventIds.length; i += GET_EVENTS_PAGE_SIZE) {
+    const page = eventIds.slice(i, i + GET_EVENTS_PAGE_SIZE);
+    // D1 doesn't support array binding, so we batch with placeholders
+    const placeholders = page.map(() => '?').join(', ');
+    const result = await db.prepare(
+      `SELECT event_id, room_id, sender, event_type, state_key, content,
+       origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures
+       FROM events WHERE event_id IN (${placeholders})`
+    ).bind(...page).all<{
+      event_id: string;
+      room_id: string;
+      sender: string;
+      event_type: string;
+      state_key: string | null;
+      content: string;
+      origin_server_ts: number;
+      unsigned: string | null;
+      depth: number;
+      auth_events: string;
+      prev_events: string;
+      hashes: string | null;
+      signatures: string | null;
+    }>();
 
-  return result.results.map(r => ({
-    event_id: r.event_id,
-    room_id: r.room_id,
-    sender: r.sender,
-    type: r.event_type,
-    state_key: r.state_key ?? undefined,
-    content: JSON.parse(r.content),
-    origin_server_ts: r.origin_server_ts,
-    unsigned: r.unsigned ? JSON.parse(r.unsigned) : undefined,
-    depth: r.depth,
-    auth_events: JSON.parse(r.auth_events),
-    prev_events: JSON.parse(r.prev_events),
-    hashes: r.hashes ? JSON.parse(r.hashes) : undefined,
-    signatures: r.signatures ? JSON.parse(r.signatures) : undefined,
-  }));
+    for (const r of result.results) {
+      out.push({
+        event_id: r.event_id,
+        room_id: r.room_id,
+        sender: r.sender,
+        type: r.event_type,
+        state_key: r.state_key ?? undefined,
+        content: JSON.parse(r.content),
+        origin_server_ts: r.origin_server_ts,
+        unsigned: r.unsigned ? JSON.parse(r.unsigned) : undefined,
+        depth: r.depth,
+        auth_events: JSON.parse(r.auth_events),
+        prev_events: JSON.parse(r.prev_events),
+        hashes: r.hashes ? JSON.parse(r.hashes) : undefined,
+        signatures: r.signatures ? JSON.parse(r.signatures) : undefined,
+      });
+    }
+  }
+  return out;
 }
+
+// Cap auth chain traversal to avoid pathological recursion fetching thousands
+// of events under D1's per-query limits.
+const MAX_AUTH_CHAIN_SIZE = 500;
 
 // Get the auth chain for an event (all auth_events recursively)
 export async function getAuthChain(db: D1Database, eventIds: string[]): Promise<PDU[]> {
@@ -685,7 +731,7 @@ export async function getAuthChain(db: D1Database, eventIds: string[]): Promise<
   const chain: PDU[] = [];
   const queue = [...eventIds];
 
-  while (queue.length > 0) {
+  while (queue.length > 0 && chain.length < MAX_AUTH_CHAIN_SIZE) {
     const batch = queue.splice(0, 50).filter(id => !seen.has(id));
     if (batch.length === 0) continue;
 
@@ -694,6 +740,10 @@ export async function getAuthChain(db: D1Database, eventIds: string[]): Promise<
     const events = await getEventsByIds(db, batch);
     for (const event of events) {
       chain.push(event);
+      if (chain.length >= MAX_AUTH_CHAIN_SIZE) {
+        console.warn('[getAuthChain] reached MAX_AUTH_CHAIN_SIZE cap', MAX_AUTH_CHAIN_SIZE, 'aborting traversal');
+        break;
+      }
       for (const authId of event.auth_events) {
         if (!seen.has(authId)) {
           queue.push(authId);

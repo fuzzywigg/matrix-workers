@@ -24,6 +24,7 @@ import {
   deleteRoomAlias,
   getEvent,
   notifyUsersOfEvent,
+  validateEventSize,
 } from '../services/database';
 import type { JoinResult } from '../workflows';
 
@@ -77,8 +78,13 @@ function validateStateEvent(event: any, index: number): StateEventValidation {
   return { valid: true };
 }
 
-// Helper to create initial room events
-// Returns the create event ID for use in initializing m.fully_read
+// Helper to create initial room events.
+// Returns the create event ID for use in initializing m.fully_read.
+//
+// All initial state events for a room are submitted as a single D1 batch so
+// either every required state event lands or none does. D1 does not support
+// BEGIN/COMMIT, but batches execute atomically — partial failure cannot leave
+// a room with missing fundamental state events.
 async function createInitialRoomEvents(
   db: D1Database,
   serverName: string,
@@ -96,18 +102,25 @@ async function createInitialRoomEvents(
   }
 ): Promise<string> {
   const now = Date.now();
-  let depth = 0;
+
+  interface PlannedEvent {
+    pdu: PDU;
+    membership?: { userId: string; state: 'join' | 'invite' };
+  }
+
+  const planned: PlannedEvent[] = [];
   const authEvents: string[] = [];
   const prevEvents: string[] = [];
+  let depth = 0;
 
-  // Helper to create and store an event
-  async function createEvent(
+  async function plan(
     type: string,
     content: any,
-    stateKey?: string
+    stateKey: string | undefined,
+    membership?: { userId: string; state: 'join' | 'invite' }
   ): Promise<string> {
     const eventId = await generateEventId(serverName, roomVersion);
-    const event: PDU = {
+    const pdu: PDU = {
       event_id: eventId,
       room_id: roomId,
       sender: creatorId,
@@ -119,20 +132,17 @@ async function createInitialRoomEvents(
       auth_events: [...authEvents],
       prev_events: [...prevEvents],
     };
+    const hash = await calculateContentHash(pdu as unknown as Record<string, unknown>);
+    pdu.hashes = { sha256: hash };
 
-    // Calculate and attach content hash
-    const hash = await calculateContentHash(event as unknown as Record<string, unknown>);
-    event.hashes = { sha256: hash };
+    // Validate row size up front; fail fast before submitting the batch.
+    validateEventSize(pdu);
 
-    await storeEvent(db, event);
+    planned.push({ pdu, membership });
 
-    // Update auth/prev events for next event
-    if (stateKey !== undefined) {
-      authEvents.push(eventId);
-    }
+    if (stateKey !== undefined) authEvents.push(eventId);
     prevEvents.length = 0;
     prevEvents.push(eventId);
-
     return eventId;
   }
 
@@ -141,14 +151,11 @@ async function createInitialRoomEvents(
     creator: creatorId,
     room_version: roomVersion,
   };
-  const createEventId = await createEvent('m.room.create', createContent, '');
+  const createEventId = await plan('m.room.create', createContent, '');
 
   // 2. m.room.member (creator joins)
-  const memberContent: RoomMemberContent = {
-    membership: 'join',
-  };
-  const joinEventId = await createEvent('m.room.member', memberContent, creatorId);
-  await updateMembership(db, roomId, creatorId, 'join', joinEventId);
+  const memberContent: RoomMemberContent = { membership: 'join' };
+  await plan('m.room.member', memberContent, creatorId, { userId: creatorId, state: 'join' });
 
   // 3. m.room.power_levels
   const preset = options.preset || 'private_chat';
@@ -173,64 +180,121 @@ async function createInitialRoomEvents(
     users: { [creatorId]: 100 },
     users_default: 0,
   };
-  await createEvent('m.room.power_levels', powerLevelsContent, '');
+  await plan('m.room.power_levels', powerLevelsContent, '');
 
   // 4. m.room.join_rules
   let joinRule = 'invite';
   if (preset === 'public_chat') joinRule = 'public';
   else if (preset === 'trusted_private_chat') joinRule = 'invite';
-  await createEvent('m.room.join_rules', { join_rule: joinRule }, '');
+  await plan('m.room.join_rules', { join_rule: joinRule }, '');
 
   // 5. m.room.history_visibility
   let historyVisibility = 'shared';
   if (preset === 'public_chat') historyVisibility = 'shared';
-  await createEvent('m.room.history_visibility', { history_visibility: historyVisibility }, '');
+  await plan('m.room.history_visibility', { history_visibility: historyVisibility }, '');
 
   // 6. m.room.guest_access
   let guestAccess = 'forbidden';
   if (preset === 'public_chat') guestAccess = 'can_join';
-  await createEvent('m.room.guest_access', { guest_access: guestAccess }, '');
+  await plan('m.room.guest_access', { guest_access: guestAccess }, '');
 
-  // Optional: m.room.name
   if (options.name) {
-    await createEvent('m.room.name', { name: options.name }, '');
+    await plan('m.room.name', { name: options.name }, '');
   }
-
-  // Optional: m.room.topic
   if (options.topic) {
-    await createEvent('m.room.topic', { topic: options.topic }, '');
+    await plan('m.room.topic', { topic: options.topic }, '');
   }
-
-  // Process initial_state
   if (options.initial_state) {
     for (const state of options.initial_state) {
-      await createEvent(state.type, state.content, state.state_key ?? '');
+      await plan(state.type, state.content, state.state_key ?? '');
     }
   }
 
-  // Process invites with individual error handling (best-effort invites)
-  // If one invite fails, we continue with the rest - the room is still valid
+  // Invites are part of the atomic batch too: either the room is created with
+  // all its requested invite memberships or nothing is committed.
   if (options.invite) {
-    const failedInvites: string[] = [];
     for (const invitee of options.invite) {
-      try {
-        const inviteContent: RoomMemberContent = {
-          membership: 'invite',
-          is_direct: options.is_direct,
-        };
-        const inviteEventId = await createEvent('m.room.member', inviteContent, invitee);
-        await updateMembership(db, roomId, invitee, 'invite', inviteEventId);
-      } catch (err) {
-        console.error(`[createRoom] Failed to invite ${invitee}:`, err);
-        failedInvites.push(invitee);
-      }
-    }
-    if (failedInvites.length > 0) {
-      console.warn(`[createRoom] Failed invites for room ${roomId}:`, failedInvites);
+      const inviteContent: RoomMemberContent = {
+        membership: 'invite',
+        is_direct: options.is_direct,
+      };
+      await plan('m.room.member', inviteContent, invitee, { userId: invitee, state: 'invite' });
     }
   }
 
-  // Return the create event ID for m.fully_read initialization
+  // Allocate stream_ordering for all events atomically. Increment by N and
+  // reserve the contiguous range [position - N + 1 .. position].
+  const n = planned.length;
+  const posResult = await db.prepare(
+    `UPDATE stream_positions SET position = position + ? WHERE stream_name = 'events' RETURNING position`
+  ).bind(n).first<{ position: number }>();
+  const lastPosition = posResult?.position ?? n;
+  const firstPosition = lastPosition - n + 1;
+
+  // Build all batch statements.
+  const stmts: D1PreparedStatement[] = [];
+  planned.forEach((p, i) => {
+    const e = p.pdu;
+    const streamOrdering = firstPosition + i;
+    stmts.push(
+      db.prepare(
+        `INSERT INTO events (event_id, room_id, sender, event_type, state_key, content,
+         origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        e.event_id,
+        e.room_id,
+        e.sender,
+        e.type,
+        e.state_key ?? null,
+        JSON.stringify(e.content),
+        e.origin_server_ts,
+        e.unsigned ? JSON.stringify(e.unsigned) : null,
+        e.depth,
+        JSON.stringify(e.auth_events),
+        JSON.stringify(e.prev_events),
+        e.hashes ? JSON.stringify(e.hashes) : null,
+        e.signatures ? JSON.stringify(e.signatures) : null,
+        streamOrdering
+      )
+    );
+    if (e.state_key !== undefined) {
+      stmts.push(
+        db.prepare(
+          `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
+           VALUES (?, ?, ?, ?)`
+        ).bind(e.room_id, e.type, e.state_key, e.event_id)
+      );
+    }
+    if (p.membership) {
+      stmts.push(
+        db.prepare(
+          `INSERT OR REPLACE INTO room_memberships (room_id, user_id, membership, event_id, display_name, avatar_url)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(roomId, p.membership.userId, p.membership.state, e.event_id, null, null)
+      );
+    }
+  });
+
+  try {
+    await db.batch(stmts);
+  } catch (err) {
+    // Compensating cleanup: D1 batches are documented atomic, but defensively
+    // attempt to remove anything we inserted for this room in case a partial
+    // write slipped through. This is best-effort; the original error is rethrown.
+    console.error('[createRoom] batch failed, attempting compensating cleanup for room', roomId, err);
+    try {
+      await db.batch([
+        db.prepare(`DELETE FROM room_memberships WHERE room_id = ?`).bind(roomId),
+        db.prepare(`DELETE FROM room_state WHERE room_id = ?`).bind(roomId),
+        db.prepare(`DELETE FROM events WHERE room_id = ?`).bind(roomId),
+      ]);
+    } catch (cleanupErr) {
+      console.error('[createRoom] compensating cleanup also failed for room', roomId, cleanupErr);
+    }
+    throw err;
+  }
+
   return createEventId;
 }
 
@@ -315,8 +379,8 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
   await createRoom(c.env.DB, roomId, version, userId, isPublic);
   console.log('[createRoom] Room record created in DB');
 
-  // Create initial room events
-  let createEventId: string | undefined;
+  // Create initial room events atomically.
+  let createEventId: string;
   try {
     createEventId = await createInitialRoomEvents(c.env.DB, c.env.SERVER_NAME, roomId, version, userId, {
       name,
@@ -329,18 +393,28 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     });
     console.log('[createRoom] Initial room events created successfully');
 
-    // Initialize m.fully_read marker for the room creator
-    // This ensures the room doesn't show all messages as unread
     await c.env.DB.prepare(`
       INSERT INTO account_data (user_id, room_id, event_type, content)
       VALUES (?, ?, 'm.fully_read', ?)
       ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET content = excluded.content
     `).bind(userId, roomId, JSON.stringify({ event_id: createEventId })).run();
-    console.log('[createRoom] Initialized m.fully_read marker for creator');
   } catch (err) {
-    console.error('[createRoom] Failed to create initial room events:', err);
-    // Still return success since room was created, but log the error
-    // In production, we should probably roll back or return an error
+    console.error('[createRoom] Failed to create initial room events, rolling back:', err);
+    // Best-effort cleanup of the rooms row so we don't leave a half-created room
+    // discoverable. Event/state/membership rows were already cleaned by
+    // createInitialRoomEvents on failure.
+    try {
+      await c.env.DB.prepare(`DELETE FROM rooms WHERE room_id = ?`).bind(roomId).run();
+    } catch (cleanupErr) {
+      console.error('[createRoom] Failed to delete rooms row during rollback:', cleanupErr);
+    }
+    if (err instanceof Error && (err as any).errcode === 'M_TOO_LARGE') {
+      return new Response(JSON.stringify({ errcode: 'M_TOO_LARGE', error: err.message }), {
+        status: 413,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return Errors.unknown('Failed to create room').toResponse();
   }
 
   // Create room alias if provided
