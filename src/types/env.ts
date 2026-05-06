@@ -43,6 +43,10 @@ export interface Env {
   // Secrets (to be configured)
   SIGNING_KEY?: string;
 
+  // Maximum staleness (in ms) past a federation key's valid_until_ts before
+  // the key is rejected for signature verification. Default 7 days.
+  FEDERATION_KEY_MAX_STALENESS_MS?: string;
+
   // OIDC encryption key for client secrets (32 random bytes, base64 encoded)
   // Generate with: openssl rand -base64 32
   // Set with: npx wrangler secret put OIDC_ENCRYPTION_KEY

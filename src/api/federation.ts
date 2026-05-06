@@ -18,6 +18,18 @@ import { resolveState } from '../services/state-resolution';
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
 const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
 
+// "Modern" room versions for the purpose of content-hash enforcement.
+// Matrix room versions 3 and later require event integrity via hashes.sha256;
+// versions 1 and 2 are legacy where hashes are optional.
+// Issue 006.6 — see docs/issues/006-federation-event-validation-state-resolution.md
+function isModernRoomVersion(version: string): boolean {
+  // Numeric room versions: anything >= 3 counts as modern. Non-numeric custom
+  // versions are treated as modern by default (fail-closed).
+  const n = parseInt(version, 10);
+  if (Number.isFinite(n)) return n >= 3;
+  return true;
+}
+
 /**
  * Get the request body from either the federation auth middleware buffer
  * (which already consumed it for signature verification) or from c.req.json()
@@ -598,8 +610,45 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
-      // Verify content hash if present
-      if (pdu.hashes?.sha256) {
+      // Check if the room exists locally — needed before the content-hash
+      // requirement check so we can pick the right enforcement level for
+      // the room version.
+      const room = await c.env.DB.prepare(
+        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+      ).bind(roomId).first<{ room_id: string; room_version: string }>();
+
+      // Content hash enforcement.
+      //   - Room versions 1-2: hashes optional (legacy clients may omit).
+      //   - Room versions 3+: hashes.sha256 is REQUIRED — modern room versions
+      //     mandate content integrity. An attacker can otherwise omit `hashes`
+      //     entirely to skip integrity verification.
+      // If the room is unknown locally, default to the strict (modern) rule —
+      // we won't accept unverifiable events for rooms we know nothing about.
+      const roomVersion = room?.room_version;
+      const requiresHash = !roomVersion || isModernRoomVersion(roomVersion);
+      const hasSha256 = typeof pdu.hashes?.sha256 === 'string' && pdu.hashes.sha256.length > 0;
+
+      if (requiresHash && !hasSha256) {
+        const reason = `Missing required hashes.sha256 (room_version=${roomVersion ?? 'unknown'})`;
+        pduResults[eventId] = { error: reason };
+        await c.env.DB.prepare(
+          `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+           VALUES (?, ?, ?, ?, 0, ?)`
+        ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
+        continue;
+      }
+
+      if (!hasSha256 && roomVersion) {
+        // Room versions 1-2: legacy, hashes optional but log so we notice.
+        console.warn(
+          `[federation] PDU ${eventId} from ${pduOrigin} in legacy room_version=${roomVersion} ` +
+          `has no content hash`
+        );
+      }
+
+      // Verify content hash if present (always — even for legacy room versions
+      // when the sender did supply one).
+      if (hasSha256) {
         try {
           const hashValid = await verifyContentHash(pdu as Record<string, unknown>, pdu.hashes.sha256);
           if (!hashValid) {
@@ -612,13 +661,20 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           }
         } catch (hashErr) {
           console.warn(`[federation] Content hash check failed for ${eventId}:`, hashErr);
+          // For modern room versions, refuse to accept an event whose hash we
+          // could not verify — silent fall-through here would defeat the
+          // requirement above.
+          if (requiresHash) {
+            const reason = 'Content hash verification error';
+            pduResults[eventId] = { error: reason };
+            await c.env.DB.prepare(
+              `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+               VALUES (?, ?, ?, ?, 0, ?)`
+            ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
+            continue;
+          }
         }
       }
-
-      // Check if the room exists locally
-      const room = await c.env.DB.prepare(
-        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-      ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
       // Run event authorization check if we have room state
       if (room) {
