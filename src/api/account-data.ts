@@ -235,18 +235,51 @@ app.put('/_matrix/client/v3/user/:userId/account_data/:type', requireAuth(), asy
     );
   }
 
-  // Also store in D1 as backup
-  await db.prepare(`
-    INSERT INTO account_data (user_id, room_id, event_type, content)
-    VALUES (?, '', ?, ?)
-    ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-      content = excluded.content
-  `).bind(targetUserId, eventType, JSON.stringify(content)).run();
+  // Optional optimistic concurrency: if the client supplies If-Match with
+  // an integer, refuse the write when the stored version differs (issue
+  // 009 #5). When omitted, behavior is identical to the previous
+  // last-write-wins upsert so existing clients are unaffected.
+  const ifMatch = c.req.header('If-Match');
+  const expectedVersionRaw = ifMatch ? parseInt(ifMatch, 10) : NaN;
+  const useVersionCheck = !isNaN(expectedVersionRaw);
+
+  // Idempotent upsert with monotonic version bump. INSERT OR REPLACE would
+  // discard the version, so we use ON CONFLICT ... DO UPDATE.
+  let updated: { version: number } | null;
+  if (useVersionCheck) {
+    updated = await db.prepare(`
+      INSERT INTO account_data (user_id, room_id, event_type, content, version)
+      VALUES (?, '', ?, ?, 1)
+      ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
+        content = excluded.content,
+        version = account_data.version + 1
+      WHERE account_data.version = ?
+      RETURNING version
+    `).bind(targetUserId, eventType, JSON.stringify(content), expectedVersionRaw)
+      .first<{ version: number }>();
+
+    if (!updated) {
+      return c.json({
+        errcode: 'M_CONFLICT',
+        error: 'Account data version mismatch; re-fetch and retry',
+      }, 409);
+    }
+  } else {
+    updated = await db.prepare(`
+      INSERT INTO account_data (user_id, room_id, event_type, content, version)
+      VALUES (?, '', ?, ?, 1)
+      ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
+        content = excluded.content,
+        version = account_data.version + 1
+      RETURNING version
+    `).bind(targetUserId, eventType, JSON.stringify(content))
+      .first<{ version: number }>();
+  }
 
   // Record change for sync
   await recordAccountDataChange(db, targetUserId, '', eventType);
 
-  return c.json({});
+  return c.json({ version: updated?.version ?? 1 });
 });
 
 // ============================================
@@ -337,18 +370,46 @@ app.put('/_matrix/client/v3/user/:userId/rooms/:roomId/account_data/:type', requ
     return Errors.badJson().toResponse();
   }
 
-  // Store account data
-  await db.prepare(`
-    INSERT INTO account_data (user_id, room_id, event_type, content)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-      content = excluded.content
-  `).bind(targetUserId, roomId, eventType, JSON.stringify(content)).run();
+  // Optional optimistic concurrency via If-Match (see global PUT above).
+  const ifMatch = c.req.header('If-Match');
+  const expectedVersionRaw = ifMatch ? parseInt(ifMatch, 10) : NaN;
+  const useVersionCheck = !isNaN(expectedVersionRaw);
+
+  let updated: { version: number } | null;
+  if (useVersionCheck) {
+    updated = await db.prepare(`
+      INSERT INTO account_data (user_id, room_id, event_type, content, version)
+      VALUES (?, ?, ?, ?, 1)
+      ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
+        content = excluded.content,
+        version = account_data.version + 1
+      WHERE account_data.version = ?
+      RETURNING version
+    `).bind(targetUserId, roomId, eventType, JSON.stringify(content), expectedVersionRaw)
+      .first<{ version: number }>();
+
+    if (!updated) {
+      return c.json({
+        errcode: 'M_CONFLICT',
+        error: 'Account data version mismatch; re-fetch and retry',
+      }, 409);
+    }
+  } else {
+    updated = await db.prepare(`
+      INSERT INTO account_data (user_id, room_id, event_type, content, version)
+      VALUES (?, ?, ?, ?, 1)
+      ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
+        content = excluded.content,
+        version = account_data.version + 1
+      RETURNING version
+    `).bind(targetUserId, roomId, eventType, JSON.stringify(content))
+      .first<{ version: number }>();
+  }
 
   // Record change for sync
   await recordAccountDataChange(db, targetUserId, roomId, eventType);
 
-  return c.json({});
+  return c.json({ version: updated?.version ?? 1 });
 });
 
 // ============================================

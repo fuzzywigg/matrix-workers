@@ -2,18 +2,18 @@
 
 Comprehensive issue documentation from a full codebase audit conducted 2026-04-13. Each issue document contains a detailed problem narrative, per-finding breakdowns with file/line references, step-by-step remediation plans, and ideal resolution criteria.
 
-**Last updated:** 2026-04-14
+**Last updated:** 2026-05-06
 
 ---
 
 ## Resolution Status
 
-Of the 64 original findings, **52 have been resolved** across 9 commits on branch `claude/review-and-document-issues-Uy4oU`:
+Of the 64 original findings, **57 have been resolved** across 10 commits on branches `claude/review-and-document-issues-Uy4oU` and `feat/009-room-race-conditions`:
 
 | Status | Count |
 |--------|-------|
-| Resolved | 52 |
-| Remaining | 12 |
+| Resolved | 57 |
+| Remaining | 7 |
 
 ---
 
@@ -29,7 +29,7 @@ Of the 64 original findings, **52 have been resolved** across 9 commits on branc
 | [006](./006-federation-event-validation-state-resolution.md) | Federation Event Validation | **High** | 8 | 6 | Mostly done |
 | [007](./007-rate-limiting-dos-protection.md) | Rate Limiting & DoS Protection | **High** | 7 | 5 | Mostly done |
 | [008](./008-rtc-webrtc-authentication-gap.md) | RTC/WebRTC Auth Gap | **Critical** | 3 | 3 | **Done** |
-| [009](./009-room-operations-race-conditions.md) | Room Operations Race Conditions | **High** | 5 | 0 | Not started |
+| [009](./009-room-operations-race-conditions.md) | Room Operations Race Conditions | **High** | 5 | 5 | **Done** |
 | [010](./010-error-handling-information-leakage.md) | Error Handling & Information Leakage | **Medium** | 6 | 4 | In progress |
 
 ---
@@ -71,7 +71,6 @@ Of the 64 original findings, **52 have been resolved** across 9 commits on branc
 
 ### High Priority (Next Session)
 - **004.2** — Room creation atomicity (batch INSERT)
-- **009** — Room operations race conditions (5 findings — route through DO for serialization)
 
 ### Medium Priority
 - **001.5** — Stale federation key rejection (max staleness threshold)
