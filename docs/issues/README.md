@@ -2,18 +2,18 @@
 
 Comprehensive issue documentation from a full codebase audit conducted 2026-04-13. Each issue document contains a detailed problem narrative, per-finding breakdowns with file/line references, step-by-step remediation plans, and ideal resolution criteria.
 
-**Last updated:** 2026-04-14
+**Last updated:** 2026-05-06
 
 ---
 
 ## Resolution Status
 
-Of the 64 original findings, **52 have been resolved** across 9 commits on branch `claude/review-and-document-issues-Uy4oU`:
+Of the 64 original findings, **55 have been resolved**:
 
 | Status | Count |
 |--------|-------|
-| Resolved | 52 |
-| Remaining | 12 |
+| Resolved | 55 |
+| Remaining | 9 |
 
 ---
 
@@ -24,7 +24,7 @@ Of the 64 original findings, **52 have been resolved** across 9 commits on branc
 | [001](./001-federation-authentication-and-signing.md) | Federation Auth & Outbound Signing | **Critical** | 6 | 5 | Mostly done |
 | [002](./002-authentication-session-security.md) | Authentication & Session Security | **Critical/High** | 8 | 8 | **Done** |
 | [003](./003-media-upload-download-security.md) | Media Upload & Download Security | **High** | 5 | 5 | **Done** |
-| [004](./004-database-integrity-and-transaction-safety.md) | Database Integrity & Transaction Safety | **Critical/High** | 6 | 3 | In progress |
+| [004](./004-database-integrity-and-transaction-safety.md) | Database Integrity & Transaction Safety | **Critical/High** | 6 | 6 | **Done** |
 | [005](./005-durable-object-lifecycle-memory-management.md) | Durable Object Lifecycle & Memory | **High** | 10 | 6 | In progress |
 | [006](./006-federation-event-validation-state-resolution.md) | Federation Event Validation | **High** | 8 | 6 | Mostly done |
 | [007](./007-rate-limiting-dos-protection.md) | Rate Limiting & DoS Protection | **High** | 7 | 5 | Mostly done |
@@ -67,15 +67,13 @@ Of the 64 original findings, **52 have been resolved** across 9 commits on branc
 
 ---
 
-## Remaining Work (12 findings)
+## Remaining Work (9 findings)
 
 ### High Priority (Next Session)
-- **004.2** — Room creation atomicity (batch INSERT)
 - **009** — Room operations race conditions (5 findings — route through DO for serialization)
 
 ### Medium Priority
 - **001.5** — Stale federation key rejection (max staleness threshold)
-- **004.4-004.6** — D1 row size validation, N+1 query optimization
 - **005.1** — SyncDO resolver race (Map-based keying)
 - **005.7** — RoomDO in-memory map caps
 - **006.5** — Room join template validation
