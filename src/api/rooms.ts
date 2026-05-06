@@ -4,18 +4,20 @@ import { Hono } from 'hono';
 import type { AppEnv, RoomCreateContent, RoomMemberContent, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { generateRoomId, generateEventId, formatRoomAlias } from '../utils/ids';
-import { invalidateRoomCache } from '../services/room-cache';
+import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias } from '../utils/ids';
+import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
 import { calculateContentHash } from '../utils/crypto';
 import {
   createRoom,
   getRoom,
   storeEvent,
+  storeEventIdempotent,
   getRoomState,
   getStateEvent,
   getRoomEvents,
   updateMembership,
+  tryInsertJoinMembership,
   getMembership,
   getUserRooms,
   getRoomMembers,
@@ -528,9 +530,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
     return Errors.forbidden('Cannot join room').toResponse();
   }
 
-  // Create join event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   // Get current state for auth events
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
@@ -545,6 +544,14 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
   const prevEvents = latestEvents.map(e => e.event_id);
 
+  // Deterministic event ID — concurrent retries within the same 1s bucket
+  // collapse to the same ID, which combined with INSERT OR IGNORE makes the
+  // join idempotent under concurrency.
+  const ts = Date.now();
+  const eventId = await generateDeterministicEventId(
+    c.env.SERVER_NAME, roomId, userId, 'join', ts, 1, room.room_version
+  );
+
   const memberContent: RoomMemberContent = {
     membership: 'join',
   };
@@ -556,17 +563,26 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
     type: 'm.room.member',
     state_key: userId,
     content: memberContent,
-    origin_server_ts: Date.now(),
+    origin_server_ts: ts,
     depth: (latestEvents[0]?.depth ?? 0) + 1,
     auth_events: authEvents,
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
-  await updateMembership(c.env.DB, roomId, userId, 'join', eventId);
+  // Idempotent insert: if a concurrent request already wrote this exact
+  // event, INSERT OR IGNORE silently no-ops and we surface the existing one.
+  const insertResult = await storeEventIdempotent(c.env.DB, event);
 
-  // Notify room members about the join
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+  // Even if the event row already existed, we still need to ensure the
+  // membership row is consistent. tryInsertJoinMembership uses ON CONFLICT
+  // to preserve an existing 'join' row rather than overwriting it.
+  const memberResult = await tryInsertJoinMembership(c.env.DB, roomId, userId, eventId);
+
+  // Only notify on a genuinely new join — duplicate retries should not
+  // produce duplicate sync notifications.
+  if (insertResult.inserted || memberResult.inserted) {
+    await notifyUsersOfEvent(c.env, roomId, memberResult.eventId, 'm.room.member');
+  }
 
   return c.json({ room_id: roomId });
 });
@@ -843,6 +859,13 @@ app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
 });
 
 // PUT /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey? - Set state
+//
+// Permission and state writes are serialized via optimistic concurrency
+// (see issue 009 sub-finding 2/3). The auth basis is captured up front
+// (power_levels event id + the existing state event for this slot), then
+// re-validated immediately before the write. If anything has changed in
+// between, we abort with M_CONFLICT instead of overwriting based on stale
+// auth context. Clients should re-read room state and retry.
 app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
@@ -862,14 +885,25 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
     return Errors.badJson().toResponse();
   }
 
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
+  // Capture the auth basis at check-time.
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
-  const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+  const powerLevelsEventCheck = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+  const existingStateEventCheck = await getStateEvent(c.env.DB, roomId, eventType, stateKey);
+
+  // Power-level permission check. We re-read this just before writing.
+  const powerLevels = (powerLevelsEventCheck?.content as any) || {};
+  const userPower = powerLevels.users?.[userId] ?? powerLevels.users_default ?? 0;
+  const requiredPower = powerLevels.events?.[eventType]
+    ?? (eventType === 'm.room.member' ? (powerLevels.state_default ?? 50) : (powerLevels.state_default ?? 50));
+  if (userPower < requiredPower) {
+    return Errors.forbidden('Insufficient power level for this state event').toResponse();
+  }
+
+  const eventId = await generateEventId(c.env.SERVER_NAME);
 
   const authEvents: string[] = [];
   if (createEvent) authEvents.push(createEvent.event_id);
-  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
+  if (powerLevelsEventCheck) authEvents.push(powerLevelsEventCheck.event_id);
   if (membership) authEvents.push(membership.eventId);
 
   const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
@@ -888,12 +922,30 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
     prev_events: prevEvents,
   };
 
+  // Re-read the auth basis immediately before the write. If either the
+  // power level event or the slot we're writing has been replaced since
+  // our check, the original permission decision was made on stale data —
+  // refuse rather than silently overwriting another concurrent write.
+  const powerLevelsEventNow = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+  const existingStateEventNow = await getStateEvent(c.env.DB, roomId, eventType, stateKey);
+  if ((powerLevelsEventCheck?.event_id ?? null) !== (powerLevelsEventNow?.event_id ?? null)) {
+    return Errors.conflict('Power levels changed during request; retry').toResponse();
+  }
+  if ((existingStateEventCheck?.event_id ?? null) !== (existingStateEventNow?.event_id ?? null)) {
+    return Errors.conflict(`State event ${eventType}/${stateKey} changed during request; retry`).toResponse();
+  }
+
   await storeEvent(c.env.DB, event);
 
   // Invalidate room metadata cache if this is a metadata-affecting state event
   const CACHED_STATE_TYPES = ['m.room.name', 'm.room.avatar', 'm.room.topic', 'm.room.canonical_alias', 'm.room.member'];
   if (CACHED_STATE_TYPES.includes(eventType)) {
-    // Non-blocking cache invalidation
+    // Bump the cache generation first (see issue 009 sub-finding 4): even
+    // if the subsequent KV delete fails, readers that compare generations
+    // will reject the stale cached value.
+    await bumpRoomCacheGeneration(c.env.CACHE, roomId).catch((err) => {
+      console.warn(`[rooms] Cache generation bump failed for room ${roomId}:`, err);
+    });
     invalidateRoomCache(c.env.CACHE, roomId).catch((err) => {
       console.warn(`[rooms] Cache invalidation failed for room ${roomId}:`, err);
     });
@@ -1130,7 +1182,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  // Check power levels
+  // Check power levels (captured at check-time; re-validated just before write
+  // for optimistic concurrency — see issue 009 sub-finding 3).
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
   const powerLevels = powerLevelsEvent?.content as any || {};
   const userPower = powerLevels.users?.[userId] ?? powerLevels.users_default ?? 0;
@@ -1178,6 +1231,12 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     auth_events: authEvents,
     prev_events: prevEvents,
   };
+
+  // Optimistic concurrency: re-read power levels just before writing.
+  const powerLevelsNow = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+  if ((powerLevelsEvent?.event_id ?? null) !== (powerLevelsNow?.event_id ?? null)) {
+    return Errors.conflict('Power levels changed during invite; retry').toResponse();
+  }
 
   await storeEvent(c.env.DB, event);
   await updateMembership(c.env.DB, roomId, inviteeId, 'invite', eventId);
@@ -1720,9 +1779,6 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
     return Errors.forbidden('Cannot join room').toResponse();
   }
 
-  // Create join event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(db, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(db, roomId, 'm.room.power_levels');
 
@@ -1735,6 +1791,12 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   const { events: latestEvents } = await getRoomEvents(db, roomId, undefined, 1);
   const prevEvents = latestEvents.map(e => e.event_id);
 
+  // Deterministic event ID — see local-room join handler for rationale.
+  const ts = Date.now();
+  const eventId = await generateDeterministicEventId(
+    c.env.SERVER_NAME, roomId, userId, 'join', ts, 1, room.room_version
+  );
+
   const memberContent: RoomMemberContent = {
     membership: 'join',
   };
@@ -1746,14 +1808,14 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
     type: 'm.room.member',
     state_key: userId,
     content: memberContent,
-    origin_server_ts: Date.now(),
+    origin_server_ts: ts,
     depth: (latestEvents[0]?.depth ?? 0) + 1,
     auth_events: authEvents,
     prev_events: prevEvents,
   };
 
-  await storeEvent(db, event);
-  await updateMembership(db, roomId, userId, 'join', eventId);
+  await storeEventIdempotent(db, event);
+  await tryInsertJoinMembership(db, roomId, userId, eventId);
 
   return c.json({ room_id: roomId });
 });

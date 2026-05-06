@@ -325,6 +325,59 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
   return streamOrdering;
 }
 
+// Idempotent variant of storeEvent that uses INSERT OR IGNORE on the events
+// table. Returns true if a new row was inserted, false if the event_id was
+// already present (indicating a concurrent / retried write was deduplicated).
+//
+// When the event collides, no stream_ordering is consumed and no state is
+// updated — the caller can treat this as "the prior write won".
+export async function storeEventIdempotent(
+  db: D1Database,
+  event: PDU,
+): Promise<{ inserted: boolean; streamOrdering: number | null }> {
+  // Allocate stream ordering optimistically. If the event already exists we
+  // simply waste one stream id; this is preferable to checking-then-inserting
+  // (which races) and stream ids are cheap.
+  const posResult = await db.prepare(
+    `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
+  ).first<{ position: number }>();
+
+  const streamOrdering = posResult?.position ?? 1;
+
+  const insertResult = await db.prepare(
+    `INSERT OR IGNORE INTO events (event_id, room_id, sender, event_type, state_key, content,
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    event.event_id,
+    event.room_id,
+    event.sender,
+    event.type,
+    event.state_key ?? null,
+    JSON.stringify(event.content),
+    event.origin_server_ts,
+    event.unsigned ? JSON.stringify(event.unsigned) : null,
+    event.depth,
+    JSON.stringify(event.auth_events),
+    JSON.stringify(event.prev_events),
+    event.hashes ? JSON.stringify(event.hashes) : null,
+    event.signatures ? JSON.stringify(event.signatures) : null,
+    streamOrdering
+  ).run();
+
+  // D1 reports rows_written / changes — when 0, the row was ignored as a dup.
+  const inserted = (insertResult.meta?.changes ?? 0) > 0;
+
+  if (inserted && event.state_key !== undefined) {
+    await db.prepare(
+      `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
+       VALUES (?, ?, ?, ?)`
+    ).bind(event.room_id, event.type, event.state_key, event.event_id).run();
+  }
+
+  return { inserted, streamOrdering: inserted ? streamOrdering : null };
+}
+
 export async function getEvent(db: D1Database, eventId: string): Promise<PDU | null> {
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
@@ -527,6 +580,49 @@ export async function updateMembership(
     `INSERT OR REPLACE INTO room_memberships (room_id, user_id, membership, event_id, display_name, avatar_url)
      VALUES (?, ?, ?, ?, ?, ?)`
   ).bind(roomId, userId, membership, eventId, displayName ?? null, avatarUrl ?? null).run();
+}
+
+// Idempotent join: only writes a membership row if one does not already
+// exist with membership='join'. Returns the event_id that ultimately
+// represents this user's join (either the new one or the pre-existing one).
+//
+// This pairs with deterministic event IDs so that two concurrent join
+// requests collapse to a single membership event without producing
+// duplicate rows in `events` or flapping `room_memberships`.
+export async function tryInsertJoinMembership(
+  db: D1Database,
+  roomId: string,
+  userId: string,
+  eventId: string,
+  displayName?: string,
+  avatarUrl?: string
+): Promise<{ inserted: boolean; eventId: string }> {
+  const result = await db.prepare(
+    `INSERT INTO room_memberships (room_id, user_id, membership, event_id, display_name, avatar_url)
+     VALUES (?, ?, 'join', ?, ?, ?)
+     ON CONFLICT(room_id, user_id) DO UPDATE SET
+       membership = CASE
+         WHEN room_memberships.membership = 'join' THEN room_memberships.membership
+         ELSE excluded.membership
+       END,
+       event_id = CASE
+         WHEN room_memberships.membership = 'join' THEN room_memberships.event_id
+         ELSE excluded.event_id
+       END,
+       display_name = CASE
+         WHEN room_memberships.membership = 'join' THEN room_memberships.display_name
+         ELSE excluded.display_name
+       END,
+       avatar_url = CASE
+         WHEN room_memberships.membership = 'join' THEN room_memberships.avatar_url
+         ELSE excluded.avatar_url
+       END
+     RETURNING event_id`
+  ).bind(roomId, userId, eventId, displayName ?? null, avatarUrl ?? null)
+    .first<{ event_id: string }>();
+
+  const finalEventId = result?.event_id ?? eventId;
+  return { inserted: finalEventId === eventId, eventId: finalEventId };
 }
 
 export async function getMembership(
