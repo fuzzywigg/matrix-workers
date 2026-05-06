@@ -35,13 +35,21 @@ interface SlidingSyncConnectionState {
   roomSentAsRead?: Record<string, boolean>;
 }
 
+// Long-poll resolver entry. The `resolved` flag prevents double-resolution
+// when a notify and a timeout race for the same waiter.
+interface WaitEntry {
+  resolve: (hasEvents: boolean) => void;
+  resolved: boolean;
+}
+
 export class SyncDurableObject extends DurableObject<Env> {
   private sessions: Map<WebSocket, SyncSession> = new Map();
   private pendingEvents: PendingEvent[] = [];
   // In-memory cache for sliding sync state (persisted to storage on save)
   private slidingSyncStates: Map<string, SlidingSyncConnectionState> = new Map();
-  // Waiting resolvers for long-polling requests
-  private waitingResolvers: Array<(hasEvents: boolean) => void> = [];
+  // Waiting resolvers for long-polling requests, keyed by a unique waiter id
+  // so deletes by key are race-free with notify clearing the whole map.
+  private waitingResolvers: Map<string, WaitEntry> = new Map();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -192,7 +200,7 @@ export class SyncDurableObject extends DurableObject<Env> {
 
   private async handleNotify(request: Request): Promise<Response> {
     const data = await request.json() as PendingEvent;
-    console.log('[SyncDO] /notify received for event:', data.event_id, 'waiting resolvers:', this.waitingResolvers.length);
+    console.log('[SyncDO] /notify received for event:', data.event_id, 'waiting resolvers:', this.waitingResolvers.size);
 
     // Store pending event
     const key = `event:${data.event_id}`;
@@ -216,15 +224,20 @@ export class SyncDurableObject extends DurableObject<Env> {
       }
     }
 
-    // Wake up all waiting long-polling requests
-    const numResolvers = this.waitingResolvers.length;
-    const resolvers = this.waitingResolvers;
-    this.waitingResolvers = [];
-    for (const resolve of resolvers) {
-      resolve(true);
+    // Snapshot and clear before resolving so a recursive notify (e.g. via
+    // an awaited side-effect) cannot see the same entries again.
+    const entries = Array.from(this.waitingResolvers.values());
+    this.waitingResolvers.clear();
+    let woke = 0;
+    for (const entry of entries) {
+      if (!entry.resolved) {
+        entry.resolved = true;
+        entry.resolve(true);
+        woke++;
+      }
     }
-    if (numResolvers > 0) {
-      console.log('[SyncDO] Woke up', numResolvers, 'waiting request(s)');
+    if (woke > 0) {
+      console.log('[SyncDO] Woke up', woke, 'waiting request(s)');
     }
 
     return new Response('OK');
@@ -232,33 +245,34 @@ export class SyncDurableObject extends DurableObject<Env> {
 
   // Wait for events (used by long-polling sliding sync)
   private async handleWaitForEvents(request: Request): Promise<Response> {
+    const waiterId = crypto.randomUUID();
+    let entry: WaitEntry | null = null;
     try {
       const body = await request.json() as { timeout?: number };
       const timeout = Math.min(body.timeout || 25000, 25000); // Cap at 25s
 
-      console.log('[SyncDO] /wait-for-events started, timeout:', timeout, 'current waiters:', this.waitingResolvers.length);
+      console.log('[SyncDO] /wait-for-events started, timeout:', timeout, 'current waiters:', this.waitingResolvers.size);
 
-      let myResolver: ((hasEvents: boolean) => void) | null = null;
+      // Single shared promise; resolved either by notify (true) or timeout (false).
+      // The `resolved` flag ensures only the first resolution wins.
+      const hasEvents = await new Promise<boolean>((resolve) => {
+        const e: WaitEntry = { resolve, resolved: false };
+        entry = e;
+        this.waitingResolvers.set(waiterId, e);
 
-      // Create a promise that resolves when events arrive or timeout expires
-      const eventPromise = new Promise<boolean>((resolve) => {
-        myResolver = resolve;
-        this.waitingResolvers.push(resolve);
+        setTimeout(() => {
+          if (!e.resolved) {
+            e.resolved = true;
+            // Delete by key — safe even if notify already removed us.
+            this.waitingResolvers.delete(waiterId);
+            resolve(false);
+          }
+        }, timeout);
       });
 
-      const timeoutPromise = new Promise<boolean>((resolve) => {
-        setTimeout(() => resolve(false), timeout);
-      });
-
-      // Wait for either events or timeout
-      const hasEvents = await Promise.race([eventPromise, timeoutPromise]);
-
-      // Clean up our resolver from the array if timeout won
-      if (!hasEvents && myResolver) {
-        const index = this.waitingResolvers.indexOf(myResolver);
-        if (index !== -1) {
-          this.waitingResolvers.splice(index, 1);
-        }
+      // Defensive cleanup in case the entry is still mapped (e.g. early return path).
+      if (entry && this.waitingResolvers.get(waiterId) === entry) {
+        this.waitingResolvers.delete(waiterId);
       }
 
       console.log('[SyncDO] /wait-for-events completed, hasEvents:', hasEvents);
@@ -267,6 +281,8 @@ export class SyncDurableObject extends DurableObject<Env> {
         headers: { 'Content-Type': 'application/json' },
       });
     } catch (error) {
+      // Ensure we don't leak a waiter if json() or anything else throws.
+      this.waitingResolvers.delete(waiterId);
       console.error('[SyncDO] Error in wait-for-events:', error);
       return new Response(JSON.stringify({ hasEvents: false, error: 'Internal error' }), {
         status: 500,
