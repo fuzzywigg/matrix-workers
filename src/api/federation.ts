@@ -598,7 +598,10 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
-      // Verify content hash if present
+      // Verify content hash. Room versions 1-3 treat hashes as optional (legacy),
+      // but versions 4+ require them per the spec.
+      const roomVersionForHash = (pdu as any).room_version || '10';
+      const hashRequired = parseInt(roomVersionForHash, 10) >= 4;
       if (pdu.hashes?.sha256) {
         try {
           const hashValid = await verifyContentHash(pdu as Record<string, unknown>, pdu.hashes.sha256);
@@ -613,6 +616,17 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         } catch (hashErr) {
           console.warn(`[federation] Content hash check failed for ${eventId}:`, hashErr);
         }
+      } else if (hashRequired) {
+        // Room version 4+ requires content hash — reject PDUs that omit it.
+        const reason = `Missing required content hash for room version ${roomVersionForHash}`;
+        pduResults[eventId] = { error: reason };
+        await c.env.DB.prepare(
+          `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+           VALUES (?, ?, ?, ?, 0, ?)`
+        ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
+        continue;
+      } else {
+        console.warn(`[federation] PDU ${eventId} missing content hash (room version ${roomVersionForHash})`);
       }
 
       // Check if the room exists locally

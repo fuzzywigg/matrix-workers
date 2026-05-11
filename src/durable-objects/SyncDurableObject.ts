@@ -40,8 +40,9 @@ export class SyncDurableObject extends DurableObject<Env> {
   private pendingEvents: PendingEvent[] = [];
   // In-memory cache for sliding sync state (persisted to storage on save)
   private slidingSyncStates: Map<string, SlidingSyncConnectionState> = new Map();
-  // Waiting resolvers for long-polling requests
-  private waitingResolvers: Array<(hasEvents: boolean) => void> = [];
+  // Waiting resolvers for long-polling requests — keyed by unique request ID to
+  // prevent stale-index corruption when notify and timeout race.
+  private waitingResolvers: Map<string, (hasEvents: boolean) => void> = new Map();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -192,7 +193,7 @@ export class SyncDurableObject extends DurableObject<Env> {
 
   private async handleNotify(request: Request): Promise<Response> {
     const data = await request.json() as PendingEvent;
-    console.log('[SyncDO] /notify received for event:', data.event_id, 'waiting resolvers:', this.waitingResolvers.length);
+    console.log('[SyncDO] /notify received for event:', data.event_id, 'waiting resolvers:', this.waitingResolvers.size);
 
     // Store pending event
     const key = `event:${data.event_id}`;
@@ -217,10 +218,10 @@ export class SyncDurableObject extends DurableObject<Env> {
     }
 
     // Wake up all waiting long-polling requests
-    const numResolvers = this.waitingResolvers.length;
+    const numResolvers = this.waitingResolvers.size;
     const resolvers = this.waitingResolvers;
-    this.waitingResolvers = [];
-    for (const resolve of resolvers) {
+    this.waitingResolvers = new Map();
+    for (const resolve of resolvers.values()) {
       resolve(true);
     }
     if (numResolvers > 0) {
@@ -236,14 +237,15 @@ export class SyncDurableObject extends DurableObject<Env> {
       const body = await request.json() as { timeout?: number };
       const timeout = Math.min(body.timeout || 25000, 25000); // Cap at 25s
 
-      console.log('[SyncDO] /wait-for-events started, timeout:', timeout, 'current waiters:', this.waitingResolvers.length);
+      console.log('[SyncDO] /wait-for-events started, timeout:', timeout, 'current waiters:', this.waitingResolvers.size);
 
-      let myResolver: ((hasEvents: boolean) => void) | null = null;
+      // Unique key for this request so timeout cleanup is always safe,
+      // even if notify() races and clears the map simultaneously.
+      const resolverKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
       // Create a promise that resolves when events arrive or timeout expires
       const eventPromise = new Promise<boolean>((resolve) => {
-        myResolver = resolve;
-        this.waitingResolvers.push(resolve);
+        this.waitingResolvers.set(resolverKey, resolve);
       });
 
       const timeoutPromise = new Promise<boolean>((resolve) => {
@@ -253,13 +255,8 @@ export class SyncDurableObject extends DurableObject<Env> {
       // Wait for either events or timeout
       const hasEvents = await Promise.race([eventPromise, timeoutPromise]);
 
-      // Clean up our resolver from the array if timeout won
-      if (!hasEvents && myResolver) {
-        const index = this.waitingResolvers.indexOf(myResolver);
-        if (index !== -1) {
-          this.waitingResolvers.splice(index, 1);
-        }
-      }
+      // Clean up by key — safe even if notify() already removed it
+      this.waitingResolvers.delete(resolverKey);
 
       console.log('[SyncDO] /wait-for-events completed, hasEvents:', hasEvents);
 

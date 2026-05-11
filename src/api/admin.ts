@@ -13,6 +13,25 @@ import { fetchOIDCDiscovery } from '../services/oidc';
 
 const app = new Hono<AppEnv>();
 
+// Write an immutable audit log entry for a sensitive admin action.
+async function logAdminAction(
+  db: D1Database,
+  adminUserId: string,
+  action: string,
+  targetUserId?: string,
+  details?: string
+): Promise<void> {
+  try {
+    await db.prepare(
+      `INSERT INTO admin_audit_log (timestamp, admin_user_id, action, target_user_id, details)
+       VALUES (?, ?, ?, ?, ?)`
+    ).bind(Date.now(), adminUserId, action, targetUserId ?? null, details ?? null).run();
+  } catch (err) {
+    // Logging must never fail silently in a security context — record server-side even if DB write fails.
+    console.error(`[admin-audit] Failed to write audit log: action=${action} admin=${adminUserId} target=${targetUserId}:`, err);
+  }
+}
+
 // Admin authentication middleware
 const requireAdmin = createMiddleware<AppEnv>(async (c, next) => {
   const userId = c.get('userId');
@@ -260,6 +279,8 @@ app.delete('/admin/api/users/:userId', requireAuth(), requireAdmin, async (c) =>
   // Revoke all access tokens
   await db.prepare('DELETE FROM access_tokens WHERE user_id = ?').bind(userId).run();
 
+  await logAdminAction(db, c.get('userId'), 'deactivate_user', userId);
+
   // Invalidate stats cache
   await invalidateStatsCache(c.env);
 
@@ -293,6 +314,8 @@ app.post('/admin/api/users/:userId/reset-password', requireAuth(), requireAdmin,
 
   // Revoke all access tokens to force re-login
   await db.prepare('DELETE FROM access_tokens WHERE user_id = ?').bind(userId).run();
+
+  await logAdminAction(db, c.get('userId'), 'reset_password', userId);
 
   return c.json({ success: true });
 });
@@ -698,6 +721,8 @@ app.post('/admin/api/remove-admin', requireAuth(), requireAdmin, async (c) => {
     'UPDATE users SET admin = 0, updated_at = ? WHERE user_id = ?'
   ).bind(Date.now(), user_id).run();
 
+  await logAdminAction(c.env.DB, currentUserId, 'remove_admin', user_id);
+
   return c.json({ success: true });
 });
 
@@ -773,6 +798,8 @@ app.delete('/admin/api/users/:userId/purge', requireAuth(), requireAdmin, async 
 
   // Clean up cross-signing keys from KV (stored as user:{userId} in keys.ts)
   await c.env.CROSS_SIGNING_KEYS.delete(`user:${userId}`);
+
+  await logAdminAction(db, currentUserId, 'purge_user', userId, 'Permanently deleted all user data');
 
   // Invalidate stats cache
   await invalidateStatsCache(c.env);

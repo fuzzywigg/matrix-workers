@@ -252,10 +252,24 @@ export class RoomDurableObject extends DurableObject<Env> {
     });
   }
 
+  // Hard cap on simultaneous WebSocket connections per room DO instance.
+  // Cloudflare hibernates DOs between requests so the actual live count is
+  // from getWebSockets(), not the in-memory sessions map.
+  private static readonly MAX_CONNECTIONS = 500;
+
   private async handleWebSocket(request: Request): Promise<Response> {
     const upgradeHeader = request.headers.get('Upgrade');
     if (!upgradeHeader || upgradeHeader !== 'websocket') {
       return new Response('Expected websocket upgrade', { status: 426 });
+    }
+
+    // Enforce per-room connection cap before accepting a new socket.
+    const currentConnections = this.ctx.getWebSockets().length;
+    if (currentConnections >= RoomDurableObject.MAX_CONNECTIONS) {
+      return new Response(JSON.stringify({
+        errcode: 'M_LIMIT_EXCEEDED',
+        error: 'Too many concurrent connections to this room',
+      }), { status: 503, headers: { 'Content-Type': 'application/json' } });
     }
 
     // Get session info from query params

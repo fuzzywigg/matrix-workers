@@ -43,10 +43,14 @@ function getClientId(c: Context<AppEnv>): string {
     return `user:${userId}`;
   }
 
-  // Fall back to IP address
+  // In production all traffic flows through Cloudflare, so CF-Connecting-IP
+  // is the only trustworthy source. X-Forwarded-For is client-controllable
+  // and would allow trivial rate-limit bypass by rotating headers.
   const cfConnectingIp = c.req.header('CF-Connecting-IP');
-  const xForwardedFor = c.req.header('X-Forwarded-For');
-  const ip = cfConnectingIp || xForwardedFor?.split(',')[0]?.trim() || 'unknown';
+
+  // Fall back to a tight shared bucket so headerless traffic (direct origin
+  // hits or local dev) is still rate-limited rather than exempted.
+  const ip = cfConnectingIp || 'unknown';
 
   return `ip:${ip}`;
 }

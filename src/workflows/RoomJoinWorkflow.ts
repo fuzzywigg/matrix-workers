@@ -184,10 +184,33 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     let depth = 1;
 
     if (remoteEventTemplate?.event) {
-      // Use template from remote server
-      authEvents = remoteEventTemplate.event.auth_events || [];
-      prevEvents = remoteEventTemplate.event.prev_events || [];
-      depth = remoteEventTemplate.event.depth || 1;
+      const tmpl = remoteEventTemplate.event;
+
+      // Validate the remote template before trusting any of its fields.
+      // A malicious server could supply empty auth_events (bypassing auth),
+      // a depth ≤ 0 (breaking ordering), or a mismatched room_id.
+      const templateAuthEvents: unknown[] = Array.isArray(tmpl.auth_events) ? tmpl.auth_events : [];
+      const templatePrevEvents: unknown[] = Array.isArray(tmpl.prev_events) ? tmpl.prev_events : [];
+      const templateDepth = typeof tmpl.depth === 'number' ? tmpl.depth : 0;
+      const EVENT_ID_RE = /^\$[A-Za-z0-9_\-+/]+$/;
+
+      if (templateAuthEvents.length === 0) {
+        throw new Error('Remote make_join template has empty auth_events');
+      }
+      if (templatePrevEvents.length === 0) {
+        throw new Error('Remote make_join template has empty prev_events');
+      }
+      if (templateDepth <= 0) {
+        throw new Error(`Remote make_join template has invalid depth: ${templateDepth}`);
+      }
+      if (tmpl.room_id && tmpl.room_id !== roomId) {
+        throw new Error(`Remote make_join template room_id mismatch: expected ${roomId}, got ${tmpl.room_id}`);
+      }
+
+      // Filter out any malformed event IDs to prevent DAG corruption.
+      authEvents = (templateAuthEvents as string[]).filter(id => EVENT_ID_RE.test(id)).slice(0, 20);
+      prevEvents = (templatePrevEvents as string[]).filter(id => EVENT_ID_RE.test(id)).slice(0, 20);
+      depth = templateDepth;
     } else {
       // Get local room state
       const createEvent = await getStateEvent(this.env.DB, roomId, 'm.room.create');

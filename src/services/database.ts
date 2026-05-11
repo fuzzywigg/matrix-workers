@@ -251,8 +251,20 @@ export async function getRoom(db: D1Database, roomId: string): Promise<Room | nu
   };
 }
 
+// D1 has an approximate 1 MB per-row limit. Reject events that would exceed
+// 500 KB to stay well clear of the limit and avoid silent truncation.
+const MAX_EVENT_ROW_BYTES = 500_000;
+
 // Event operations
 export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
+  // Guard against oversized events before touching the database.
+  const rowEstimate = JSON.stringify(event).length;
+  if (rowEstimate > MAX_EVENT_ROW_BYTES) {
+    throw new Error(
+      `Event ${event.event_id} exceeds maximum row size (${rowEstimate} > ${MAX_EVENT_ROW_BYTES} bytes)`
+    );
+  }
+
   // Atomically allocate the next stream ordering using UPDATE...RETURNING.
   // This avoids the race condition where two concurrent calls both read
   // MAX(stream_ordering) and generate the same value.

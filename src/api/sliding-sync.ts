@@ -489,36 +489,40 @@ async function getRoomData(
     }));
   }
 
-  // Get required state
+  // Get required state — use db.batch() to execute all state queries in a
+  // single network round-trip instead of N sequential queries per room.
   if (config.requiredState && config.requiredState.length > 0) {
     result.required_state = [];
 
-    for (const [eventType, stateKey] of config.requiredState) {
-      let stateQuery = `
-        SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned
-        FROM room_state rs
-        JOIN events e ON rs.event_id = e.event_id
-        WHERE rs.room_id = ?
-      `;
-      const stateParams: any[] = [roomId];
+    const BASE_QUERY = `
+      SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned
+      FROM room_state rs
+      JOIN events e ON rs.event_id = e.event_id
+      WHERE rs.room_id = ?
+    `;
+
+    const stmts = config.requiredState.map(([eventType, stateKey]) => {
+      let q = BASE_QUERY;
+      const params: any[] = [roomId];
 
       if (eventType !== '*') {
-        stateQuery += ` AND rs.event_type = ?`;
-        stateParams.push(eventType);
+        q += ` AND rs.event_type = ?`;
+        params.push(eventType);
       }
 
       if (stateKey !== '*' && stateKey !== '') {
-        stateQuery += ` AND rs.state_key = ?`;
-        // Handle $ME placeholder - replace with actual user ID
-        const resolvedStateKey = stateKey === '$ME' ? userId : stateKey;
-        stateParams.push(resolvedStateKey);
+        q += ` AND rs.state_key = ?`;
+        params.push(stateKey === '$ME' ? userId : stateKey);
       } else if (stateKey === '') {
-        stateQuery += ` AND rs.state_key = ''`;
+        q += ` AND rs.state_key = ''`;
       }
 
-      const stateEvents = await db.prepare(stateQuery).bind(...stateParams).all();
+      return db.prepare(q).bind(...params);
+    });
 
-      for (const event of stateEvents.results as any[]) {
+    const batchResults = await db.batch(stmts);
+    for (const resultSet of batchResults) {
+      for (const event of resultSet.results as any[]) {
         try {
           result.required_state.push({
             type: event.event_type,

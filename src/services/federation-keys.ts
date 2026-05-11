@@ -27,6 +27,13 @@ interface RemoteServerKey {
 // Cache TTL for remote server keys (5 minutes for KV, longer in D1)
 const KEY_CACHE_TTL = 5 * 60;
 
+// Maximum age of a cached key that is accepted as a fallback when the remote
+// server cannot be reached. Keys older than 7 days could have been rotated and
+// an adversary who compromised the old key might force this fallback via DNS
+// poisoning. After MAX_KEY_STALENESS_MS the server is considered unreachable
+// and the request is rejected rather than accepting potentially stale material.
+const MAX_KEY_STALENESS_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 /**
  * Fetch and cache a remote server's signing keys
  */
@@ -91,9 +98,18 @@ export async function fetchRemoteServerKeys(
   } catch (error) {
     console.error(`Failed to fetch keys from ${serverName}:`, error);
 
-    // Fall back to D1 cache even if stale
+    // Fall back to D1 cache, but only if the keys are not too stale.
+    // Accepting arbitrarily old keys would allow an attacker who has
+    // compromised a rotated key to force a fallback via DNS poisoning.
     if (dbKeys.results.length > 0) {
-      return dbKeys.results;
+      const freshEnough = dbKeys.results.filter(
+        k => k.fetched_at > Date.now() - MAX_KEY_STALENESS_MS
+      );
+      if (freshEnough.length > 0) {
+        console.warn(`[federation-keys] Using cached keys for ${serverName} (network unreachable)`);
+        return freshEnough;
+      }
+      console.error(`[federation-keys] Cached keys for ${serverName} are too stale (>${MAX_KEY_STALENESS_MS / 86400000}d old), refusing fallback`);
     }
 
     throw new Error(`Cannot fetch signing keys from ${serverName}`);
