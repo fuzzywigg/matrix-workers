@@ -2,56 +2,60 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "matrix-worker",
   "main": "src/index.ts",
-  "compatibility_date": "2024-11-01",
+  "compatibility_date": "2025-01-01",
   "compatibility_flags": ["nodejs_compat"],
-  "account_id": "870e8509c92b6115e64a0cd8bb95ea97",
+  // Remove account_id — wrangler uses the authenticated account automatically.
+  // Set via: wrangler login
 
   "observability": {
     "enabled": true
   },
 
   // D1 Database for relational data (users, rooms, events, memberships)
+  // Replace database_id with the ID from: wrangler d1 create matrix-db
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "tuwunel-db",
-      "database_id": "36b31035-03de-40ed-8940-753d325bae27"
+      "database_name": "matrix-db",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
     }
   ],
 
   // KV Namespaces for fast lookups
+  // Replace each id with output from: wrangler kv namespace create <BINDING>
   "kv_namespaces": [
     {
       "binding": "SESSIONS",
-      "id": "366e0561b7054c2ebb07ceb44e8f92a5"
+      "id": "REPLACE_WITH_SESSIONS_KV_ID"
     },
     {
       "binding": "DEVICE_KEYS",
-      "id": "9c44be58428049ddbc69727e0e0ff3ef"
+      "id": "REPLACE_WITH_DEVICE_KEYS_KV_ID"
     },
     {
       "binding": "CACHE",
-      "id": "121081991bbb4b44806dd973ea185404"
+      "id": "REPLACE_WITH_CACHE_KV_ID"
     },
     {
       "binding": "CROSS_SIGNING_KEYS",
-      "id": "b3f387bf735b4fc684a25656f1808abc"
+      "id": "REPLACE_WITH_CROSS_SIGNING_KEYS_KV_ID"
     },
     {
       "binding": "ACCOUNT_DATA",
-      "id": "326dab002ae54bc7a10b99daad566670"
+      "id": "REPLACE_WITH_ACCOUNT_DATA_KV_ID"
     },
     {
       "binding": "ONE_TIME_KEYS",
-      "id": "c3739acd328748f5a966c3b7ff2a6352"
+      "id": "REPLACE_WITH_ONE_TIME_KEYS_KV_ID"
     }
   ],
 
   // R2 Bucket for media storage
+  // Replace bucket_name with the name from: wrangler r2 bucket create matrix-media
   "r2_buckets": [
     {
       "binding": "MEDIA",
-      "bucket_name": "tuwunel-media"
+      "bucket_name": "matrix-media"
     }
   ],
 
@@ -120,53 +124,47 @@
     }
   ],
 
-  // Environment variables
+  // Environment variables — customize for your deployment
   "vars": {
-    "SERVER_NAME": "m.easydemo.org",
+    // Set to your Matrix server domain (e.g. "matrix.fuzzywigg.com")
+    "SERVER_NAME": "matrix.example.com",
     "SERVER_VERSION": "0.1.0",
-    "TURN_KEY_ID": "42586a3b6b8415d1e69e825f169f3108",
-    "LIVEKIT_API_KEY": "devkey",
-    "LIVEKIT_URL": "wss://livekit.easydemo.org"
+    // TURN server config — replace with your TURN credentials or remove if unused
+    "TURN_KEY_ID": "REPLACE_WITH_YOUR_TURN_KEY_ID",
+    // LiveKit config — replace with your LiveKit deployment or remove if unused
+    "LIVEKIT_API_KEY": "REPLACE_WITH_YOUR_LIVEKIT_API_KEY",
+    "LIVEKIT_URL": "wss://REPLACE_WITH_YOUR_LIVEKIT_URL"
   },
 
-  // Secrets should be set using:
-  // npx wrangler secret put TURN_API_TOKEN
-  // npx wrangler secret put CALLS_APP_ID
-  // npx wrangler secret put CALLS_APP_SECRET
-  // npx wrangler secret put LIVEKIT_API_SECRET
-  //
-  // For email verification (3PID) via Cloudflare Email Service:
-  // npx wrangler secret put EMAIL_FROM       # From address (e.g., "noreply@m.easydemo.org")
-  //
-  // For direct APNs push notifications (optional - bypasses Sygnal):
-  // npx wrangler secret put APNS_KEY_ID      # Key ID from Apple Developer Portal
-  // npx wrangler secret put APNS_TEAM_ID     # Apple Developer Team ID
-  // npx wrangler secret put APNS_PRIVATE_KEY # Contents of .p8 file
-  // npx wrangler secret put APNS_ENVIRONMENT # "production" or "sandbox" (default: production)
-  //
-  // To create a Cloudflare Realtime SFU app:
-  // 1. Go to https://dash.cloudflare.com/?to=/:account/calls
-  // 2. Create a new Realtime App
-  // 3. Copy the App ID and App Secret
-  // Or use the API: https://developers.cloudflare.com/api/resources/calls/subresources/sfu/methods/create/
+  // Required secrets — set using wrangler secret put <NAME>
+  // wrangler secret put SIGNING_KEY        # openssl rand -base64 32
+  // wrangler secret put OIDC_ENCRYPTION_KEY # openssl rand -base64 32
+  // wrangler secret put TURN_API_TOKEN     # From your TURN provider
+  // wrangler secret put CALLS_APP_ID       # Cloudflare Realtime App ID (optional)
+  // wrangler secret put CALLS_APP_SECRET   # Cloudflare Realtime App Secret (optional)
+  // wrangler secret put LIVEKIT_API_SECRET # LiveKit API secret (optional)
+  // wrangler secret put EMAIL_FROM         # e.g. "noreply@matrix.example.com" (optional)
 
-  // Custom domain routing
-  "routes": [
-    {
-      "pattern": "m.easydemo.org",
-      "custom_domain": true
-    }
-  ],
+  // Custom domain routing — update pattern to your domain
+  // Remove this section and configure via Cloudflare dashboard instead if preferred
+  // "routes": [
+  //   {
+  //     "pattern": "matrix.example.com",
+  //     "custom_domain": true
+  //   }
+  // ],
 
-  // Workers VPC for LiveKit connectivity
+  // Workers VPC for LiveKit connectivity (optional)
+  // Replace service_id with your VPC service ID from Cloudflare dashboard
+  // Remove this binding if not using LiveKit via VPC
   "vpc_services": [
     {
       "binding": "LIVEKIT_API",
-      "service_id": "019b6a8b-4d9e-7751-bef5-7d9a3f1807a9"
+      "service_id": "REPLACE_WITH_YOUR_VPC_SERVICE_ID"
     }
   ],
 
-  // Cloudflare Email Service for 3PID email verification
+  // Cloudflare Email Service for 3PID email verification (optional)
   "send_email": [{ "name": "EMAIL", "remote": true }],
 
   // Cloudflare Workflows for durable multi-step operations
