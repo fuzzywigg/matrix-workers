@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 execute tuwunel-db --file=./migrations/schema.sql",
-    "db:migrate:local": "wrangler d1 execute tuwunel-db --local --file=./migrations/schema.sql",
+    "db:migrate": "wrangler d1 execute matrix-db --file=./migrations/schema.sql --remote",
+    "db:migrate:local": "wrangler d1 execute matrix-db --local --file=./migrations/schema.sql",
     "test": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/"

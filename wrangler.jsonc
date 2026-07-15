@@ -95,31 +95,31 @@
 		},
 		{
 			"tag": "v2",
-			"new_classes": [
+			"new_sqlite_classes": [
 				"CallRoomDurableObject"
 			]
 		},
 		{
 			"tag": "v3",
-			"new_classes": [
+			"new_sqlite_classes": [
 				"AdminDurableObject"
 			]
 		},
 		{
 			"tag": "v4",
-			"new_classes": [
+			"new_sqlite_classes": [
 				"UserKeysDurableObject"
 			]
 		},
 		{
 			"tag": "v5",
-			"new_classes": [
+			"new_sqlite_classes": [
 				"PushDurableObject"
 			]
 		},
 		{
 			"tag": "v6",
-			"new_classes": [
+			"new_sqlite_classes": [
 				"RateLimitDurableObject"
 			]
 		}
