@@ -40,22 +40,18 @@ wrangler r2 bucket create matrix-media
 
 ## Step 3: Update wrangler.jsonc
 
-Open `wrangler.jsonc` and fill in:
+`wrangler.jsonc` in this repo is checked in with the live `matrix.fuzzywigg.com` resource IDs. If you are deploying to a **different** Cloudflare account, replace these values with your own IDs from Step 2:
 
-| Placeholder | Replace with |
+| Field | Replace with |
 |---|---|
-| `REPLACE_WITH_YOUR_D1_DATABASE_ID` | D1 database_id from Step 2 |
-| `REPLACE_WITH_SESSIONS_KV_ID` | SESSIONS namespace id |
-| `REPLACE_WITH_DEVICE_KEYS_KV_ID` | DEVICE_KEYS namespace id |
-| `REPLACE_WITH_CACHE_KV_ID` | CACHE namespace id |
-| `REPLACE_WITH_CROSS_SIGNING_KEYS_KV_ID` | CROSS_SIGNING_KEYS namespace id |
-| `REPLACE_WITH_ACCOUNT_DATA_KV_ID` | ACCOUNT_DATA namespace id |
-| `REPLACE_WITH_ONE_TIME_KEYS_KV_ID` | ONE_TIME_KEYS namespace id |
-| `matrix.example.com` | Your domain (e.g. `matrix.fuzzywigg.com`) |
+| `d1_databases[0].database_id` | D1 `database_id` from Step 2 |
+| `kv_namespaces[*].id` | The matching namespace id for each of the six bindings (`SESSIONS`, `DEVICE_KEYS`, `CACHE`, `CROSS_SIGNING_KEYS`, `ACCOUNT_DATA`, `ONE_TIME_KEYS`) |
+| `vars.SERVER_NAME` | Your domain (e.g. `matrix.example.com`) |
+| `routes[0].pattern` | Your domain (or delete `routes` and configure a custom domain via the dashboard) |
 
-Also uncomment the `routes` section and set your domain, or configure via Cloudflare dashboard.
+Leave `d1_databases[0].database_name` as `matrix-db` — the `db:migrate` npm scripts target that name.
 
-Remove the `vpc_services` binding if you're not using LiveKit.
+**Durable Objects**: all eight DO classes are already declared in the `migrations` array using `new_sqlite_classes` (tags `v1`–`v6`). This is required — every DO class must appear in a `new_sqlite_classes` migration entry. If you add a new DO later, add a **new** migration tag for it; never use `new_classes` (legacy KV-backed DOs, unavailable on the free plan) and never edit already-deployed tags.
 
 ## Step 4: Run Database Migrations
 
@@ -63,7 +59,15 @@ Remove the `vpc_services` binding if you're not using LiveKit.
 npm run db:migrate
 ```
 
-This runs `schema.sql` followed by all numbered `migrations/0XX_*.sql` files against your D1 database.
+This applies `migrations/schema.sql` (the base schema) to your remote D1 database. The numbered migration files (`migrations/002_*.sql` … `migrations/019_*.sql`) are **not** applied by this script — apply them in order afterwards:
+
+```bash
+for f in $(ls migrations/0*.sql | sort); do
+  npx wrangler d1 execute matrix-db --remote --file="$f"
+done
+```
+
+(Note: two files share the `005` prefix and two share `017` — the loop above runs all of them.)
 
 ## Step 5: Set Required Secrets
 
