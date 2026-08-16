@@ -13,8 +13,8 @@ parent_governance: github.com/fuzzywigg/agents-governance
 ## Context
 
 This is a fork of nkuntz1934/matrix-workers (Tuwunel), a Matrix Spec v1.17 homeserver running
-entirely on Cloudflare's edge infrastructure. The fork is being adapted for Andrew's own
-Cloudflare account and domain (target: matrix.fuzzywigg.com or matrix.smtp.eth).
+entirely on Cloudflare's edge infrastructure. The live instance for this fork is
+`matrix.fuzzywigg.com` (see `DEPLOY.md` and committed `wrangler.jsonc`).
 
 Read `DEPLOY.md` before any deployment-related work.
 
