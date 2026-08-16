@@ -33,7 +33,7 @@ npm run db:migrate:local # Run D1 migrations (local)
 - `src/types/` — `env.ts` (Cloudflare bindings), `matrix.ts` (PDU/event types).
 - `src/utils/` — `crypto.ts` (hashing/signing), `ids.ts` (Matrix ID generation), `errors.ts` (MatrixApiError + Errors factory).
 - `src/admin/dashboard.ts` — Embedded admin web UI at `/admin`.
-- `migrations/` — D1 schema files (schema.sql + numbered migrations 002–011).
+- `migrations/` — D1 schema files (schema.sql + numbered migrations 002–019). Two files share the `005_` prefix (`005_idp_providers.sql`, `005_server_config.sql`) and two share the `017_` prefix (`017_query_optimization_and_size_limits.sql`, `017_room_memberships_unique.sql`); do not renumber existing files in place (see `DEPLOY.md`).
 
 **Storage bindings (defined in `wrangler.jsonc`):**
 - D1 `matrix-db` (binding `DB`) — Relational data (users, rooms, events, memberships, etc.)
