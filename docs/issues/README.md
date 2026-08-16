@@ -1,36 +1,38 @@
 # Tuwunel Issue Registry
 
-Comprehensive issue documentation from a full codebase audit conducted 2026-04-13. Each issue document contains a detailed problem narrative, per-finding breakdowns with file/line references, step-by-step remediation plans, and ideal resolution criteria.
+> **Audit snapshot (2026-04-13):** This registry documents findings from an April 2026 codebase audit. Per-issue file/line references are suspects — the tree has moved; treat line numbers as historical pointers, not current navigation.
 
-**Last updated:** 2026-05-06
+Comprehensive issue documentation from that audit. Each issue document contains a detailed problem narrative, per-finding breakdowns with file/line references, step-by-step remediation plans, and ideal resolution criteria.
+
+**Last updated:** 2026-08-16 (status table aligned to landed PRs on `main`)
 
 ---
 
 ## Resolution Status
 
-Of the 64 original findings, **55 have been resolved**:
+Of the 64 original findings, **most have landed on `main`**. Counts below reflect code that shipped (not the over-claims in some PR bodies). Line-level verification of every sub-finding is out of scope for this docs pass.
 
-| Status | Count |
-|--------|-------|
-| Resolved | 55 |
-| Remaining | 9 |
+| Status | Count (approx.) |
+|--------|-----------------|
+| Done (issue closed by landed PRs) | 7 issues (001–004, 006, 008–009) |
+| Mostly done (key sub-findings on `main`) | 3 issues (005, 007, 010) |
 
 ---
 
 ## Issue Index
 
-| # | Title | Severity | Findings | Resolved | Status |
-|---|-------|----------|----------|----------|--------|
+| # | Title | Severity | Findings | Resolved (landed) | Status |
+|---|-------|----------|----------|-------------------|--------|
 | [001](./001-federation-authentication-and-signing.md) | Federation Auth & Outbound Signing | **Critical** | 6 | 6 | **Done** |
 | [002](./002-authentication-session-security.md) | Authentication & Session Security | **Critical/High** | 8 | 8 | **Done** |
 | [003](./003-media-upload-download-security.md) | Media Upload & Download Security | **High** | 5 | 5 | **Done** |
-| [004](./004-database-integrity-and-transaction-safety.md) | Database Integrity & Transaction Safety | **Critical/High** | 6 | 6 | **Done** |
-| [005](./005-durable-object-lifecycle-memory-management.md) | Durable Object Lifecycle & Memory | **High** | 10 | 6 | In progress |
-| [006](./006-federation-event-validation-state-resolution.md) | Federation Event Validation | **High** | 8 | 8 | **Done** |
-| [007](./007-rate-limiting-dos-protection.md) | Rate Limiting & DoS Protection | **High** | 7 | 5 | Mostly done |
+| [004](./004-database-integrity-and-transaction-safety.md) | Database Integrity & Transaction Safety | **Critical/High** | 6 | 6 | **Done** (PR #8) |
+| [005](./005-durable-object-lifecycle-memory-management.md) | Durable Object Lifecycle & Memory | **High** | 10 | 8+ | Mostly done — **005.1** & **005.7** on `main` (PR #11); earlier commits covered more |
+| [006](./006-federation-event-validation-state-resolution.md) | Federation Event Validation | **High** | 8 | 8 | **Done** (PR #9) |
+| [007](./007-rate-limiting-dos-protection.md) | Rate Limiting & DoS Protection | **High** | 7 | 6 | Mostly done — **007.1** on `main` (PR #11); earlier commits covered more |
 | [008](./008-rtc-webrtc-authentication-gap.md) | RTC/WebRTC Auth Gap | **Critical** | 3 | 3 | **Done** |
-| [009](./009-room-operations-race-conditions.md) | Room Operations Race Conditions | **High** | 5 | 0 | Not started |
-| [010](./010-error-handling-information-leakage.md) | Error Handling & Information Leakage | **Medium** | 6 | 4 | In progress |
+| [009](./009-room-operations-race-conditions.md) | Room Operations Race Conditions | **High** | 5 | 5 | **Done** — PR #10 + `migrations/018_room_memberships_unique.sql` |
+| [010](./010-error-handling-information-leakage.md) | Error Handling & Information Leakage | **Medium** | 6 | 5 | Mostly done — **010.5** admin audit trail on `main` (PR #11) |
 
 ---
 
@@ -70,8 +72,26 @@ Of the 64 original findings, **55 have been resolved**:
 - **006**: Item 5 — `make_join` template from remote validated for room_id, sender, state_key, type, content.membership, non-empty auth_events / prev_events with valid IDs, supported room version, and positive depth before signing
 - **006**: Item 6 — `hashes.sha256` required for room versions ≥ 3; legacy room versions (1-2) still accepted without hash but logged
 
+### PR #8: Database integrity remainder
+- **004**: Remaining atomicity / row-size / N+1 / index items
+
+### PR #9: Federation validation remainder
+- **001** / **006**: Stale-key, join-template, and content-hash follow-through (see commit 8)
+
+### PR #10: Room operation race conditions (issue 009 — all 5)
+- **009.1** Join race — D1 batch + unique `room_memberships(room_id, user_id)` (also `migrations/018_room_memberships_unique.sql`, renumbered from a conflicting `017_*` name)
+- **009.2** / **009.3** State write interleaving / TOCTOU — idempotent store + optimistic concurrency (`M_CONFLICT`)
+- **009.4** Cache invalidation logging + generation bump
+- **009.5** Account data upsert / version awareness
+
+### PR #11: DO bounds, rate-limit IP trust, admin audit
+- **005.1** SyncDO resolver map keyed by waiter id
+- **005.7** RoomDO in-memory caps
+- **007.1** Prefer `CF-Connecting-IP`; `X-Forwarded-For` only when `TRUST_FORWARDED_FOR=true`
+- **010.5** `admin_audit_log` (migration 019) + `src/services/admin-audit.ts`
+
 ---
 
 ## Remaining Work
 
-No critical or high-severity findings remain open in this branch. Subsequent fixes for findings #001.5 (stale federation keys), #006.5 (join template validation), and #006.6 (content hash enforcement) ship in this PR. See companion PRs for issues #004 (database integrity), #009 (room race conditions), and DO/rate-limit/audit hardening.
+Issue **009 is done** on `main` (PR #10 + migration 018). Residual open work is mostly medium/low leftovers under **005**, **007**, and **010** (for example identity-reset rate limits, well-known cache TTL hardening, and admin QR login token handling) — re-audit against current line numbers before picking them up. Do not treat PR body “N/N Done” claims as a substitute for reading the tree.

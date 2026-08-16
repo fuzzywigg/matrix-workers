@@ -20,8 +20,8 @@ Read `DEPLOY.md` before any deployment-related work.
 
 ## Agent Instructions
 
-- **Never hardcode** account IDs, credentials, server names, or resource IDs
-- `wrangler.jsonc` is a template — actual IDs are HITL (Andrew must supply them)
+- `wrangler.jsonc` is checked in with the live `matrix.fuzzywigg.com` D1/KV resource IDs and `SERVER_NAME` (same fact as `DEPLOY.md`). Changing those IDs, bindings, or server name is HITL — do not invent, strip, or replace them
+- **Never hardcode** credentials or secrets into source or docs; do not print live Cloudflare resource IDs in new documentation
 - **Never modify existing migration files** — add a new numbered file instead
 - When touching `src/services/database.ts` or `src/middleware/auth.ts`, flag for human review
 - When touching `migrations/`, flag for human review before merging
