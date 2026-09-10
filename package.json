@@ -23,7 +23,7 @@
     "@types/uuid": "^11.0.0",
     "eslint": "^9.0.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.9",
+    "vitest": "^5.0.0",
     "wrangler": "^4.103.0"
   }
 }
