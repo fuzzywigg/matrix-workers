@@ -473,3 +473,15 @@ describe('media helpers TOKENMAXX edge paths after #54', () => {
     expect(clampThumbnailDimension('1e3', 32)).toBe(1);
   });
 });
+
+
+describe('media helpers TOKENMAXX edge paths after #55', () => {
+  it('decodes &amp;amp; once to &amp; via the AMP sentinel', () => {
+    expect(decodeHtmlEntities('&amp;amp;')).toBe('&amp;');
+  });
+
+  it('treats whitespace-only MIME type as unsupported after trim', () => {
+    expect(parseBaseContentType('   ;charset=utf-8')).toBe('');
+    expect(isSupportedContentType('   ;charset=utf-8')).toBe(false);
+  });
+});

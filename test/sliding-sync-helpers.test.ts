@@ -433,3 +433,13 @@ describe('sliding-sync TOKENMAXX edge paths after #54', () => {
     ).toBe(false);
   });
 });
+
+
+describe('sliding-sync TOKENMAXX edge paths after #55', () => {
+  it('does not flag small-timeline-limit for a single subscription at 6', () => {
+    const result = detectNSERequest(undefined, {
+      room_subscriptions: { '!a:example.com': { timeline_limit: 6 } },
+    });
+    expect(result.indicators).not.toContain('small-timeline-limit');
+  });
+});

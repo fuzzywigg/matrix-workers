@@ -352,3 +352,31 @@ describe('rate-limit TOKENMAXX edge paths after #54', () => {
     expect(getRateLimitType('/_matrix/federation/v1/sync', 'GET')).toBe('sync');
   });
 });
+
+
+describe('rate-limit TOKENMAXX edge paths after #55', () => {
+  it('classifies federation user/keys paths as e2ee (/keys/ checked before federation)', () => {
+    expect(getRateLimitType('/_matrix/federation/v1/user/keys/claim', 'POST')).toBe('e2ee');
+    expect(getRateLimitType('/_matrix/federation/v1/user/keys/query', 'POST')).toBe('e2ee');
+  });
+
+  it('does not classify /redact/ or /state/ room writes as send_message', () => {
+    expect(
+      getRateLimitType('/_matrix/client/v3/rooms/!r:s/redact/$e/t1', 'PUT')
+    ).toBe('default');
+    expect(
+      getRateLimitType('/_matrix/client/v3/rooms/!r:s/state/m.room.name/', 'PUT')
+    ).toBe('default');
+  });
+
+  it('trims whitespace on the first trusted X-Forwarded-For hop', () => {
+    expect(
+      getClientId(
+        makeContext({
+          headers: { 'X-Forwarded-For': ' 198.51.100.1 , 10.0.0.1' },
+          env: { TRUST_FORWARDED_FOR: 'true' },
+        })
+      )
+    ).toBe('ip:198.51.100.1');
+  });
+});

@@ -358,3 +358,109 @@ describe('CallRoom signaling TOKENMAXX edge paths after #54', () => {
     expect(state.storage.map.get('callId')).toBe('call-1');
   });
 });
+
+
+describe('CallRoom signaling TOKENMAXX edge paths after #55', () => {
+  it('rejects duplicate join with ALREADY_JOINED before SFU createSession', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const room = makeRoom(state) as any;
+    const ws = new FakeWebSocket();
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+    );
+
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'ALREADY_JOINED',
+    });
+    expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+  });
+
+  it('rejects answer without join with NOT_JOINED', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state) as any;
+    const ws = new FakeWebSocket();
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'answer', sdp: 'v=0' })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({ type: 'error', code: 'NOT_JOINED' });
+  });
+
+  it('returns TRACK_NOT_FOUND when joined but trackName is missing', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'mute', trackName: 'missing', muted: true })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'TRACK_NOT_FOUND',
+    });
+  });
+
+  it('persists mute state and broadcasts mute_changed to peers', async () => {
+    const state = new FakeState();
+    await state.storage.put(
+      'participant:u1|d1',
+      storedParticipant('u1', 'd1', { audio0: TRACK })
+    );
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const wsA = new FakeWebSocket();
+    wsA.serializeAttachment({ participantKey: 'u1|d1' });
+    const wsB = new FakeWebSocket();
+    wsB.serializeAttachment({ participantKey: 'u2|d2' });
+    state.sockets = [wsA, wsB];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      wsA,
+      JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })
+    );
+
+    const stored = state.storage.map.get('participant:u1|d1') as any;
+    expect(stored.tracks.audio0.enabled).toBe(false);
+    const changed = wsB.sent.map((s: string) => JSON.parse(s)).find(
+      (m: { type: string }) => m.type === 'mute_changed'
+    );
+    expect(changed).toMatchObject({
+      type: 'mute_changed',
+      oderId: 'u1',
+      deviceId: 'd1',
+      trackName: 'audio0',
+      muted: true,
+    });
+    expect(wsA.sent).toHaveLength(0);
+  });
+
+  it('handles leave via websocket message and notifies peers', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const wsA = new FakeWebSocket();
+    wsA.serializeAttachment({ participantKey: 'u1|d1' });
+    const wsB = new FakeWebSocket();
+    wsB.serializeAttachment({ participantKey: 'u2|d2' });
+    state.sockets = [wsA, wsB];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(wsA, JSON.stringify({ type: 'leave' }));
+
+    expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+    expect(wsA.closed?.code).toBe(1000);
+    const left = wsB.sent.map((s: string) => JSON.parse(s)).find(
+      (m: { type: string }) => m.type === 'participant_left'
+    );
+    expect(left?.oderId).toBe('u1');
+  });
+});

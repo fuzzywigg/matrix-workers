@@ -171,3 +171,11 @@ describe('isValidServerName TOKENMAXX edge paths after #54', () => {
     expect(isValidServerName('example.com.')).toBe(true);
   });
 });
+
+
+describe('isValidServerName TOKENMAXX edge paths after #55', () => {
+  it('allows public IPv6 with federation port and rejects loopback IPv6 with port', () => {
+    expect(isValidServerName('[2606:4700:4700::1111]:8448')).toBe(true);
+    expect(isValidServerName('[::1]:8448')).toBe(false);
+  });
+});

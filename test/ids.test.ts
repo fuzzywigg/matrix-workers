@@ -311,3 +311,12 @@ describe('ids TOKENMAXX edge paths after #53', () => {
     expect(isValidServerName('[2001:db8::1]:8448')).toBe(true);
   });
 });
+
+
+describe('ids TOKENMAXX edge paths after #55', () => {
+  it('documents getServerName vs parseUserId divergence on IPv6 user IDs', () => {
+    const id = '@alice:[::1]' as '@alice:example.com';
+    expect(getServerName(id)).toBe('1]');
+    expect(parseUserId(id)).toEqual({ localpart: 'alice', serverName: '[::1]' });
+  });
+});

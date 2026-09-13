@@ -313,3 +313,10 @@ describe('crypto TOKENMAXX edge paths after #52', () => {
     expect(canonicalJson({ '🔑': 1 })).toBe('{"🔑":1}');
   });
 });
+
+
+describe('crypto TOKENMAXX edge paths after #55', () => {
+  it('encodes bigint as null (falls through typeof branches)', () => {
+    expect(canonicalJson(1n)).toBe('null');
+  });
+});

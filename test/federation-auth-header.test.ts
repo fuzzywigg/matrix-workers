@@ -267,3 +267,15 @@ describe('parseAuthHeader / buildSignedRequest TOKENMAXX edge paths after #52', 
     expect((req.content as typeof content).signatures).toBe(content.signatures);
   });
 });
+
+
+describe('parseAuthHeader TOKENMAXX edge paths after #55', () => {
+  it('rejects tab or newline delimiters after the X-Matrix scheme', () => {
+    expect(
+      parseAuthHeader('X-Matrix\torigin="a.example.com",key="ed25519:k",sig="s"')
+    ).toBeNull();
+    expect(
+      parseAuthHeader('X-Matrix\norigin="a.example.com",key="ed25519:k",sig="s"')
+    ).toBeNull();
+  });
+});

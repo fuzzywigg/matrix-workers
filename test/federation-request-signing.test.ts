@@ -456,3 +456,53 @@ describe('verifyRemoteSignature TOKENMAXX edge paths after #54', () => {
   });
 });
 
+
+
+describe('federation signing TOKENMAXX edge paths after #55', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('returns null from getServerSigningKey when private_key_jwk is empty string', async () => {
+    const db = {
+      prepare: () => ({
+        first: async () => ({ key_id: 'ed25519:1', private_key_jwk: '' }),
+      }),
+    } as unknown as D1Database;
+    expect(await getServerSigningKey(db)).toBeNull();
+  });
+
+  it('still verifies at the exact DEFAULT_KEY_MAX_STALENESS boundary (not too stale)', async () => {
+    const pair = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.test', content: { n: 1 } },
+      'edge.example.com',
+      pair.keyId,
+      pair.privateKeyJwk
+    );
+    const now = Date.now();
+    const kv = mockKv({
+      'federation:keys:edge.example.com': JSON.stringify([
+        {
+          server_name: 'edge.example.com',
+          key_id: pair.keyId,
+          public_key: pair.publicKey,
+          valid_from: 0,
+          valid_until: now - DEFAULT_KEY_MAX_STALENESS_MS,
+          fetched_at: now,
+          verified: 1,
+        },
+      ]),
+    });
+    // isKeyTooStale uses `>` so equality remains within the grace window
+    expect(
+      await verifyRemoteSignature(signed, 'edge.example.com', pair.keyId, mockDb(), kv)
+    ).toBe(true);
+  });
+});

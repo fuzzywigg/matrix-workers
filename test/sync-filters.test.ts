@@ -290,3 +290,11 @@ describe('sync filters TOKENMAXX edge paths after #54', () => {
     ).toBe(false);
   });
 });
+
+
+describe('sync filters TOKENMAXX edge paths after #55', () => {
+  it('ignores NaN limits (falsy) and keeps full set for Infinity slice', () => {
+    expect(applyEventFilter(events, { limit: Number.NaN })).toEqual(events);
+    expect(applyEventFilter(events, { limit: Number.POSITIVE_INFINITY })).toEqual(events);
+  });
+});

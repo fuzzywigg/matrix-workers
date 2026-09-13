@@ -3,6 +3,7 @@ import {
   isIPLiteral,
   selectSRVRecord,
   buildServerUrl,
+  clearDiscoveryCache,
   type SRVRecord,
 } from '../src/services/server-discovery';
 
@@ -191,5 +192,37 @@ describe('server-discovery TOKENMAXX edge paths after #52', () => {
     expect(buildServerUrl({ host: 'example.com', port: 8448, tlsHostname: 'example.com' })).toBe(
       'https://example.com:8448'
     );
+  });
+});
+
+
+describe('server-discovery TOKENMAXX edge paths after #55', () => {
+  it('clearDiscoveryCache deletes the discovery: KV key and no-ops when missing', async () => {
+    const data: Record<string, string> = {
+      'discovery:matrix.org': JSON.stringify({ host: 'matrix.org', port: 443 }),
+      'other:key': 'keep',
+    };
+    const kv = {
+      get: async (key: string) => data[key] ?? null,
+      put: async (key: string, value: string) => {
+        data[key] = value;
+      },
+      delete: async (key: string) => {
+        delete data[key];
+      },
+      list: async () => ({ keys: [], list_complete: true, cacheStatus: null }),
+      getWithMetadata: async () => ({ value: null, metadata: null, cacheStatus: null }),
+    } as unknown as KVNamespace;
+
+    await clearDiscoveryCache('matrix.org', kv);
+    expect(data['discovery:matrix.org']).toBeUndefined();
+    expect(data['other:key']).toBe('keep');
+
+    await expect(clearDiscoveryCache('missing.example.com', kv)).resolves.toBeUndefined();
+  });
+
+  it('rejects empty and incomplete bracket forms as IP literals', () => {
+    expect(isIPLiteral('')).toBe(false);
+    expect(isIPLiteral('[')).toBe(false);
   });
 });
