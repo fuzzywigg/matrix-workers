@@ -226,6 +226,30 @@ describe('CallRoom hibernation: leave and close cleanup', () => {
     expect(state.storage.map.size).toBe(0);
     expect(room.participants.size).toBe(0);
   });
+
+  it('webSocketError triggers the same leave cleanup as webSocketClose', async () => {
+    const { state, wsA, wsB, room } = await seedTwoParticipantRoom();
+
+    await room.webSocketError(wsA, new Error('network'));
+
+    expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+    expect(room.participants.size).toBe(1);
+    const left = wsB.sent.map((s: string) => JSON.parse(s)).find(
+      (m: { type: string }) => m.type === 'participant_left'
+    );
+    expect(left?.oderId).toBe('u1');
+  });
+
+  it('webSocketError is a no-op leave when the socket has no attachment', async () => {
+    const { state, room } = await seedTwoParticipantRoom();
+    const bare = new FakeWebSocket();
+
+    await room.webSocketError(bare, 'boom');
+
+    expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+    expect(state.storage.map.has('participant:u2|d2')).toBe(true);
+    expect(room.participants.size).toBe(2);
+  });
 });
 
 describe('CallRoom hibernation: state endpoint', () => {

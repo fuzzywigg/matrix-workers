@@ -1415,3 +1415,76 @@ describe('checkEventAuth TOKENMAXX edge paths after #50', () => {
     expect(checkEventAuth(leave, state, '6').error).toMatch(/Not a member of the room/);
   });
 });
+
+describe('event-auth TOKENMAXX edge paths after #53', () => {
+  it('allows knocking while currently invited (only ban/join block knock)', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'invite', '@alice:example.com'),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'knock' },
+      }),
+    ];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'knock'), state, '10').allowed).toBe(
+      true
+    );
+  });
+
+  it('allows knocking with no prior membership on a knock room', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'knock' },
+      }),
+    ];
+    expect(checkEventAuth(memberEvent('@carol:example.com', 'knock'), state, '10').allowed).toBe(
+      true
+    );
+  });
+
+  it('allows inviting a user who is currently knocking', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'knock'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'invite', '@alice:example.com'), state, '10')
+        .allowed
+    ).toBe(true);
+  });
+
+  it('rejects self-leave while banned', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'ban', '@alice:example.com'),
+    ];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'leave'), state, '10').error).toMatch(
+      /Not a member of the room/
+    );
+  });
+
+  it('allows kicking a target with no membership when sender has kick power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@ghost:example.com', 'leave', '@alice:example.com'), state, '10')
+        .allowed
+    ).toBe(true);
+  });
+});

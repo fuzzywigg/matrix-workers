@@ -241,3 +241,25 @@ describe('sync filters TOKENMAXX edge paths after #52', () => {
     expect(applyEventFilter(events, { not_senders: [] })).toEqual(events);
   });
 });
+
+describe('sync filters TOKENMAXX edge paths after #53', () => {
+  it('excludes events missing sender when senders whitelist is set', () => {
+    const filtered = applyEventFilter(
+      [{ type: 'm.room.message' }, { type: 'm.room.message', sender: '@alice:example.com' }],
+      { senders: ['@alice:example.com'] }
+    );
+    expect(filtered).toEqual([{ type: 'm.room.message', sender: '@alice:example.com' }]);
+  });
+
+  it('excludes events missing type when types whitelist uses exact match', () => {
+    expect(
+      applyEventFilter([{ sender: '@alice:example.com' }, ...events], {
+        types: ['m.room.message'],
+      })
+    ).toEqual([{ type: 'm.room.message', sender: '@alice:example.com' }]);
+  });
+
+  it('parses legacy NaN tokens as zero positions', () => {
+    expect(parseSyncToken('NaN')).toEqual({ events: 0, toDevice: 0 });
+  });
+});

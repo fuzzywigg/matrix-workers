@@ -336,7 +336,6 @@ describe('sliding-sync TOKENMAXX edge paths after #50', () => {
   });
 });
 
-
 describe('sliding-sync TOKENMAXX edge paths after #52', () => {
   it('does not swap inverted ranges (endIndex may be less than startIndex)', () => {
     expect(resolveListRange({ range: [5, 1] }, 10)).toEqual({
@@ -361,5 +360,29 @@ describe('sliding-sync TOKENMAXX edge paths after #52', () => {
     expect(
       matchesSlidingRoomFilters('Room hq', false, { room_name_like: 'h.q' })
     ).toBe(false);
+  });
+});
+
+describe('detectNSERequest TOKENMAXX edge paths after #53', () => {
+  it('does not mark isLikelyNSE for a single indicator', () => {
+    const single = detectNSERequest(undefined, {
+      extensions: { to_device: { enabled: true }, account_data: { enabled: true } },
+    });
+    expect(single.indicators).toEqual(['minimal-extensions']);
+    expect(single.isLikelyNSE).toBe(false);
+  });
+
+  it('does not flag presence-only extensions as minimal-extensions', () => {
+    expect(
+      detectNSERequest(undefined, { extensions: { presence: { enabled: true } } }).indicators
+    ).not.toContain('minimal-extensions');
+  });
+
+  it('flags two non-typing/non-presence extensions as minimal-extensions', () => {
+    expect(
+      detectNSERequest(undefined, {
+        extensions: { to_device: { enabled: true }, account_data: { enabled: true } },
+      }).indicators
+    ).toContain('minimal-extensions');
   });
 });

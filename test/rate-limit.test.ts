@@ -315,3 +315,18 @@ describe('rate-limit TOKENMAXX edge paths after #52', () => {
     expect(getRateLimitType('/_matrix/key/v2/query', 'GET')).toBe('federation');
   });
 });
+
+describe('rate-limit TOKENMAXX edge paths after #53', () => {
+  it('prefers /login over /media when both substrings are present (POST)', () => {
+    expect(getRateLimitType('/_matrix/media/v3/login', 'POST')).toBe('login');
+    expect(getRateLimitType('/_matrix/media/v3/login', 'GET')).toBe('media_download');
+  });
+
+  it('classifies key/v2/server/<keyId> paths as federation', () => {
+    expect(getRateLimitType('/_matrix/key/v2/server/ed25519:abcd', 'GET')).toBe('federation');
+  });
+
+  it('treats whitespace-only userId as truthy for the user bucket', () => {
+    expect(getClientId(makeContext({ userId: ' ' }))).toBe('user: ');
+  });
+});

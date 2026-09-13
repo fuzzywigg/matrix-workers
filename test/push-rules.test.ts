@@ -475,3 +475,42 @@ describe('push-rules TOKENMAXX edge paths after #52', () => {
     expect(getNestedValue([{ name: 'y' }], '0.name')).toBe('y');
   });
 });
+
+describe('push-rules TOKENMAXX edge paths after #53', () => {
+  it('uses strict equality for event_property_is (number !== string)', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_is', key: 'content.count', value: 5 },
+        { content: { count: '5' } },
+        userId,
+        2
+      )
+    ).toBe(false);
+    expect(
+      matchesCondition(
+        { kind: 'event_property_is', key: 'content.count', value: 5 },
+        { content: { count: 5 } },
+        userId,
+        2
+      )
+    ).toBe(true);
+  });
+
+  it('stops getNestedValue when a mid-path value is null', () => {
+    expect(getNestedValue({ a: null }, 'a.b')).toBeUndefined();
+    expect(
+      matchesCondition(
+        { kind: 'event_match', key: 'a.b', pattern: 'x' },
+        { a: null },
+        userId,
+        2
+      )
+    ).toBe(false);
+  });
+
+  it('rejects room_member_count is: "==" with no digits', () => {
+    expect(
+      matchesCondition({ kind: 'room_member_count', is: '==' }, message, userId, 2)
+    ).toBe(false);
+  });
+});

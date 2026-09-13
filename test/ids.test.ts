@@ -304,3 +304,10 @@ describe('ids TOKENMAXX edge paths after #52', () => {
     expect(isLocalServerName('', 'example.com')).toBe(false);
   });
 });
+
+describe('ids TOKENMAXX edge paths after #53', () => {
+  it('accepts IPv6 literals that federation SSRF would reject', () => {
+    expect(isValidServerName('[::1]')).toBe(true);
+    expect(isValidServerName('[2001:db8::1]:8448')).toBe(true);
+  });
+});

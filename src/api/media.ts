@@ -61,6 +61,11 @@ export function clampThumbnailDimension(raw: string | undefined, fallback = 96):
   return Math.max(1, Math.min(parseInt(raw || String(fallback), 10) || fallback, 1920));
 }
 
+/** Map Matrix thumbnail `method` to Cloudflare Image Resizing `fit`. Exported for unit tests. */
+export function resolveThumbnailFit(method?: string): 'cover' | 'contain' {
+  return method === 'crop' ? 'cover' : 'contain';
+}
+
 // Add security headers to all media responses
 /** Exported for unit tests. */
 export function addMediaSecurityHeaders(headers: Headers): void {
@@ -335,7 +340,7 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
         image: {
           width,
           height,
-          fit: method === 'crop' ? 'cover' : 'contain',
+          fit: resolveThumbnailFit(method),
           format: 'jpeg',
           quality: 85,
         },
@@ -713,7 +718,7 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
           image: {
             width,
             height,
-            fit: method === 'crop' ? 'cover' : 'contain',
+            fit: resolveThumbnailFit(method),
             format: 'jpeg',
             quality: 85,
           },
