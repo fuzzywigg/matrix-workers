@@ -1,11 +1,14 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { parseAuthHeader } from '../src/middleware/federation-auth';
 import {
   DEFAULT_KEY_MAX_STALENESS_MS,
   signFederationRequest,
   verifyRemoteSignature,
+  getServerSigningKey,
+  federationGet,
   type SigningKey,
 } from '../src/services/federation-keys';
+import * as serverDiscovery from '../src/services/server-discovery';
 import {
   generateSigningKeyPair,
   signJson,
@@ -81,6 +84,10 @@ function mockDb(): D1Database {
         first: async () => null,
         run: async () => ({ meta: { changes: 0 } }),
       }),
+      // getServerSigningKey calls prepare().first() without bind()
+      first: async () => null,
+      all: async () => ({ results: [] }),
+      run: async () => ({ meta: { changes: 0 } }),
     }),
   } as unknown as D1Database;
 }
@@ -301,5 +308,148 @@ describe('verifyRemoteSignature staleness gate', () => {
     expect(
       await verifyRemoteSignature(signed, 'ok.example.com', pair.keyId, mockDb(), kv)
     ).toBe(true);
+  });
+});
+
+describe('getServerSigningKey', () => {
+  it('returns null when DB row is missing or private_key_jwk is null', async () => {
+    expect(await getServerSigningKey(mockDb())).toBeNull();
+
+    const nullJwkDb = {
+      prepare: () => ({
+        first: async () => ({ key_id: 'ed25519:1', private_key_jwk: null }),
+      }),
+    } as unknown as D1Database;
+    expect(await getServerSigningKey(nullJwkDb)).toBeNull();
+  });
+
+  it('parses a valid current signing key row', async () => {
+    const jwk = { kty: 'OKP', crv: 'Ed25519', d: 'x', x: 'y' };
+    const db = {
+      prepare: () => ({
+        first: async () => ({
+          key_id: 'ed25519:abc',
+          private_key_jwk: JSON.stringify(jwk),
+        }),
+      }),
+    } as unknown as D1Database;
+    await expect(getServerSigningKey(db)).resolves.toEqual({
+      keyId: 'ed25519:abc',
+      privateKeyJwk: jwk,
+    });
+  });
+});
+
+describe('federationGet', () => {
+  let restoreShim: (() => void) | undefined;
+
+  afterEach(() => {
+    restoreShim?.();
+    restoreShim = undefined;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('throws when server signing key is not configured', async () => {
+    await expect(
+      federationGet(
+        'remote.example.com',
+        '/_matrix/federation/v1/version',
+        'local.example.com',
+        mockDb(),
+        mockKv()
+      )
+    ).rejects.toThrow(/Server signing key not configured/);
+  });
+
+  it('signs GET with path-only URI and omits body', async () => {
+    restoreShim = installNodeEd25519Shim();
+    const pair = await generateSigningKeyPair();
+    const db = {
+      prepare: () => ({
+        first: async () => ({
+          key_id: pair.keyId,
+          private_key_jwk: JSON.stringify(pair.privateKeyJwk),
+        }),
+      }),
+    } as unknown as D1Database;
+
+    vi.spyOn(serverDiscovery, 'discoverServer').mockResolvedValue({
+      host: 'remote.example.com',
+      port: 443,
+      tlsHostname: 'remote.example.com',
+    });
+
+    const fetchMock = vi.fn(async () => new Response('{"server":{}}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await federationGet(
+      'remote.example.com',
+      '/_matrix/federation/v1/version',
+      'local.example.com',
+      db,
+      mockKv()
+    );
+    expect(res.status).toBe(200);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://remote.example.com/_matrix/federation/v1/version');
+    expect(init.method).toBe('GET');
+    expect(init.body).toBeUndefined();
+    const auth = String((init.headers as Record<string, string>).Authorization);
+    const parsed = parseAuthHeader(auth);
+    expect(parsed?.origin).toBe('local.example.com');
+    expect(parsed?.destination).toBe('remote.example.com');
+    expect(parsed?.key).toBe(pair.keyId);
+
+    const requestObj = {
+      method: 'GET',
+      uri: '/_matrix/federation/v1/version',
+      origin: 'local.example.com',
+      destination: 'remote.example.com',
+      signatures: {
+        'local.example.com': { [pair.keyId]: parsed!.sig },
+      },
+    };
+    expect(
+      await verifySignature(requestObj, 'local.example.com', pair.keyId, pair.publicKey)
+    ).toBe(true);
+  });
+});
+
+describe('verifyRemoteSignature wrong public key', () => {
+  let restoreShim: (() => void) | undefined;
+
+  afterEach(() => {
+    restoreShim?.();
+    restoreShim = undefined;
+  });
+
+  it('returns false when cached public key does not verify', async () => {
+    restoreShim = installNodeEd25519Shim();
+    const good = await generateSigningKeyPair();
+    const other = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.room.message', content: { body: 'hi' } },
+      'remote.example.com',
+      good.keyId,
+      good.privateKeyJwk
+    );
+    const kv = mockKv({
+      'federation:keys:remote.example.com': JSON.stringify([
+        {
+          server_name: 'remote.example.com',
+          key_id: good.keyId,
+          public_key: other.publicKey,
+          valid_from: 0,
+          valid_until: Date.now() + 86_400_000,
+          fetched_at: Date.now(),
+          verified: 1,
+        },
+      ]),
+    });
+    expect(
+      await verifyRemoteSignature(signed, 'remote.example.com', good.keyId, mockDb(), kv)
+    ).toBe(false);
   });
 });

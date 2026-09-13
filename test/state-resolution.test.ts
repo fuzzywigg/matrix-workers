@@ -375,3 +375,70 @@ describe('resolveState TOKENMAXX edge paths after #50', () => {
     expect(resolveStateV1([[dup], [dup]])).toEqual([dup]);
   });
 });
+
+describe('state-resolution TOKENMAXX edges after #54', () => {
+  it('ignores events without state_key in buildStateMap so peer name still resolves', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const powerLevels = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+      },
+    });
+    const named = nameEvent('keep', '$name-keep', 5);
+    const noKey = { ...nameEvent('ghost', '$name-nokey', 5) } as PDU & { state_key?: string };
+    delete noKey.state_key;
+
+    // noKey is dropped from its state map → named is conflicted (present in 1/2 sets)
+    const resolved = resolveState('10', [
+      [create, alice, powerLevels, named],
+      [create, alice, powerLevels, noKey as PDU],
+    ]);
+    expect(resolved.find((e) => e.type === 'm.room.name')?.event_id).toBe('$name-keep');
+    expect(resolved.find((e) => e.event_id === '$name-nokey')).toBeUndefined();
+  });
+
+  it('treats keys present in only one of N sets as conflicted then auth-applies', () => {
+    const create = createEvent();
+    const joinRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    const alice = member('@alice:example.com', 'join');
+    const powerLevels = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+      },
+    });
+    const topic = pdu({
+      type: 'm.room.topic',
+      event_id: '$topic-only',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { topic: 'hello' },
+      depth: 3,
+    });
+    const resolved = resolveState('10', [
+      [create, joinRules, alice, powerLevels],
+      [create, joinRules, alice, powerLevels, topic],
+    ]);
+    expect(resolved.find((e) => e.event_id === '$topic-only')?.content).toEqual({ topic: 'hello' });
+  });
+});

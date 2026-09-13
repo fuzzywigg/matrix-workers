@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  evaluatePushRules,
   matchesRule,
   matchesCondition,
   getNestedValue,
@@ -512,5 +513,364 @@ describe('push-rules TOKENMAXX edge paths after #53', () => {
     expect(
       matchesCondition({ kind: 'room_member_count', is: '==' }, message, userId, 2)
     ).toBe(false);
+  });
+});
+
+function mockPushDb(
+  rows: Array<{
+    kind: string;
+    rule_id: string;
+    conditions: string | null;
+    actions: string;
+    enabled: number;
+  }> = []
+): D1Database {
+  return {
+    prepare: () => ({
+      bind: () => ({
+        all: async () => ({ results: rows }),
+        first: async () => null,
+        run: async () => ({ meta: { changes: 0, last_row_id: 1 } }),
+      }),
+    }),
+  } as unknown as D1Database;
+}
+
+describe('evaluatePushRules (defaults + personalization)', () => {
+  const alice = '@alice:example.com';
+
+  it('notifies on invite_for_me only when state_key is the user', async () => {
+    const db = mockPushDb();
+    const forMe = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.member',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        state_key: alice,
+        content: { membership: 'invite' },
+      },
+      2
+    );
+    expect(forMe).toEqual({
+      notify: true,
+      highlight: false,
+      actions: ['notify', { set_tweak: 'sound', value: 'default' }],
+    });
+
+    const forOther = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.member',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        state_key: '@carol:example.com',
+        content: { membership: 'invite' },
+      },
+      2
+    );
+    // Falls through to .m.rule.member_event → dont_notify
+    expect(forOther.notify).toBe(false);
+    expect(forOther.actions).toEqual(['dont_notify']);
+  });
+
+  it('personalizes contains_user_name to the localpart with highlight', async () => {
+    const db = mockPushDb();
+    const hit = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'hey alice are you there', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(hit.notify).toBe(true);
+    expect(hit.highlight).toBe(true);
+
+    const miss = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'hey bob', msgtype: 'm.text' },
+      },
+      5
+    );
+    // Underride .m.rule.message — notify without highlight
+    expect(miss).toEqual({ notify: true, highlight: false, actions: ['notify'] });
+  });
+
+  it('matches is_user_mention when nested path matches getNestedValue traversal', async () => {
+    const db = mockPushDb();
+    // Code truth: key `content.m\\.mentions.user_ids` becomes dotted path content.m.mentions.user_ids
+    const hit = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: {
+          body: 'ping',
+          msgtype: 'm.text',
+          m: { mentions: { user_ids: [alice] } },
+        },
+      },
+      5
+    );
+    expect(hit.notify).toBe(true);
+    expect(hit.highlight).toBe(true);
+
+    // Spec-shaped `m.mentions` key is NOT traversed by getNestedValue today
+    const specShaped = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: {
+          body: 'ping',
+          msgtype: 'm.text',
+          'm.mentions': { user_ids: [alice] },
+        },
+      },
+      5
+    );
+    expect(specShaped.actions).toEqual(['notify']);
+    expect(specShaped.highlight).toBe(false);
+  });
+
+  it('suppresses notices via override before underride message', async () => {
+    const db = mockPushDb();
+    const result = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'bot says hi', msgtype: 'm.notice' },
+      },
+      5
+    );
+    expect(result).toEqual({ notify: false, highlight: false, actions: ['dont_notify'] });
+  });
+
+  it('does not let disabled master rule suppress everything', async () => {
+    const db = mockPushDb();
+    const result = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'hello', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(result.notify).toBe(true);
+  });
+
+  it('prefers room_one_to_one underride when memberCount is 2', async () => {
+    const db = mockPushDb();
+    const dm = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!dm:example.com',
+        content: { body: 'dm', msgtype: 'm.text' },
+      },
+      2
+    );
+    expect(dm.notify).toBe(true);
+    expect(dm.actions).toEqual(['notify', { set_tweak: 'sound', value: 'default' }]);
+
+    const group = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!g:example.com',
+        content: { body: 'group', msgtype: 'm.text' },
+      },
+      8
+    );
+    expect(group.actions).toEqual(['notify']);
+  });
+
+  it('honors custom DB override disabling .m.rule.message', async () => {
+    const db = mockPushDb([
+      {
+        kind: 'underride',
+        rule_id: '.m.rule.message',
+        conditions: JSON.stringify([
+          { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        ]),
+        actions: JSON.stringify(['notify']),
+        enabled: 0,
+      },
+    ]);
+    const result = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'silent', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(result).toEqual({ notify: false, actions: [], highlight: false });
+  });
+
+  it('tolerates malformed conditions/actions JSON from DB without throwing', async () => {
+    const db = mockPushDb([
+      {
+        kind: 'override',
+        rule_id: '.m.rule.custom_broken',
+        conditions: '{not-json',
+        actions: 'also-broken',
+        enabled: 1,
+      },
+    ]);
+    // Broken override has conditions undefined + empty actions → matchesRule returns true
+    // (no pattern, no conditions) → notify false because actions lack 'notify'
+    const result = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(result.notify).toBe(false);
+    expect(result.actions).toEqual([]);
+  });
+
+  it('treats bare highlight tweak as true and value:false as false', async () => {
+    const db = mockPushDb([
+      {
+        kind: 'override',
+        rule_id: '.m.rule.custom_hl',
+        conditions: JSON.stringify([
+          { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        ]),
+        actions: JSON.stringify(['notify', { set_tweak: 'highlight' }]),
+        enabled: 1,
+      },
+    ]);
+    const bare = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(bare.highlight).toBe(true);
+
+    const db2 = mockPushDb([
+      {
+        kind: 'override',
+        rule_id: '.m.rule.custom_nohl',
+        conditions: JSON.stringify([
+          { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        ]),
+        actions: JSON.stringify(['notify', { set_tweak: 'highlight', value: false }]),
+        enabled: 1,
+      },
+    ]);
+    const noHl = await evaluatePushRules(
+      db2,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(noHl.notify).toBe(true);
+    expect(noHl.highlight).toBe(false);
+  });
+
+  it('returns notify:false for dont_notify-only and empty actions', async () => {
+    const db = mockPushDb([
+      {
+        kind: 'override',
+        rule_id: '.m.rule.custom_quiet',
+        conditions: JSON.stringify([
+          { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        ]),
+        actions: JSON.stringify(['dont_notify']),
+        enabled: 1,
+      },
+    ]);
+    const quiet = await evaluatePushRules(
+      db,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(quiet.notify).toBe(false);
+
+    const dbEmpty = mockPushDb([
+      {
+        kind: 'override',
+        rule_id: '.m.rule.custom_empty',
+        conditions: JSON.stringify([
+          { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        ]),
+        actions: JSON.stringify([]),
+        enabled: 1,
+      },
+    ]);
+    const empty = await evaluatePushRules(
+      dbEmpty,
+      alice,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: '!r:example.com',
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(empty).toEqual({ notify: false, actions: [], highlight: false });
+  });
+
+  it('matches enabled rule with neither pattern nor conditions (master-style)', () => {
+    const rule: PushRule = {
+      rule_id: '.m.rule.master',
+      default: true,
+      enabled: true,
+      actions: ['dont_notify'],
+    };
+    expect(matchesRule(rule, message, userId, 2)).toBe(true);
   });
 });

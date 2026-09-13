@@ -3,6 +3,7 @@ import {
   isIPLiteral,
   selectSRVRecord,
   buildServerUrl,
+  clearDiscoveryCache,
   type SRVRecord,
 } from '../src/services/server-discovery';
 
@@ -191,5 +192,42 @@ describe('server-discovery TOKENMAXX edge paths after #52', () => {
     expect(buildServerUrl({ host: 'example.com', port: 8448, tlsHostname: 'example.com' })).toBe(
       'https://example.com:8448'
     );
+  });
+});
+
+
+describe('clearDiscoveryCache + all-zero SRV weights', () => {
+  it('deletes only discovery:{serverName}', async () => {
+    const store: Record<string, string> = {
+      'discovery:a.example.com': '{"host":"a"}',
+      'discovery:b.example.com': '{"host":"b"}',
+      'other:a.example.com': 'keep',
+    };
+    const cache = {
+      delete: async (key: string) => {
+        delete store[key];
+      },
+    } as unknown as KVNamespace;
+    await clearDiscoveryCache('a.example.com', cache);
+    expect(store['discovery:a.example.com']).toBeUndefined();
+    expect(store['discovery:b.example.com']).toBe('{"host":"b"}');
+    expect(store['other:a.example.com']).toBe('keep');
+  });
+
+  it('picks index 0 or last among two weight-0 peers based on Math.random', () => {
+    const a: SRVRecord = { priority: 0, weight: 0, port: 8448, target: 'a.example.com' };
+    const b: SRVRecord = { priority: 0, weight: 0, port: 8448, target: 'b.example.com' };
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    expect(selectSRVRecord([a, b]).target).toBe('a.example.com');
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    expect(selectSRVRecord([a, b]).target).toBe('b.example.com');
+  });
+
+  it('ignores higher-priority peers when selecting among lowest-priority zero-weight set', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const backup: SRVRecord = { priority: 10, weight: 0, port: 8448, target: 'backup.example.com' };
+    const p0: SRVRecord = { priority: 0, weight: 0, port: 8448, target: 'p0.example.com' };
+    const p1: SRVRecord = { priority: 0, weight: 0, port: 8448, target: 'p1.example.com' };
+    expect(selectSRVRecord([backup, p0, p1]).target).toBe('p0.example.com');
   });
 });

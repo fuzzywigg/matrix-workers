@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { generateLiveKitToken } from '../src/services/livekit';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+  generateLiveKitToken,
+  createLiveKitRoom,
+  listLiveKitRooms,
+  getLiveKitConfig,
+} from '../src/services/livekit';
+import type { Env } from '../src/types';
 
 function decodePart(part: string): Record<string, unknown> {
   const padded = part.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((part.length + 3) % 4);
@@ -86,5 +92,75 @@ describe('livekit TOKENMAXX edge paths after #50', () => {
     const token = await generateLiveKitToken('k', 's', 'room', 'id', 'Name', -10);
     const claims = decodePart(token.split('.')[1]) as { nbf: number; exp: number };
     expect(claims.exp).toBe(claims.nbf - 10);
+  });
+});
+
+
+describe('createLiveKitRoom / listLiveKitRooms / getLiveKitConfig', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function envWithApi(fetchImpl: (url: string, init?: RequestInit) => Promise<Response>): Env {
+    return {
+      LIVEKIT_API: { fetch: fetchImpl },
+      LIVEKIT_API_KEY: 'k',
+      LIVEKIT_API_SECRET: 's',
+      LIVEKIT_URL: 'wss://livekit.example.com',
+    } as unknown as Env;
+  }
+
+  it('getLiveKitConfig requires key, secret, and url', () => {
+    expect(getLiveKitConfig({} as Env)).toBeNull();
+    expect(
+      getLiveKitConfig({ LIVEKIT_API_KEY: 'k', LIVEKIT_API_SECRET: 's' } as unknown as Env)
+    ).toBeNull();
+    expect(
+      getLiveKitConfig({
+        LIVEKIT_API_KEY: 'k',
+        LIVEKIT_API_SECRET: 's',
+        LIVEKIT_URL: 'wss://x',
+      } as unknown as Env)
+    ).toEqual({ apiKey: 'k', apiSecret: 's', wsUrl: 'wss://x' });
+  });
+
+  it('createLiveKitRoom returns JSON on ok and null on !ok or throw', async () => {
+    const ok = await createLiveKitRoom(
+      envWithApi(async () => new Response(JSON.stringify({ room: { name: 'r', sid: 's1' } }), { status: 200 })),
+      'r'
+    );
+    expect(ok).toEqual({ room: { name: 'r', sid: 's1' } });
+
+    const bad = await createLiveKitRoom(
+      envWithApi(async () => new Response('nope', { status: 500 })),
+      'r'
+    );
+    expect(bad).toBeNull();
+
+    const boom = await createLiveKitRoom(
+      envWithApi(async () => {
+        throw new Error('vpc down');
+      }),
+      'r'
+    );
+    expect(boom).toBeNull();
+  });
+
+  it('listLiveKitRooms returns rooms on ok and null on !ok or throw', async () => {
+    const ok = await listLiveKitRooms(
+      envWithApi(async () => new Response(JSON.stringify({ rooms: [{ name: 'a' }] }), { status: 200 }))
+    );
+    expect(ok).toEqual({ rooms: [{ name: 'a' }] });
+
+    expect(
+      await listLiveKitRooms(envWithApi(async () => new Response('x', { status: 404 })))
+    ).toBeNull();
+    expect(
+      await listLiveKitRooms(
+        envWithApi(async () => {
+          throw new Error('fail');
+        })
+      )
+    ).toBeNull();
   });
 });

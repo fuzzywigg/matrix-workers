@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   isExclusiveAppServiceUser,
   isExclusiveAppServiceAlias,
   getInterestedAppServices,
+  sendAppServiceTransaction,
   type AppServiceRegistration,
 } from '../src/services/appservice';
 
@@ -324,5 +325,67 @@ describe('appservice TOKENMAXX edge paths after #53', () => {
     });
     expect(isExclusiveAppServiceUser([multi], '@_multi_bot:example.com')).toBe(multi);
     expect(isExclusiveAppServiceUser([multi], '@_soft_bot:example.com')).toBeNull();
+  });
+});
+
+describe('sendAppServiceTransaction', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function txnDb(tracker: { sql: string[]; binds: unknown[][] }) {
+    return {
+      prepare: (sql: string) => ({
+        bind: (...args: unknown[]) => {
+          tracker.sql.push(sql);
+          tracker.binds.push(args);
+          return {
+            run: async () => ({ meta: { changes: 1, last_row_id: 42 } }),
+          };
+        },
+      }),
+    } as unknown as D1Database;
+  }
+
+  it('PUTs events with Bearer hs_token and marks sent_at on success', async () => {
+    const tracker = { sql: [] as string[], binds: [] as unknown[][] };
+    const db = txnDb(tracker);
+    const events = [{ type: 'm.room.message', content: { body: 'hi' } }];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        expect(url).toBe('https://bridge.example.com/_matrix/app/v1/transactions/42');
+        expect(init?.method).toBe('PUT');
+        expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer hs-bridge');
+        expect(JSON.parse(init?.body as string)).toEqual({ events });
+        return new Response('{}', { status: 200 });
+      })
+    );
+
+    await expect(sendAppServiceTransaction(db, bridge, events)).resolves.toBe(true);
+    expect(tracker.sql[0]).toMatch(/INSERT INTO appservice_transactions/);
+    expect(tracker.sql[1]).toMatch(/SET sent_at/);
+    expect(tracker.binds[1][1]).toBe(42);
+  });
+
+  it('increments retry_count and returns false on non-OK response', async () => {
+    const tracker = { sql: [] as string[], binds: [] as unknown[][] };
+    const db = txnDb(tracker);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 500 })));
+    await expect(sendAppServiceTransaction(db, bridge, [])).resolves.toBe(false);
+    expect(tracker.sql.some((s) => /retry_count/.test(s))).toBe(true);
+  });
+
+  it('increments retry_count and returns false when fetch throws', async () => {
+    const tracker = { sql: [] as string[], binds: [] as unknown[][] };
+    const db = txnDb(tracker);
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network down');
+    }));
+    await expect(
+      sendAppServiceTransaction(db, bridge, [{ type: 'm.room.member' }])
+    ).resolves.toBe(false);
+    expect(tracker.sql.some((s) => /retry_count/.test(s))).toBe(true);
   });
 });
