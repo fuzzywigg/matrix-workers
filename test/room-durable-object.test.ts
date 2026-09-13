@@ -531,3 +531,245 @@ describe('RoomDurableObject TOKENMAXX clock boundaries after #61', () => {
     });
   });
 });
+
+describe('RoomDurableObject TOKENMAXX receipt/WS edges after #74', () => {
+  const NOW = 1_700_000_000_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('legacy load falls back when receipt_type is absent from storage key', async () => {
+    const { state, do: room } = makeRoom();
+    // Key ends with m.read but stored receipt_type is different → lastIndexOf fails
+    await state.storage.put('receipt:@u:ex.com:m.read', {
+      event_id: '$fb',
+      receipt_type: 'm.read.private',
+      ts: 7,
+    });
+
+    const body = (await (await room.fetch(new Request('https://do/receipts'))).json()) as {
+      receipts: Record<string, Record<string, Record<string, { ts: number }>>>;
+    };
+    // Fallback key: keyWithoutPrefix + :unthreaded → cache key "@u:ex.com:m.read:unthreaded"
+    // but user_id was never backfilled — GET still iterates cache values
+    expect(body.receipts.$fb['m.read.private']).toBeDefined();
+    const users = body.receipts.$fb['m.read.private'];
+    // user_id undefined → property key "undefined" in JS object assignment
+    expect(Object.values(users)[0].ts).toBe(7);
+  });
+
+  it('legacy load with thread_id uses threaded cache key and includes thread_id in GET', async () => {
+    const { state, do: room } = makeRoom();
+    await state.storage.put('receipt:@legacy:ex.com:m.read', {
+      event_id: '$th',
+      receipt_type: 'm.read',
+      ts: 11,
+      thread_id: '$t1',
+    });
+
+    const body = (await (await room.fetch(new Request('https://do/receipts'))).json()) as {
+      receipts: Record<
+        string,
+        Record<string, Record<string, { ts: number; thread_id?: string }>>
+      >;
+    };
+    expect(body.receipts.$th['m.read']['@legacy:ex.com']).toEqual({
+      ts: 11,
+      thread_id: '$t1',
+    });
+  });
+
+  it('PUT /receipt broadcasts to other users only', async () => {
+    const { state, do: room } = makeRoom();
+    const sender = new FakeWebSocket();
+    sender.serializeAttachment({
+      id: 's1',
+      userId: '@a:ex.com',
+      deviceId: null,
+    });
+    const peer = new FakeWebSocket();
+    peer.serializeAttachment({
+      id: 's2',
+      userId: '@b:ex.com',
+      deviceId: null,
+    });
+    state.sockets.push(sender, peer);
+
+    await room.fetch(
+      new Request('https://do/receipt', {
+        method: 'PUT',
+        body: JSON.stringify({
+          user_id: '@a:ex.com',
+          event_id: '$e',
+          receipt_type: 'm.read',
+        }),
+      })
+    );
+
+    const expected = JSON.stringify({
+      type: 'receipt',
+      user_id: '@a:ex.com',
+      event_id: '$e',
+      receipt_type: 'm.read',
+      ts: NOW,
+      room_id: '',
+      thread_id: undefined,
+    });
+    expect(peer.sent).toContain(expected);
+    expect(sender.sent).toEqual([]);
+  });
+
+  it('omits thread_id from GET when absent or explicitly unthreaded', async () => {
+    const { do: room } = makeRoom();
+    await room.fetch(
+      new Request('https://do/receipt', {
+        method: 'PUT',
+        body: JSON.stringify({
+          user_id: '@a:ex.com',
+          event_id: '$u1',
+          receipt_type: 'm.read',
+          thread_id: 'unthreaded',
+        }),
+      })
+    );
+    await room.fetch(
+      new Request('https://do/receipt', {
+        method: 'PUT',
+        body: JSON.stringify({
+          user_id: '@b:ex.com',
+          event_id: '$u2',
+          receipt_type: 'm.read',
+        }),
+      })
+    );
+
+    const body = (await (await room.fetch(new Request('https://do/receipts'))).json()) as {
+      receipts: Record<
+        string,
+        Record<string, Record<string, { ts: number; thread_id?: string }>>
+      >;
+    };
+    expect(body.receipts.$u1['m.read']['@a:ex.com']).toEqual({ ts: NOW });
+    expect(body.receipts.$u1['m.read']['@a:ex.com'].thread_id).toBeUndefined();
+    expect(body.receipts.$u2['m.read']['@b:ex.com']).toEqual({ ts: NOW });
+  });
+
+  it('setReceiptCacheLRU refreshes recency and evicts oldest past MAX_RECEIPTS_CACHE', async () => {
+    const { do: room } = makeRoom();
+    const cache = (
+      room as unknown as { receiptsCache: Map<string, unknown> }
+    ).receiptsCache;
+
+    for (let i = 0; i < 5000; i++) {
+      cache.set(`old:${i}`, {
+        user_id: `@u${i}:ex.com`,
+        event_id: `$e${i}`,
+        receipt_type: 'm.read',
+        ts: i,
+      });
+    }
+    // Refresh first key so it becomes newest; next insert should evict old:1 not old:0
+    const setLRU = (
+      room as unknown as {
+        setReceiptCacheLRU: (k: string, v: unknown) => void;
+      }
+    ).setReceiptCacheLRU.bind(room);
+    setLRU('old:0', {
+      user_id: '@u0:ex.com',
+      event_id: '$e0',
+      receipt_type: 'm.read',
+      ts: 0,
+    });
+    setLRU('new:cap', {
+      user_id: '@new:ex.com',
+      event_id: '$new',
+      receipt_type: 'm.read',
+      ts: 999,
+    });
+
+    expect(cache.size).toBe(5000);
+    expect(cache.has('old:0')).toBe(true);
+    expect(cache.has('old:1')).toBe(false);
+    expect(cache.has('new:cap')).toBe(true);
+  });
+
+  it('returns 404 for wrong methods on typing/receipt/receipts', async () => {
+    const { do: room } = makeRoom();
+    expect(
+      (await room.fetch(new Request('https://do/typing', { method: 'POST' }))).status
+    ).toBe(404);
+    expect((await room.fetch(new Request('https://do/receipt'))).status).toBe(404);
+    expect(
+      (
+        await room.fetch(new Request('https://do/receipts', { method: 'PUT' }))
+      ).status
+    ).toBe(404);
+  });
+
+  it('webSocketMessage swallows malformed JSON without throwing', async () => {
+    const { do: room } = makeRoom();
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ userId: '@a:ex.com', id: 's', deviceId: null });
+    await expect(
+      (
+        room as unknown as {
+          webSocketMessage: (ws: FakeWebSocket, m: string) => Promise<void>;
+        }
+      ).webSocketMessage(ws, '{bad')
+    ).resolves.toBeUndefined();
+    expect(ws.sent).toEqual([]);
+  });
+
+  it('websocket upgrade without device_id attaches deviceId null', async () => {
+    const { state, do: room } = makeRoom();
+    vi.stubGlobal(
+      'WebSocketPair',
+      class {
+        0 = new FakeWebSocket();
+        1 = new FakeWebSocket();
+      }
+    );
+
+    await expect(
+      room.fetch(
+        new Request('https://do/websocket?user_id=@a:ex.com&room_id=!r:ex.com', {
+          headers: { Upgrade: 'websocket' },
+        })
+      )
+    ).rejects.toThrow(/status/);
+
+    expect(state.sockets[0].deserializeAttachment()).toMatchObject({
+      userId: '@a:ex.com',
+      deviceId: null,
+    });
+  });
+
+  it('receipt broadcast swallows send throws on peer sockets', async () => {
+    const { state, do: room } = makeRoom();
+    const broken = new FakeWebSocket();
+    broken.serializeAttachment({ userId: '@b:ex.com', id: 'b', deviceId: null });
+    broken.send = () => {
+      throw new Error('closed');
+    };
+    state.sockets.push(broken);
+
+    const res = await room.fetch(
+      new Request('https://do/receipt', {
+        method: 'PUT',
+        body: JSON.stringify({
+          user_id: '@a:ex.com',
+          event_id: '$e',
+          receipt_type: 'm.read',
+        }),
+      })
+    );
+    expect(await res.text()).toBe('OK');
+  });
+});

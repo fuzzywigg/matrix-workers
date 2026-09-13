@@ -302,3 +302,171 @@ describe('AdminDurableObject TOKENMAXX clock boundaries after #61', () => {
     expect(tracker.firsts).toBeGreaterThan(afterWarm);
   });
 });
+
+function mockNullAdminDb() {
+  return {
+    prepare(_sql: string) {
+      return {
+        bind() {
+          return this;
+        },
+        async first() {
+          return null;
+        },
+      };
+    },
+  };
+}
+
+describe('AdminDurableObject TOKENMAXX edges after #74', () => {
+  const NOW = 1_700_000_000_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('PUT /config broadcasts config_changed to connected admin sockets', async () => {
+    const state = new FakeDurableObjectState();
+    const ws = new FakeWebSocket();
+    state.sockets.push(ws);
+    const { do: admin } = makeAdmin({}, state);
+
+    const put = await admin.fetch(
+      new Request('https://do/config', {
+        method: 'PUT',
+        body: JSON.stringify({ registration_enabled: false }),
+      })
+    );
+    expect(await put.json()).toEqual({
+      registration_enabled: false,
+      updated_at: NOW,
+    });
+    expect(ws.sent).toContain(
+      JSON.stringify({
+        type: 'config_changed',
+        config: { registration_enabled: false, updated_at: NOW },
+      })
+    );
+  });
+
+  it('zeroes stats fields when D1 first() returns null for all counts', async () => {
+    const { do: admin } = makeAdmin({
+      DB: mockNullAdminDb() as Env['DB'],
+    });
+    const stats = await admin.fetch(new Request('https://do/stats'));
+    expect(await stats.json()).toEqual({
+      users: { total: 0, active: 0, registrations_24h: 0 },
+      rooms: { total: 0 },
+      events: { total: 0, last_24h: 0 },
+      media: { count: 0, total_size_bytes: 0 },
+      unresolvedReports: 0,
+      lastUpdated: NOW,
+    });
+  });
+
+  it('rejects Upgrade header that is not exactly websocket (case-sensitive)', async () => {
+    const { do: admin } = makeAdmin();
+    const res = await admin.fetch(
+      new Request('https://do/websocket?user_id=@admin:ex.com', {
+        headers: { Upgrade: 'Websocket' },
+      })
+    );
+    expect(res.status).toBe(426);
+    expect(await res.text()).toBe('Expected websocket upgrade');
+  });
+
+  it('accepts websocket upgrade under WebSocketPair stub with tags and initial stats', async () => {
+    const state = new FakeDurableObjectState();
+    const { do: admin } = makeAdmin(
+      { DB: mockAdminDb({ count: 2 }) as Env['DB'] },
+      state
+    );
+    vi.stubGlobal(
+      'WebSocketPair',
+      class {
+        0 = new FakeWebSocket();
+        1 = new FakeWebSocket();
+      }
+    );
+
+    await expect(
+      admin.fetch(
+        new Request('https://do/websocket?user_id=@admin:ex.com', {
+          headers: { Upgrade: 'websocket' },
+        })
+      )
+    ).rejects.toThrow(/status/);
+
+    expect(state.sockets).toHaveLength(1);
+    expect(state.sockets[0].tags).toEqual(['admin', '@admin:ex.com']);
+    expect(state.sockets[0].deserializeAttachment()).toEqual({
+      userId: '@admin:ex.com',
+      connectedAt: NOW,
+    });
+    expect(state.sockets[0].sent.some((s) => s.includes('"type":"stats"'))).toBe(
+      true
+    );
+  });
+
+  it('webSocketMessage swallows malformed JSON without sending', async () => {
+    const { do: admin } = makeAdmin();
+    const ws = new FakeWebSocket();
+    await (
+      admin as unknown as {
+        webSocketMessage: (ws: FakeWebSocket, msg: string) => Promise<void>;
+      }
+    ).webSocketMessage(ws, '{not-json');
+    expect(ws.sent).toEqual([]);
+  });
+
+  it('broadcastToAdmins swallows send throws and still returns OK', async () => {
+    const state = new FakeDurableObjectState();
+    const broken = new FakeWebSocket();
+    broken.send = () => {
+      throw new Error('closed');
+    };
+    const ok = new FakeWebSocket();
+    state.sockets.push(broken, ok);
+    const { do: admin } = makeAdmin({}, state);
+
+    const res = await admin.fetch(
+      new Request('https://do/broadcast', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'notice' }),
+      })
+    );
+    expect(await res.text()).toBe('OK');
+    expect(ok.sent).toContain(JSON.stringify({ type: 'notice' }));
+  });
+
+  it('webSocketClose and webSocketError resolve without throwing', async () => {
+    const { do: admin } = makeAdmin();
+    const ws = new FakeWebSocket();
+    await expect(
+      (
+        admin as unknown as {
+          webSocketClose: (
+            ws: FakeWebSocket,
+            code: number,
+            reason: string,
+            clean: boolean
+          ) => Promise<void>;
+        }
+      ).webSocketClose(ws, 1000, 'bye', true)
+    ).resolves.toBeUndefined();
+
+    await expect(
+      (
+        admin as unknown as {
+          webSocketError: (ws: FakeWebSocket, err: unknown) => Promise<void>;
+        }
+      ).webSocketError(ws, new Error('boom'))
+    ).resolves.toBeUndefined();
+  });
+});
