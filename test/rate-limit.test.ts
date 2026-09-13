@@ -563,3 +563,76 @@ describe('rateLimitMiddleware / strictRateLimit TOKENMAXX after #60', () => {
     expect(next).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('rateLimitMiddleware fallback headers TOKENMAXX after #64', () => {
+  it('denies without retryAfterMs using RATE_LIMITS[type].windowMs', async () => {
+    const binding = mockRateLimitBinding(async () =>
+      Response.json({ allowed: false, remaining: 0 })
+    );
+    const next = vi.fn();
+    const ctx = makeContext({
+      path: '/_matrix/client/v3/login',
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': '203.0.113.40' },
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+
+    const result = (await rateLimitMiddleware(ctx, next)) as {
+      body: unknown;
+      status: number;
+      headers: Record<string, string>;
+    };
+    expect(result.status).toBe(429);
+    expect(result.body).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'Too many requests',
+      retry_after_ms: RATE_LIMITS.login.windowMs,
+    });
+    expect(result.headers['Retry-After']).toBe(String(RATE_LIMITS.login.windowMs / 1000));
+    expect(result.headers['X-RateLimit-Limit']).toBe(String(RATE_LIMITS.login.requests));
+    expect(result.headers['X-RateLimit-Remaining']).toBe('0');
+    expect(result.headers['X-RateLimit-Reset']).toBeUndefined();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('allows without resetAt and omits X-RateLimit-Reset', async () => {
+    const binding = mockRateLimitBinding(async () =>
+      Response.json({ allowed: true, remaining: 3 })
+    );
+    const next = vi.fn(async () => 'ok');
+    const ctx = makeContext({
+      path: '/_matrix/media/v3/upload',
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': '203.0.113.41' },
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+
+    await expect(rateLimitMiddleware(ctx, next)).resolves.toBe('ok');
+    const headers = (ctx as unknown as { _headers: Record<string, string> })._headers;
+    expect(headers['X-RateLimit-Limit']).toBe(String(RATE_LIMITS.media_upload.requests));
+    expect(headers['X-RateLimit-Remaining']).toBe('3');
+    expect(headers['X-RateLimit-Reset']).toBeUndefined();
+    expect(binding.idFromName).toHaveBeenCalledWith('media_upload');
+  });
+
+  it('uses federation windowMs fallback for federation bucket denies', async () => {
+    const binding = mockRateLimitBinding(async () =>
+      Response.json({ allowed: false, remaining: 0 })
+    );
+    const next = vi.fn();
+    const ctx = makeContext({
+      path: '/_matrix/federation/v1/send/txn',
+      method: 'PUT',
+      headers: { 'CF-Connecting-IP': '203.0.113.42' },
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+
+    const result = (await rateLimitMiddleware(ctx, next)) as {
+      body: { retry_after_ms: number };
+      status: number;
+    };
+    expect(result.status).toBe(429);
+    expect(result.body.retry_after_ms).toBe(RATE_LIMITS.federation.windowMs);
+    expect(binding.idFromName).toHaveBeenCalledWith('federation');
+  });
+});

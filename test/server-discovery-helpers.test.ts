@@ -472,3 +472,49 @@ describe('discoverServer TOKENMAXX algorithm + cache TTL after #63', () => {
     });
   });
 });
+
+describe('discoverServer well-known / DoH throw fallthrough TOKENMAXX after #64', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('falls through to default :8448 when well-known fetch throws and SRV fails', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/.well-known/matrix/server')) {
+        throw new Error('network reset');
+      }
+      // DoH non-OK → empty SRV answers
+      return new Response('upstream error', { status: 502 });
+    });
+
+    await expect(discoverServer('throw.example.com')).resolves.toEqual({
+      host: 'throw.example.com',
+      port: 8448,
+      tlsHostname: 'throw.example.com',
+    });
+  });
+
+  it('falls through when well-known throws and DoH Status is non-zero / missing Answer', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/.well-known/matrix/server')) {
+        throw new TypeError('failed to fetch');
+      }
+      if (u.includes('_matrix-fed._tcp')) {
+        return new Response(JSON.stringify({ Status: 2 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ Status: 0 }), { status: 200 }); // no Answer
+    });
+
+    await expect(discoverServer('doh-miss.example.com')).resolves.toEqual({
+      host: 'doh-miss.example.com',
+      port: 8448,
+      tlsHostname: 'doh-miss.example.com',
+    });
+  });
+});
