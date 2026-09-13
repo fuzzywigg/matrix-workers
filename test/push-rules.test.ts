@@ -3,6 +3,7 @@ import {
   matchesRule,
   matchesCondition,
   getNestedValue,
+  evaluatePushRules,
   type PushRule,
 } from '../src/api/push';
 
@@ -514,3 +515,179 @@ describe('push-rules TOKENMAXX edge paths after #53', () => {
     ).toBe(false);
   });
 });
+
+describe('evaluatePushRules TOKENMAXX edge paths after #54', () => {
+  function pushDb(rows: Array<Record<string, unknown>> = []) {
+    return {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async all<T>() {
+                return { results: rows as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  const roomId = '!r:example.com';
+
+  it('notifies for ordinary m.room.message via .m.rule.message underride', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'hi', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(result).toMatchObject({ notify: true, highlight: false });
+  });
+
+  it('suppresses member events that are not invite-for-me', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.member',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        state_key: '@carol:example.com',
+        content: { membership: 'join' },
+      },
+      5
+    );
+    expect(result.notify).toBe(false);
+  });
+
+  it('suppresses reactions and notices via override rules', async () => {
+    expect(
+      (
+        await evaluatePushRules(
+          pushDb(),
+          userId,
+          {
+            type: 'm.reaction',
+            sender: '@bob:example.com',
+            room_id: roomId,
+            content: { 'm.relates_to': { rel_type: 'm.annotation', key: '👍' } },
+          },
+          5
+        )
+      ).notify
+    ).toBe(false);
+
+    expect(
+      (
+        await evaluatePushRules(
+          pushDb(),
+          userId,
+          {
+            type: 'm.room.message',
+            sender: '@bob:example.com',
+            room_id: roomId,
+            content: { body: 'bot', msgtype: 'm.notice' },
+          },
+          5
+        )
+      ).notify
+    ).toBe(false);
+  });
+
+  it('notifies invite-for-me when state_key matches the user', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.member',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        state_key: userId,
+        content: { membership: 'invite' },
+      },
+      5
+    );
+    expect(result.notify).toBe(true);
+  });
+
+  it('highlights when the body contains the user localpart', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'hey Alice check this', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(result).toMatchObject({ notify: true, highlight: true });
+  });
+
+  it('does not blanket-suppress when the master rule remains disabled', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'still notify', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(result.notify).toBe(true);
+  });
+
+  it('ignores custom DB rules with enabled:0 and honors enabled:1 dont_notify overrides', async () => {
+    const disabled = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.disabled',
+          conditions: null,
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 0,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(disabled.notify).toBe(true);
+
+    const enabled = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.quiet',
+          conditions: null,
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(enabled.notify).toBe(false);
+  });
+});
+

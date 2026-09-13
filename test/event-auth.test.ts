@@ -1488,3 +1488,128 @@ describe('event-auth TOKENMAXX edge paths after #53', () => {
     ).toBe(true);
   });
 });
+
+
+describe('event-auth TOKENMAXX edge paths after #54', () => {
+  it('rejects create events with omitted state_key (undefined !== empty string)', () => {
+    const create = pdu({
+      type: 'm.room.create',
+      event_id: '$nocreatekey',
+      sender: '@alice:example.com',
+      prev_events: [],
+      depth: 0,
+      content: { creator: '@alice:example.com', room_version: '10' },
+    });
+    // intentionally omit state_key
+    delete (create as { state_key?: string }).state_key;
+    expect(checkEventAuth(create, []).error).toMatch(/empty state_key/);
+  });
+
+  it('allows re-join after leave on a public room', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'leave'),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'public' },
+      }),
+    ];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'join'), state, '10').allowed).toBe(true);
+  });
+
+  it('rejects re-join after leave when join_rule defaults to invite', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'leave'),
+    ];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'join'), state, '10').error).toMatch(
+      /Not authorized to join/
+    );
+  });
+
+  it('allows inviting a user who is already invited', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'invite', '@alice:example.com'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'invite', '@alice:example.com'), state, '10')
+        .allowed
+    ).toBe(true);
+  });
+
+  it('allows kicking and banning an invited target with sufficient power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'invite', '@alice:example.com'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'leave', '@alice:example.com'), state, '10')
+        .allowed
+    ).toBe(true);
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'ban', '@alice:example.com'), state, '10')
+        .allowed
+    ).toBe(true);
+  });
+
+  it('rejects first power_levels that set users_default above the sender level', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50 }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl2',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50 },
+        users_default: 60,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').error).toMatch(/higher than own/);
+  });
+
+  it('allows lowering another user PL when sender power is strictly greater than old level', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100, '@bob:example.com': 50 }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl3',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100, '@bob:example.com': 20 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').allowed).toBe(true);
+  });
+});

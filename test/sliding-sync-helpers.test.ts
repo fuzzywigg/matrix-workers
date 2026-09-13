@@ -386,3 +386,50 @@ describe('detectNSERequest TOKENMAXX edge paths after #53', () => {
     ).toContain('minimal-extensions');
   });
 });
+
+
+describe('sliding-sync TOKENMAXX edge paths after #54', () => {
+  it('does not mark isLikelyNSE for a lone no-extensions indicator', () => {
+    // Empty/omitted extensions always adds no-extensions; a single indicator is not NSE.
+    const result = detectNSERequest(undefined, {
+      lists: {},
+      room_subscriptions: {},
+      extensions: { typing: { enabled: true }, presence: { enabled: true }, to_device: { enabled: true } },
+    });
+    expect(result.indicators).not.toContain('no-extensions');
+    expect(result.indicators).not.toContain('minimal-extensions');
+    expect(result.isLikelyNSE).toBe(false);
+
+    const bare = detectNSERequest(undefined, {});
+    expect(bare.indicators).toEqual(['no-extensions']);
+    expect(bare.isLikelyNSE).toBe(false);
+  });
+
+  it('does not treat Element X iOS alone as user-agent-different-ios', () => {
+    // Gate: iOS without "Element X iOS" → user-agent-different-ios; Element X iOS exempt.
+    const mainApp = detectNSERequest('Element X iOS/1.0', {});
+    expect(mainApp.indicators).not.toContain('user-agent-different-ios');
+
+    const otherIos = detectNSERequest('SomeOther iOS/1.0', {});
+    expect(otherIos.indicators).toContain('user-agent-different-ios');
+  });
+
+  it('clamps range endIndex when roomCount is 0 even if range requests a window', () => {
+    expect(resolveListRange({ range: [0, 10] }, 0)).toEqual({ startIndex: 0, endIndex: -1 });
+  });
+
+  it('requires both is_dm and room_name_like when both are set (AND)', () => {
+    expect(
+      matchesSlidingRoomFilters('Matrix HQ', true, {
+        is_dm: true,
+        room_name_like: 'hq',
+      })
+    ).toBe(true);
+    expect(
+      matchesSlidingRoomFilters('Matrix HQ', false, {
+        is_dm: true,
+        room_name_like: 'hq',
+      })
+    ).toBe(false);
+  });
+});

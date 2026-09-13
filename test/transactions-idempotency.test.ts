@@ -179,3 +179,49 @@ describe('getTransaction / storeTransaction / cleanupOldTransactions', () => {
     expect(db.store.has(newKey)).toBe(true);
   });
 });
+
+
+describe('transactions TOKENMAXX edge paths after #54', () => {
+  it('treats empty-string txnId as missing (falsy guard)', async () => {
+    const db = createTxnDb();
+    expect(await checkTransactionIdempotency(db, '@u:ex.com', '')).toEqual({ cached: false });
+    const handler = vi.fn(async () => ({ eventId: '$e', response: { event_id: '$e' } }));
+    const wrapped = withIdempotency(handler);
+    await expect(wrapped(db, '@u:ex.com', '')).resolves.toEqual({ event_id: '$e' });
+    expect(db.store.size).toBe(0);
+  });
+
+  it('stores null for falsy response values (0 / false) via truthy stringify guard', async () => {
+    const db = createTxnDb();
+    await storeTransaction(db, '@u:ex.com', 't0', '$ev', 0);
+    await storeTransaction(db, '@u:ex.com', 'tf', '$ev', false);
+    expect(await getTransaction(db, '@u:ex.com', 't0')).toEqual({
+      eventId: '$ev',
+      response: undefined,
+    });
+    expect(await getTransaction(db, '@u:ex.com', 'tf')).toEqual({
+      eventId: '$ev',
+      response: undefined,
+    });
+  });
+
+  it('uses the default 24h retention cutoff when maxAgeMs is omitted', async () => {
+    const db = createTxnDb();
+    const oldKey = '@u:ex.com:ancient';
+    const recentKey = '@u:ex.com:recent';
+    db.store.set(oldKey, {
+      event_id: '$a',
+      response: null,
+      created_at: Date.now() - 25 * 60 * 60 * 1000,
+    } as TxnRow & { created_at: number });
+    db.store.set(recentKey, {
+      event_id: '$b',
+      response: null,
+      created_at: Date.now() - 60_000,
+    } as TxnRow & { created_at: number });
+
+    expect(await cleanupOldTransactions(db)).toBe(1);
+    expect(db.store.has(oldKey)).toBe(false);
+    expect(db.store.has(recentKey)).toBe(true);
+  });
+});

@@ -330,3 +330,25 @@ describe('rate-limit TOKENMAXX edge paths after #53', () => {
     expect(getClientId(makeContext({ userId: ' ' }))).toBe('user: ');
   });
 });
+
+
+describe('rate-limit TOKENMAXX edge paths after #54', () => {
+  it('does not classify /keys without trailing slash as e2ee', () => {
+    expect(getRateLimitType('/_matrix/client/v3/keys', 'POST')).toBe('default');
+    expect(getRateLimitType('/_matrix/client/v3/keys/upload', 'POST')).toBe('e2ee');
+  });
+
+  it('classifies HEAD/PATCH media as media_download (non-POST/PUT)', () => {
+    expect(getRateLimitType('/_matrix/media/v3/download/s/m', 'HEAD')).toBe('media_download');
+    expect(getRateLimitType('/_matrix/media/v3/upload', 'PATCH')).toBe('media_download');
+  });
+
+  it('requires POST for createRoom; PUT falls through to default', () => {
+    expect(getRateLimitType('/_matrix/client/v3/createRoom', 'POST')).toBe('create_room');
+    expect(getRateLimitType('/_matrix/client/v3/createRoom', 'PUT')).toBe('default');
+  });
+
+  it('prefers /sync over /_matrix/federation when both substrings appear', () => {
+    expect(getRateLimitType('/_matrix/federation/v1/sync', 'GET')).toBe('sync');
+  });
+});

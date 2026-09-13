@@ -263,3 +263,30 @@ describe('sync filters TOKENMAXX edge paths after #53', () => {
     expect(parseSyncToken('NaN')).toEqual({ events: 0, toDevice: 0 });
   });
 });
+
+
+describe('sync filters TOKENMAXX edge paths after #54', () => {
+  it('keeps events missing sender when only not_senders is set', () => {
+    const filtered = applyEventFilter(
+      [{ type: 'm.room.message' }, { type: 'm.room.message', sender: '@bob:example.com' }],
+      { not_senders: ['@bob:example.com'] }
+    );
+    expect(filtered).toEqual([{ type: 'm.room.message' }]);
+  });
+
+  it('matches m.room.* types without matching m.reaction', () => {
+    expect(applyEventFilter(events, { types: ['m.room.*'] }).map((e) => e.type)).toEqual([
+      'm.room.message',
+      'm.room.member',
+    ]);
+  });
+
+  it('excludes a room listed in both rooms and not_rooms', () => {
+    expect(
+      shouldIncludeRoom('!both:example.com', {
+        rooms: ['!both:example.com', '!other:example.com'],
+        not_rooms: ['!both:example.com'],
+      })
+    ).toBe(false);
+  });
+});
