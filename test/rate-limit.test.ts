@@ -1,20 +1,5 @@
 import { describe, it, expect } from 'vitest';
-
-// Pure function extracted for testing — mirrors src/middleware/rate-limit.ts
-function getRateLimitType(path: string, method: string): string {
-  if (path.includes('/login') && method === 'POST') return 'login';
-  if (path.includes('/register') && method === 'POST') return 'register';
-  if (path.includes('/sync')) return 'sync';
-  if (path.includes('/keys/')) return 'e2ee';
-  if (path.includes('/media') || path.includes('/upload')) {
-    return method === 'POST' || method === 'PUT' ? 'media_upload' : 'media_download';
-  }
-  if (path.includes('/search')) return 'search';
-  if (path.includes('/_matrix/federation') || path.includes('/_matrix/key')) return 'federation';
-  if (path.includes('/createRoom') && method === 'POST') return 'create_room';
-  if (path.match(/\/rooms\/[^/]+\/send/) && method === 'PUT') return 'send_message';
-  return 'default';
-}
+import { getRateLimitType, RATE_LIMITS } from '../src/middleware/rate-limit';
 
 describe('getRateLimitType', () => {
   it('classifies login POST correctly', () => {
@@ -56,10 +41,41 @@ describe('getRateLimitType', () => {
   });
 
   it('classifies room message send', () => {
-    expect(getRateLimitType('/_matrix/client/v3/rooms/!abc:example.com/send/m.room.message/1', 'PUT')).toBe('send_message');
+    expect(
+      getRateLimitType('/_matrix/client/v3/rooms/!abc:example.com/send/m.room.message/1', 'PUT')
+    ).toBe('send_message');
   });
 
   it('falls back to default for unknown routes', () => {
     expect(getRateLimitType('/_matrix/client/v3/profile/@user:example.com', 'GET')).toBe('default');
+  });
+});
+
+describe('RATE_LIMITS', () => {
+  it('defines every classifier bucket', () => {
+    const paths: Array<[string, string]> = [
+      ['/_matrix/client/v3/login', 'POST'],
+      ['/_matrix/client/v3/register', 'POST'],
+      ['/_matrix/client/v3/sync', 'GET'],
+      ['/_matrix/client/v3/keys/upload', 'POST'],
+      ['/_matrix/media/v3/upload', 'POST'],
+      ['/_matrix/media/v3/download/x/y', 'GET'],
+      ['/_matrix/client/v3/search', 'POST'],
+      ['/_matrix/federation/v1/send', 'PUT'],
+      ['/_matrix/client/v3/createRoom', 'POST'],
+      ['/_matrix/client/v3/rooms/!r:s/send/m.room.message/1', 'PUT'],
+      ['/_matrix/client/v3/profile/@u:s', 'GET'],
+    ];
+    for (const [path, method] of paths) {
+      const type = getRateLimitType(path, method);
+      expect(RATE_LIMITS[type]).toBeDefined();
+      expect(RATE_LIMITS[type].requests).toBeGreaterThan(0);
+      expect(RATE_LIMITS[type].windowMs).toBeGreaterThan(0);
+    }
+  });
+
+  it('keeps auth endpoints stricter than default', () => {
+    expect(RATE_LIMITS.login.requests).toBeLessThan(RATE_LIMITS.default.requests);
+    expect(RATE_LIMITS.register.requests).toBeLessThan(RATE_LIMITS.login.requests);
   });
 });

@@ -2,9 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main, "fix/**", "feat/**"]
+    branches: [main, "fix/**", "feat/**", "cursor/**"]
   pull_request:
     branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   typecheck:
@@ -41,4 +48,18 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
-      - run: npx vitest run
+      - run: npm test
+
+  worker-bundle:
+    name: Worker Bundle (dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      # Validates the Worker compiles with wrangler/workers-types after deps bumps
+      # without uploading (no Cloudflare credentials required).
+      - run: npm run worker:check

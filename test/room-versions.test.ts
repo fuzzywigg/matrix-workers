@@ -1,0 +1,77 @@
+import { describe, it, expect } from 'vitest';
+import {
+  getRoomVersion,
+  isRoomVersionSupported,
+  getDefaultRoomVersion,
+  getSupportedRoomVersions,
+  getRedactionAllowedKeys,
+} from '../src/services/room-versions';
+
+describe('room version registry', () => {
+  it('defaults to stable room version 10', () => {
+    expect(getDefaultRoomVersion()).toBe('10');
+    expect(getRoomVersion('10')?.stable).toBe(true);
+  });
+
+  it('supports Matrix room versions 1 through 12', () => {
+    for (let v = 1; v <= 12; v++) {
+      expect(isRoomVersionSupported(String(v))).toBe(true);
+      expect(getRoomVersion(String(v))).not.toBeNull();
+    }
+    expect(isRoomVersionSupported('99')).toBe(false);
+    expect(getRoomVersion('99')).toBeNull();
+  });
+
+  it('marks all registered versions stable for clients', () => {
+    const supported = getSupportedRoomVersions();
+    expect(Object.keys(supported).sort((a, b) => Number(a) - Number(b))).toEqual(
+      Array.from({ length: 12 }, (_, i) => String(i + 1))
+    );
+    expect(Object.values(supported).every((s) => s === 'stable')).toBe(true);
+  });
+
+  it('tracks capability gates across versions', () => {
+    expect(getRoomVersion('6')?.knockingSupported).toBe(false);
+    expect(getRoomVersion('7')?.knockingSupported).toBe(true);
+    expect(getRoomVersion('7')?.restrictedJoinsSupported).toBe(false);
+    expect(getRoomVersion('8')?.restrictedJoinsSupported).toBe(true);
+    expect(getRoomVersion('9')?.integerPowerLevels).toBe(false);
+    expect(getRoomVersion('10')?.integerPowerLevels).toBe(true);
+    expect(getRoomVersion('10')?.knockRestrictedSupported).toBe(true);
+    expect(getRoomVersion('10')?.updatedRedactionRules).toBe(false);
+    expect(getRoomVersion('11')?.updatedRedactionRules).toBe(true);
+  });
+
+  it('uses expected event ID / state resolution algorithms', () => {
+    expect(getRoomVersion('1')?.stateResolution).toBe('v1');
+    expect(getRoomVersion('1')?.eventIdFormat).toBe('v1');
+    expect(getRoomVersion('2')?.stateResolution).toBe('v2');
+    expect(getRoomVersion('3')?.eventIdFormat).toBe('v3');
+    expect(getRoomVersion('4')?.eventIdFormat).toBe('v4');
+    expect(getRoomVersion('12')?.eventIdFormat).toBe('v4');
+  });
+});
+
+describe('getRedactionAllowedKeys', () => {
+  it('always preserves core event envelope keys', () => {
+    const v10 = getRoomVersion('10')!;
+    const keys = getRedactionAllowedKeys('m.room.message', v10);
+    expect(keys).toEqual(
+      expect.arrayContaining(['event_id', 'type', 'room_id', 'sender', 'signatures', 'hashes'])
+    );
+  });
+
+  it('preserves membership content keys and expands them for v11+', () => {
+    const v10 = getRoomVersion('10')!;
+    const v11 = getRoomVersion('11')!;
+    expect(getRedactionAllowedKeys('m.room.member', v10)).toEqual(
+      expect.arrayContaining(['membership', 'join_authorised_via_users_server'])
+    );
+    expect(getRedactionAllowedKeys('m.room.member', v10)).not.toContain('third_party_invite');
+    expect(getRedactionAllowedKeys('m.room.member', v11)).toContain('third_party_invite');
+    expect(getRedactionAllowedKeys('m.room.create', v11)).toEqual(
+      expect.arrayContaining(['creator', 'room_version'])
+    );
+    expect(getRedactionAllowedKeys('m.room.redaction', v11)).toContain('redacts');
+  });
+});

@@ -6,7 +6,7 @@ import type { Context, Next } from 'hono';
 import type { AppEnv } from '../types';
 
 // Rate limit configurations for different endpoint types
-const RATE_LIMITS: Record<string, { requests: number; windowMs: number }> = {
+export const RATE_LIMITS: Record<string, { requests: number; windowMs: number }> = {
   login: { requests: 10, windowMs: 60 * 1000 }, // 10 per minute
   register: { requests: 5, windowMs: 60 * 1000 }, // 5 per minute
   default: { requests: 100, windowMs: 60 * 1000 }, // 100 per minute
@@ -20,7 +20,8 @@ const RATE_LIMITS: Record<string, { requests: number; windowMs: number }> = {
   create_room: { requests: 10, windowMs: 60 * 1000 }, // 10 per minute
 };
 
-function getRateLimitType(path: string, method: string): string {
+/** Classify a request path/method into a rate-limit bucket. Exported for unit tests. */
+export function getRateLimitType(path: string, method: string): string {
   if (path.includes('/login') && method === 'POST') return 'login';
   if (path.includes('/register') && method === 'POST') return 'register';
   if (path.includes('/sync')) return 'sync';
