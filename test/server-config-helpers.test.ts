@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { buildServerUrl } from '../src/services/server-discovery';
 import { getStunServers, isTurnConfigured, getTurnStatus } from '../src/services/turn';
 import { getLiveKitConfig } from '../src/services/livekit';
-import { isCallsConfigured } from '../src/services/cloudflare-calls';
+import { CloudflareCallsError, isCallsConfigured } from '../src/services/cloudflare-calls';
 import type { Env } from '../src/types';
 
 function env(partial: Partial<Env> = {}): Env {
@@ -103,5 +103,19 @@ describe('server-config TOKENMAXX edge paths after #50', () => {
       configured: true,
       keyId: 'abcdefgh...',
     });
+  });
+});
+
+
+describe('server-config TOKENMAXX edge paths after #57', () => {
+  it('constructs CloudflareCallsError with default and override statusCode', () => {
+    const def = new CloudflareCallsError('boom', 'API_ERROR');
+    expect(def.name).toBe('CloudflareCallsError');
+    expect(def.code).toBe('API_ERROR');
+    expect(def.statusCode).toBe(500);
+    expect(def.message).toBe('boom');
+
+    const custom = new CloudflareCallsError('nope', 'NO_ANSWER', 502);
+    expect(custom.statusCode).toBe(502);
   });
 });

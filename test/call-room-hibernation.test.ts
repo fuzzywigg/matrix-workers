@@ -1,6 +1,20 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CallRoomDurableObject } from '../src/durable-objects/call-room';
 import type { Env } from '../src/types';
+
+const { addTracksMock, closeTracksMock } = vi.hoisted(() => ({
+  addTracksMock: vi.fn(),
+  closeTracksMock: vi.fn(),
+}));
+
+vi.mock('../src/services/cloudflare-calls', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/cloudflare-calls')>();
+  return {
+    ...actual,
+    addTracks: addTracksMock,
+    closeTracks: closeTracksMock,
+  };
+});
 
 // Minimal stand-ins for the pieces of the DO runtime the hibernation path touches.
 // Storage structured-clones values like real DO storage, so a Map smuggled into a
@@ -462,5 +476,132 @@ describe('CallRoom signaling TOKENMAXX edge paths after #55', () => {
       (m: { type: string }) => m.type === 'participant_left'
     );
     expect(left?.oderId).toBe('u1');
+  });
+});
+
+
+describe('CallRoom signaling TOKENMAXX edge paths after #57', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+  });
+
+  it('routes POST /end through fetch to wipe the call', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    await state.storage.put('callId', 'call-1');
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    const res = await room.fetch(new Request('https://do/end', { method: 'POST' }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ success: true });
+    expect(state.storage.map.size).toBe(0);
+    expect(ws.closed?.code).toBe(1000);
+  });
+
+  it('unmutes a track and broadcasts muted:false', async () => {
+    const state = new FakeState();
+    await state.storage.put(
+      'participant:u1|d1',
+      storedParticipant('u1', 'd1', { audio0: { ...TRACK, enabled: false } })
+    );
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const wsA = new FakeWebSocket();
+    wsA.serializeAttachment({ participantKey: 'u1|d1' });
+    const wsB = new FakeWebSocket();
+    wsB.serializeAttachment({ participantKey: 'u2|d2' });
+    state.sockets = [wsA, wsB];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      wsA,
+      JSON.stringify({ type: 'mute', trackName: 'audio0', muted: false })
+    );
+
+    const stored = state.storage.map.get('participant:u1|d1') as any;
+    expect(stored.tracks.audio0.enabled).toBe(true);
+    const changed = wsB.sent.map((s: string) => JSON.parse(s)).find(
+      (m: { type: string }) => m.type === 'mute_changed'
+    );
+    expect(changed).toMatchObject({ muted: false, trackName: 'audio0' });
+  });
+
+  it('returns NO_ANSWER when SFU addTracks omits sessionDescription', async () => {
+    addTracksMock.mockResolvedValueOnce({ tracks: [{ mid: '0' }] });
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({
+        type: 'offer',
+        trackName: 'audio0',
+        kind: 'audio',
+        sdp: 'v=0',
+      })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({ type: 'error', code: 'NO_ANSWER' });
+  });
+
+  it('surfaces SFU track errorCode from offer responses', async () => {
+    addTracksMock.mockResolvedValueOnce({
+      sessionDescription: { type: 'answer', sdp: 'v=0' },
+      tracks: [{ errorCode: 'TRACK_FAILED', errorDescription: 'boom' }],
+    });
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({
+        type: 'offer',
+        trackName: 'audio0',
+        kind: 'audio',
+        sdp: 'v=0',
+      })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'TRACK_FAILED',
+      message: 'boom',
+    });
+  });
+
+  it('calls closeTracks on leave when tracks exist and swallows closeTracks failures', async () => {
+    closeTracksMock.mockRejectedValueOnce(new Error('sfu down'));
+    const state = new FakeState();
+    await state.storage.put(
+      'participant:u1|d1',
+      storedParticipant('u1', 'd1', { audio0: TRACK })
+    );
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const wsA = new FakeWebSocket();
+    wsA.serializeAttachment({ participantKey: 'u1|d1' });
+    const wsB = new FakeWebSocket();
+    wsB.serializeAttachment({ participantKey: 'u2|d2' });
+    state.sockets = [wsA, wsB];
+    const room = makeRoom(state) as any;
+
+    await room.handleLeave(wsA);
+
+    expect(closeTracksMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'session-u1',
+      ['0'],
+      true
+    );
+    expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+    expect(wsA.closed?.code).toBe(1000);
   });
 });

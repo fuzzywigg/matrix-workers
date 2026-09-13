@@ -1735,3 +1735,95 @@ describe('checkEventAuth TOKENMAXX edge paths after #55', () => {
     expect(checkEventAuth(join, state, '10').allowed).toBe(true);
   });
 });
+
+
+describe('checkEventAuth TOKENMAXX edge paths after #57', () => {
+  it('rejects PL updates that raise invite above the sender power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50 }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl-invite',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 60,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').error).toMatch(/higher than own/);
+  });
+
+  it('rejects first PL write when no prior PL exists (sender defaults to 0 < state_default 50)', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl-first',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100, '@bob:example.com': 10 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').error).toMatch(
+      /Insufficient power level for m\.room\.power_levels \(have 0, need 50\)/
+    );
+  });
+
+  it('allows lowering a user from implicit users_default when currentPl.users omits them', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl2',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100, '@bob:example.com': 0 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').allowed).toBe(true);
+  });
+});

@@ -226,3 +226,12 @@ describe('server-discovery TOKENMAXX edge paths after #55', () => {
     expect(isIPLiteral('[')).toBe(false);
   });
 });
+
+
+describe('server-discovery TOKENMAXX edge paths after #57', () => {
+  it('includes port 0 verbatim (only 443 is omitted)', () => {
+    expect(buildServerUrl({ host: 'example.com', port: 0, tlsHostname: 'example.com' })).toBe(
+      'https://example.com:0'
+    );
+  });
+});

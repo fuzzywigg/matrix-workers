@@ -380,3 +380,15 @@ describe('rate-limit TOKENMAXX edge paths after #55', () => {
     ).toBe('ip:198.51.100.1');
   });
 });
+
+
+describe('rate-limit TOKENMAXX edge paths after #57', () => {
+  it('does not classify sendToDevice as send_message (rooms/send regex only)', () => {
+    expect(
+      getRateLimitType('/_matrix/client/v3/sendToDevice/m.room.message/t1', 'PUT')
+    ).toBe('default');
+    expect(
+      getRateLimitType('/_matrix/client/v3/rooms/!r:s/send/m.room.message/t1', 'PUT')
+    ).toBe('send_message');
+  });
+});

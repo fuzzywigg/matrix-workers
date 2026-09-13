@@ -848,3 +848,63 @@ describe('evaluatePushRules TOKENMAXX edge paths after #55', () => {
     expect(explicit).toMatchObject({ notify: true, highlight: true });
   });
 });
+
+
+describe('push-rules TOKENMAXX edge paths after #57', () => {
+  function pushDb(rows: Array<Record<string, unknown>> = []) {
+    return {
+      prepare: () => ({
+        bind: () => ({
+          all: async () => ({ results: rows }),
+        }),
+      }),
+    } as unknown as D1Database;
+  }
+
+  const roomId = '!room:example.com';
+
+  it('skips a failed override condition and falls through to a later matching rule', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.miss',
+          conditions: JSON.stringify([
+            { kind: 'event_match', key: 'type', pattern: 'm.room.encrypted' },
+          ]),
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'hello there', msgtype: 'm.text' },
+      },
+      5
+    );
+    // Default .m.rule.message underride still notifies after the miss
+    expect(result).toMatchObject({ notify: true, highlight: false });
+  });
+
+  it('treats event_property_is with value undefined as true when the key is missing', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_is', key: 'content.missing', value: undefined },
+        message,
+        userId,
+        2
+      )
+    ).toBe(true);
+    expect(
+      matchesCondition(
+        { kind: 'event_property_is', key: 'content.msgtype', value: undefined },
+        { ...message, content: { ...message.content, msgtype: null } },
+        userId,
+        2
+      )
+    ).toBe(false);
+  });
+});
