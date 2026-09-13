@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   checkTransactionIdempotency,
   cleanupOldTransactions,
@@ -244,5 +244,72 @@ describe('transactions TOKENMAXX edge paths after #55', () => {
       eventId: '$ev',
       response: [],
     });
+  });
+});
+
+describe('transactions cleanup clock boundaries TOKENMAXX after #60', () => {
+  const NOW = 1_700_000_000_000;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  it('keeps created_at === NOW - 24h (strict < cutoff) and deletes one ms older', async () => {
+    const db = createTxnDb();
+    const atCutoff = '@u:ex.com:at-cutoff';
+    const older = '@u:ex.com:older';
+    const newer = '@u:ex.com:newer';
+    db.store.set(atCutoff, {
+      event_id: '$eq',
+      response: null,
+      created_at: NOW - DAY_MS,
+    } as TxnRow & { created_at: number });
+    db.store.set(older, {
+      event_id: '$old',
+      response: null,
+      created_at: NOW - DAY_MS - 1,
+    } as TxnRow & { created_at: number });
+    db.store.set(newer, {
+      event_id: '$new',
+      response: null,
+      created_at: NOW - DAY_MS + 1,
+    } as TxnRow & { created_at: number });
+
+    expect(await cleanupOldTransactions(db)).toBe(1);
+    expect(db.store.has(atCutoff)).toBe(true);
+    expect(db.store.has(older)).toBe(false);
+    expect(db.store.has(newer)).toBe(true);
+  });
+
+  it('pins custom maxAgeMs cutoff exactly', async () => {
+    const db = createTxnDb();
+    const maxAgeMs = 60_000;
+    db.store.set('@u:ex.com:keep', {
+      event_id: '$k',
+      response: null,
+      created_at: NOW - maxAgeMs,
+    } as TxnRow & { created_at: number });
+    db.store.set('@u:ex.com:drop', {
+      event_id: '$d',
+      response: null,
+      created_at: NOW - maxAgeMs - 1,
+    } as TxnRow & { created_at: number });
+
+    expect(await cleanupOldTransactions(db, maxAgeMs)).toBe(1);
+    expect(db.store.has('@u:ex.com:keep')).toBe(true);
+    expect(db.store.has('@u:ex.com:drop')).toBe(false);
+  });
+
+  it('returns 0 when every row is at or after the cutoff', async () => {
+    const db = createTxnDb();
+    db.store.set('@u:ex.com:fresh', {
+      event_id: '$f',
+      response: null,
+      created_at: NOW,
+    } as TxnRow & { created_at: number });
+    expect(await cleanupOldTransactions(db, DAY_MS)).toBe(0);
+    expect(db.store.size).toBe(1);
   });
 });

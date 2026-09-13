@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { getRateLimitType, getClientId, RATE_LIMITS } from '../src/middleware/rate-limit';
+import { describe, it, expect, vi } from 'vitest';
+import {
+  getRateLimitType,
+  getClientId,
+  RATE_LIMITS,
+  rateLimitMiddleware,
+  strictRateLimit,
+} from '../src/middleware/rate-limit';
 import type { Context } from 'hono';
 import type { AppEnv } from '../src/types';
 
@@ -8,16 +14,34 @@ function makeContext(
     userId?: string;
     headers?: Record<string, string>;
     env?: Partial<AppEnv['Bindings']>;
+    path?: string;
+    method?: string;
   } = {}
 ): Context<AppEnv> {
   const headers = opts.headers ?? {};
+  const setHeaders: Record<string, string> = {};
   return {
     get: (key: string) => (key === 'userId' ? opts.userId : undefined),
     req: {
       header: (name: string) => headers[name] ?? headers[name.toLowerCase()],
+      path: opts.path ?? '/_matrix/client/v3/login',
+      method: opts.method ?? 'POST',
     },
     env: opts.env ?? {},
-  } as unknown as Context<AppEnv>;
+    header: (name: string, value: string) => {
+      setHeaders[name] = value;
+    },
+    json: (body: unknown, status?: number) => ({ body, status: status ?? 200, headers: setHeaders }),
+    _headers: setHeaders,
+  } as unknown as Context<AppEnv> & { _headers: Record<string, string> };
+}
+
+function mockRateLimitBinding(fetchImpl: (req: Request) => Promise<Response>) {
+  const idFromName = vi.fn((name: string) => ({ name }));
+  const get = vi.fn(() => ({
+    fetch: fetchImpl,
+  }));
+  return { idFromName, get };
 }
 
 describe('getRateLimitType', () => {
@@ -390,5 +414,152 @@ describe('rate-limit TOKENMAXX edge paths after #57', () => {
     expect(
       getRateLimitType('/_matrix/client/v3/rooms/!r:s/send/m.room.message/t1', 'PUT')
     ).toBe('send_message');
+  });
+});
+
+describe('rateLimitMiddleware / strictRateLimit TOKENMAXX after #60', () => {
+  it('skips OPTIONS and /sync without touching the rate-limit DO', async () => {
+    const binding = mockRateLimitBinding(async () => new Response('{}'));
+    const next = vi.fn(async () => 'next');
+
+    const optsCtx = makeContext({
+      method: 'OPTIONS',
+      path: '/_matrix/client/v3/login',
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+    await expect(rateLimitMiddleware(optsCtx, next)).resolves.toBe('next');
+    expect(binding.idFromName).not.toHaveBeenCalled();
+
+    const syncCtx = makeContext({
+      method: 'GET',
+      path: '/_matrix/client/v3/sync',
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+    await expect(rateLimitMiddleware(syncCtx, next)).resolves.toBe('next');
+    expect(binding.idFromName).not.toHaveBeenCalled();
+  });
+
+  it('sets X-RateLimit headers and calls next when the DO allows', async () => {
+    const resetAt = 1_700_000_060_000;
+    const binding = mockRateLimitBinding(async () =>
+      Response.json({ allowed: true, remaining: 9, resetAt })
+    );
+    const next = vi.fn(async () => 'ok');
+    const ctx = makeContext({
+      path: '/_matrix/client/v3/login',
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': '203.0.113.1' },
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+
+    await expect(rateLimitMiddleware(ctx, next)).resolves.toBe('ok');
+    expect(binding.idFromName).toHaveBeenCalledWith('login');
+    const headers = (ctx as unknown as { _headers: Record<string, string> })._headers;
+    expect(headers['X-RateLimit-Limit']).toBe('10');
+    expect(headers['X-RateLimit-Remaining']).toBe('9');
+    expect(headers['X-RateLimit-Reset']).toBe(String(Math.ceil(resetAt / 1000)));
+    expect(next).toHaveBeenCalledOnce();
+  });
+
+  it('returns 429 with Retry-After ceil(retryAfterMs/1000) when denied', async () => {
+    const binding = mockRateLimitBinding(async () =>
+      Response.json({
+        allowed: false,
+        remaining: 0,
+        retryAfterMs: 1500,
+        resetAt: 1_700_000_061_500,
+      })
+    );
+    const next = vi.fn();
+    const ctx = makeContext({
+      path: '/_matrix/client/v3/register',
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': '203.0.113.2' },
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+
+    const result = (await rateLimitMiddleware(ctx, next)) as {
+      body: unknown;
+      status: number;
+      headers: Record<string, string>;
+    };
+    expect(result.status).toBe(429);
+    expect(result.body).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'Too many requests',
+      retry_after_ms: 1500,
+    });
+    expect(result.headers['Retry-After']).toBe('2'); // ceil(1.5s)
+    expect(binding.idFromName).toHaveBeenCalledWith('register');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('fails open when the DO fetch throws', async () => {
+    const binding = mockRateLimitBinding(async () => {
+      throw new Error('do down');
+    });
+    const next = vi.fn(async () => 'allowed');
+    const ctx = makeContext({
+      path: '/_matrix/client/v3/login',
+      method: 'POST',
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+    await expect(rateLimitMiddleware(ctx, next)).resolves.toBe('allowed');
+    expect(next).toHaveBeenCalledOnce();
+  });
+
+  it('strictRateLimit uses strict:path DO id and denies with fallback windowMs', async () => {
+    const binding = mockRateLimitBinding(async (req) => {
+      const body = (await req.json()) as { limit: number; windowMs: number; clientId: string };
+      expect(body).toMatchObject({ limit: 2, windowMs: 30_000, clientId: 'ip:203.0.113.9' });
+      return Response.json({ allowed: false, remaining: 0 });
+    });
+    const next = vi.fn();
+    const mw = strictRateLimit(2, 30_000);
+    const ctx = makeContext({
+      path: '/_matrix/client/v3/register',
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': '203.0.113.9' },
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+
+    const result = (await mw(ctx, next)) as {
+      body: unknown;
+      status: number;
+      headers: Record<string, string>;
+    };
+    expect(binding.idFromName).toHaveBeenCalledWith('strict:/_matrix/client/v3/register');
+    expect(result.status).toBe(429);
+    expect(result.body).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'Too many requests',
+      retry_after_ms: 30_000,
+    });
+    expect(result.headers['Retry-After']).toBe('30');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('strictRateLimit fails open on DO errors and allows when DO permits', async () => {
+    const failBinding = mockRateLimitBinding(async () => {
+      throw new Error('boom');
+    });
+    const next = vi.fn(async () => 'ok');
+    const failCtx = makeContext({
+      path: '/strict',
+      method: 'POST',
+      env: { RATE_LIMIT: failBinding } as Partial<AppEnv['Bindings']>,
+    });
+    await expect(strictRateLimit(1, 1000)(failCtx, next)).resolves.toBe('ok');
+
+    const allowBinding = mockRateLimitBinding(async () =>
+      Response.json({ allowed: true, remaining: 0 })
+    );
+    const allowCtx = makeContext({
+      path: '/strict',
+      method: 'POST',
+      env: { RATE_LIMIT: allowBinding } as Partial<AppEnv['Bindings']>,
+    });
+    await expect(strictRateLimit(1, 1000)(allowCtx, next)).resolves.toBe('ok');
+    expect(next).toHaveBeenCalledTimes(2);
   });
 });

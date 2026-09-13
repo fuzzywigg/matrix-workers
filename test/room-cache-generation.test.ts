@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   bumpRoomCacheGeneration,
   getRoomCacheGeneration,
@@ -237,5 +237,123 @@ describe('room-cache metadata TOKENMAXX edge paths after #58', () => {
     ]);
     const meta = await getRoomMetadata(kv, db, '!r:ex.com');
     expect(meta).toMatchObject({ name: 'X', joinedCount: 1, isDm: false });
+  });
+});
+
+describe('room-cache TTL clock boundaries TOKENMAXX after #60', () => {
+  const NOW = 1_700_000_000_000;
+  const TTL_MS = 5 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  it('serves KV hit at age TTL_MS - 1 and misses at exact TTL_MS (strict <)', async () => {
+    const hitMeta = {
+      name: 'AlmostStale',
+      joinedCount: 3,
+      invitedCount: 0,
+      isDm: false,
+      cachedAt: NOW - (TTL_MS - 1),
+    };
+    const data: Record<string, string> = {
+      'room-meta:!hit:ex.com': JSON.stringify(hitMeta),
+    };
+    const kv = mockKv(data);
+    const db = mockDb(emptyBatchResults());
+    expect(await getRoomMetadata(kv, db, '!hit:ex.com')).toMatchObject({ name: 'AlmostStale' });
+    expect(db.batch).not.toHaveBeenCalled();
+
+    const missMeta = {
+      name: 'ExactStale',
+      joinedCount: 1,
+      invitedCount: 0,
+      isDm: false,
+      cachedAt: NOW - TTL_MS,
+    };
+    data['room-meta:!miss:ex.com'] = JSON.stringify(missMeta);
+    const missDb = mockDb([
+      { results: [{ content: JSON.stringify({ name: 'Refetched' }) }] },
+      { results: [] },
+      { results: [] },
+      { results: [] },
+      { results: [{ count: 1 }] },
+      { results: [{ count: 0 }] },
+    ]);
+    expect(await getRoomMetadata(kv, missDb, '!miss:ex.com')).toMatchObject({
+      name: 'Refetched',
+    });
+    expect(missDb.batch).toHaveBeenCalledOnce();
+    expect(JSON.parse(data['room-meta:!miss:ex.com']).cachedAt).toBe(NOW);
+  });
+
+  it('batch path applies the same strict TTL boundary per room', async () => {
+    const data: Record<string, string> = {
+      'room-meta:!fresh:ex.com': JSON.stringify({
+        name: 'Fresh',
+        joinedCount: 2,
+        invitedCount: 0,
+        isDm: false,
+        cachedAt: NOW - (TTL_MS - 1),
+      }),
+      'room-meta:!stale:ex.com': JSON.stringify({
+        name: 'Stale',
+        joinedCount: 1,
+        invitedCount: 0,
+        isDm: false,
+        cachedAt: NOW - TTL_MS,
+      }),
+    };
+    const kv = mockKv(data);
+    const db = mockDb([
+      { results: [{ content: JSON.stringify({ name: 'FromDB' }) }] },
+      { results: [] },
+      { results: [] },
+      { results: [] },
+      { results: [{ count: 4 }] },
+      { results: [{ count: 0 }] },
+    ]);
+    const map = await getBatchRoomMetadata(kv, db, ['!fresh:ex.com', '!stale:ex.com']);
+    expect(map.get('!fresh:ex.com')).toMatchObject({ name: 'Fresh' });
+    expect(map.get('!stale:ex.com')).toMatchObject({ name: 'FromDB', joinedCount: 4 });
+  });
+
+  it('parses avatar url, topic, and canonical alias; ignores malformed JSON fields', async () => {
+    const db = mockDb([
+      { results: [{ content: '{not-json' }] },
+      { results: [{ content: JSON.stringify({ url: 'mxc://ex/av' }) }] },
+      { results: [{ content: JSON.stringify({ topic: 'Hello' }) }] },
+      { results: [{ content: JSON.stringify({ alias: '#room:ex.com' }) }] },
+      { results: [{ count: 0 }] },
+      { results: [{ count: 2 }] },
+    ]);
+    const meta = await getRoomMetadata(mockKv(), db, '!r:ex.com');
+    expect(meta).toEqual({
+      name: undefined,
+      avatar: 'mxc://ex/av',
+      topic: 'Hello',
+      canonicalAlias: '#room:ex.com',
+      joinedCount: 0,
+      invitedCount: 2,
+      isDm: true,
+      cachedAt: NOW,
+    });
+  });
+
+  it('pins isDm for joinedCount 0–3 without a name', async () => {
+    for (const count of [0, 1, 2, 3]) {
+      const db = mockDb([
+        { results: [] },
+        { results: [] },
+        { results: [] },
+        { results: [] },
+        { results: [{ count }] },
+        { results: [{ count: 0 }] },
+      ]);
+      const meta = await getRoomMetadata(mockKv(), db, `!c${count}:ex.com`);
+      expect(meta?.isDm).toBe(count <= 2);
+      expect(meta?.joinedCount).toBe(count);
+    }
   });
 });

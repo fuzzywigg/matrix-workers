@@ -201,3 +201,96 @@ describe('SyncDurableObject TOKENMAXX edge paths after #58', () => {
     vi.useRealTimers();
   });
 });
+
+describe('SyncDurableObject alarm clock boundaries TOKENMAXX after #60', () => {
+  const NOW = 1_700_000_000_000;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  it('keeps events/connections at exact cutoff and deletes one ms older', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const { state, do: sync } = makeSync();
+    const cutoff = NOW - DAY_MS;
+
+    await state.storage.put('event:$eq', {
+      event_id: '$eq',
+      room_id: '!r',
+      type: 'm.room.message',
+      timestamp: cutoff,
+    });
+    await state.storage.put('event:$older', {
+      event_id: '$older',
+      room_id: '!r',
+      type: 'm.room.message',
+      timestamp: cutoff - 1,
+    });
+    await state.storage.put('sliding_sync:eq', {
+      pos: 1,
+      lastAccess: cutoff,
+      roomStates: {},
+      listStates: {},
+    });
+    await state.storage.put('sliding_sync:older', {
+      pos: 2,
+      lastAccess: cutoff - 1,
+      roomStates: {},
+      listStates: {},
+    });
+    await state.storage.put('sliding_sync:no-access', {
+      pos: 3,
+      roomStates: {},
+      listStates: {},
+    });
+
+    await (sync as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(state.storage.map.has('event:$eq')).toBe(true);
+    expect(state.storage.map.has('event:$older')).toBe(false);
+    expect(state.storage.map.has('sliding_sync:eq')).toBe(true);
+    expect(state.storage.map.has('sliding_sync:older')).toBe(false);
+    // lastAccess falsy → condition skipped → kept
+    expect(state.storage.map.has('sliding_sync:no-access')).toBe(true);
+    expect(state.storage.alarm).toBe(NOW + 3600_000);
+    vi.useRealTimers();
+  });
+
+  it('filters in-memory pendingEvents with the same >= cutoff rule', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const { do: sync } = makeSync();
+    const cutoff = NOW - DAY_MS;
+
+    // Seed via notify (in-memory + storage depending on impl) then age wall clock
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$mem-old',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: cutoff - 1,
+        }),
+      })
+    );
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$mem-eq',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: cutoff,
+        }),
+      })
+    );
+
+    await (sync as unknown as { alarm: () => Promise<void> }).alarm();
+
+    const pending = await sync.fetch(new Request('https://do/pending?since=0'));
+    const body = (await pending.json()) as { events: Array<{ event_id: string }> };
+    const ids = body.events.map((e) => e.event_id);
+    expect(ids).toContain('$mem-eq');
+    expect(ids).not.toContain('$mem-old');
+    vi.useRealTimers();
+  });
+});
