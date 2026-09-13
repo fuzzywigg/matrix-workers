@@ -226,4 +226,70 @@ describe('checkEventAuth', () => {
     expect(result.allowed).toBe(false);
     expect(result.error).toMatch(/Knocking not supported/);
   });
+
+  it('allows a joined user to leave', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    expect(
+      checkEventAuth(memberEvent('@alice:example.com', 'leave'), state, '10').allowed
+    ).toBe(true);
+  });
+
+  it('allows a high-power user to kick and ban', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'leave', '@alice:example.com'),
+        state,
+        '10'
+      ).allowed
+    ).toBe(true);
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'ban', '@alice:example.com'), state, '10')
+        .allowed
+    ).toBe(true);
+  });
+
+  it('rejects kicks from users without kick power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      memberEvent('@carol:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const result = checkEventAuth(
+      memberEvent('@carol:example.com', 'leave', '@bob:example.com'),
+      state,
+      '10'
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.error).toMatch(/kick/i);
+  });
+
+  it('rejects redactions from low-power senders', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const result = checkEventAuth(
+      pdu({
+        type: 'm.room.redaction',
+        event_id: '$redact',
+        sender: '@bob:example.com',
+        content: {},
+        redacts: '$msg',
+      }),
+      state,
+      '10'
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.error).toMatch(/redact/i);
+  });
 });

@@ -74,4 +74,26 @@ describe('getRedactionAllowedKeys', () => {
     );
     expect(getRedactionAllowedKeys('m.room.redaction', v11)).toContain('redacts');
   });
+
+  it('preserves join_rules, power_levels, and history_visibility content keys', () => {
+    const v10 = getRoomVersion('10')!;
+    const v11 = getRoomVersion('11')!;
+    expect(getRedactionAllowedKeys('m.room.join_rules', v10)).toEqual(
+      expect.arrayContaining(['join_rule', 'allow'])
+    );
+    expect(getRedactionAllowedKeys('m.room.history_visibility', v10)).toContain(
+      'history_visibility'
+    );
+    expect(getRedactionAllowedKeys('m.room.power_levels', v10)).toEqual(
+      expect.arrayContaining(['ban', 'kick', 'users', 'users_default'])
+    );
+    expect(getRedactionAllowedKeys('m.room.power_levels', v10)).not.toContain('notifications');
+    expect(getRedactionAllowedKeys('m.room.power_levels', v11)).toContain('notifications');
+  });
+
+  it('tracks redactionAlgorithm v1 vs v11', () => {
+    expect(getRoomVersion('10')?.redactionAlgorithm).toBe('v1');
+    expect(getRoomVersion('11')?.redactionAlgorithm).toBe('v11');
+    expect(getRoomVersion('12')?.redactionAlgorithm).toBe('v11');
+  });
 });

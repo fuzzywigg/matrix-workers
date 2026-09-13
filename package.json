@@ -17,7 +17,6 @@
     "lint": "eslint src/ test/",
     "worker:check": "wrangler deploy --dry-run --outdir=.wrangler-dry-run"
   },
-
   "dependencies": {
     "@cloudflare/workers-types": "^5.20260911.1",
     "hono": "^4.13.7",
@@ -27,7 +26,7 @@
     "@types/uuid": "^11.0.0",
     "@typescript-eslint/eslint-plugin": "^8.70.0",
     "@typescript-eslint/parser": "^8.70.0",
-    "eslint": "^9.0.0",
+    "eslint": "^9.39.5",
     "typescript": "^6.0.3",
     "vitest": "^5.0.0",
     "wrangler": "^4.131.1"

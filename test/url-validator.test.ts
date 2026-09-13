@@ -46,6 +46,18 @@ describe('validateUrl SSRF protection', () => {
     expect(validateUrl('not a url').valid).toBe(false);
   });
 
+  it('rejects additional internal / metadata hostnames', () => {
+    expect(validateUrl('http://metadata.google.internal/computeMetadata/v1').valid).toBe(false);
+    expect(validateUrl('http://foo.internal/').valid).toBe(false);
+    expect(validateUrl('http://metadata/').valid).toBe(false);
+  });
+
+  it('allows public hosts even when userinfo is present', () => {
+    const result = validateUrl('https://user:pass@example.com/path');
+    expect(result.valid).toBe(true);
+    expect(result.sanitizedUrl).toContain('example.com');
+  });
+
   it('returns a sanitized URL on success', () => {
     const result = validateUrl('https://example.com/a');
     expect(result.valid).toBe(true);
