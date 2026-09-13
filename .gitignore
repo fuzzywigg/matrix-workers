@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 .wrangler/
+.wrangler-dry-run/
 
 # Environment files
 .env

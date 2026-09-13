@@ -12,8 +12,9 @@ Tuwunel is a Matrix homeserver (spec v1.17) running entirely on Cloudflare Worke
 npm run dev              # Local dev server (wrangler dev)
 npm run deploy           # Deploy to Cloudflare
 npm run typecheck        # TypeScript type checking (tsc --noEmit)
-npm run lint             # ESLint on src/
-npm run test             # Vitest
+npm run lint             # ESLint on src/ and test/
+npm run test             # Vitest (single run)
+npm run worker:check     # wrangler deploy --dry-run (bundle without upload)
 npm run db:migrate       # Run D1 migrations (remote)
 npm run db:migrate:local # Run D1 migrations (local)
 ```

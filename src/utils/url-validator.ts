@@ -81,10 +81,19 @@ function isBlockedIPv6(ip: string): boolean {
     return true;
   }
 
-  // IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
-  const ipv4Mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (ipv4Mapped) {
-    return isBlockedIPv4(ipv4Mapped[1]);
+  // IPv4-mapped IPv6 addresses (::ffff:x.x.x.x or ::ffff:hhhh:hhhh)
+  const ipv4MappedDotted = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (ipv4MappedDotted) {
+    return isBlockedIPv4(ipv4MappedDotted[1]);
+  }
+  const ipv4MappedHex = normalized.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (ipv4MappedHex) {
+    const hi = parseInt(ipv4MappedHex[1], 16);
+    const lo = parseInt(ipv4MappedHex[2], 16);
+    if (!Number.isNaN(hi) && !Number.isNaN(lo)) {
+      const dotted = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+      return isBlockedIPv4(dotted);
+    }
   }
 
   // Link-local (fe80::/10)
