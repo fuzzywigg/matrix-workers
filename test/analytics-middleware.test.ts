@@ -142,7 +142,7 @@ describe('analyticsMiddleware TOKENMAXX path/status/method matrix after #82', ()
     vi.restoreAllMocks();
   });
 
-  it('indexes root path "/" as empty-string blob segments joined to ""', async () => {
+  it('indexes root path "/" as "/" (split yields ["",""] → join "/")', async () => {
     const writeDataPoint = vi.fn();
     const next = vi.fn(async () => {
       vi.setSystemTime(NOW + 3);
@@ -154,10 +154,11 @@ describe('analyticsMiddleware TOKENMAXX path/status/method matrix after #82', ()
       status: 200,
     });
     await analyticsMiddleware()(ctx, next);
+    // '/'.split('/') → ['', '']; slice(0,5).join('/') → '/'
     expect(writeDataPoint.mock.calls[0][0]).toEqual({
       blobs: ['/', 'GET', '200'],
       doubles: [3],
-      indexes: [''],
+      indexes: ['/'],
     });
   });
 
