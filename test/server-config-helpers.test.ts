@@ -65,4 +65,18 @@ describe('TURN / Calls / LiveKit config helpers', () => {
     expect(isCallsConfigured(env())).toBe(false);
     expect(isCallsConfigured(env({ CALLS_APP_ID: 'app', CALLS_APP_SECRET: 'sec' }))).toBe(true);
   });
+
+  it('requires both Calls id and secret', () => {
+    expect(isCallsConfigured(env({ CALLS_APP_ID: 'app' }))).toBe(false);
+    expect(isCallsConfigured(env({ CALLS_APP_SECRET: 'sec' }))).toBe(false);
+  });
+
+  it('requires both TURN key id and token', () => {
+    expect(isTurnConfigured(env({ TURN_KEY_ID: 'abcdefghijklmnop' }))).toBe(false);
+    expect(isTurnConfigured(env({ TURN_API_TOKEN: 'tok' }))).toBe(false);
+  });
+
+  it('omits keyId from TURN status when unset', () => {
+    expect(getTurnStatus(env())).toEqual({ configured: false, keyId: undefined });
+  });
 });

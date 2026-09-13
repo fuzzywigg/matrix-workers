@@ -170,4 +170,21 @@ describe('event ID formats', () => {
     expect(txn.length).toBeGreaterThan(10);
     expect(txn).not.toMatch(/[+/=]/);
   });
+
+  it('defaults generateEventId to modern bare $opaque format', async () => {
+    const id = await generateEventId('matrix.example.com');
+    expect(id).toMatch(/^\$[A-Za-z0-9_-]+$/);
+  });
+});
+
+describe('getServerName edge cases', () => {
+  it('handles aliases and event IDs', () => {
+    expect(getServerName('#general:matrix.example.com')).toBe('matrix.example.com');
+    expect(getServerName('$evt:matrix.example.com')).toBe('matrix.example.com');
+  });
+
+  it('returns only the final colon segment (port when present)', () => {
+    // Current regex :([^:]+)$ — host:port IDs yield the port alone
+    expect(getServerName('@user:matrix.example.com:8448')).toBe('8448');
+  });
 });

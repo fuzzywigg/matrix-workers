@@ -140,4 +140,46 @@ describe('extractOpenGraphPreview', () => {
   it('returns empty object when no preview fields exist', () => {
     expect(extractOpenGraphPreview('<html><body>hi</body></html>')).toEqual({});
   });
+
+  it('prefers og:title over <title> when both exist', () => {
+    const html = `
+      <title>Page Title</title>
+      <meta property="og:title" content="OG Title" />
+    `;
+    expect(extractOpenGraphPreview(html)['og:title']).toBe('OG Title');
+  });
+
+  it('leaves absolute og:image URLs unchanged when baseUrl is set', () => {
+    const base = { protocol: 'https:', host: 'example.com' };
+    expect(
+      extractOpenGraphPreview(
+        `<meta property="og:image" content="https://cdn.example.com/x.png" />`,
+        base
+      )['og:image']
+    ).toBe('https://cdn.example.com/x.png');
+  });
+
+  it('decodes entities in meta description fallback', () => {
+    const html = `<meta name="description" content="A &amp; B" />`;
+    expect(extractOpenGraphPreview(html)['og:description']).toBe('A & B');
+  });
+});
+
+describe('MIME helpers edge cases', () => {
+  it('rejects empty and unknown MIME after parameter strip', () => {
+    expect(isSupportedContentType('')).toBe(false);
+    expect(isSupportedContentType('application/x-msdownload')).toBe(false);
+    expect(isSupportedContentType('text/html')).toBe(false);
+  });
+
+  it('accepts svg and webp from the whitelist', () => {
+    expect(isSupportedContentType('image/svg+xml')).toBe(true);
+    expect(isSupportedContentType('image/webp')).toBe(true);
+  });
+
+  it('clamps parseInt float prefixes', () => {
+    expect(clampThumbnailDimension('96.9')).toBe(96);
+    expect(clampThumbnailDimension('1')).toBe(1);
+    expect(clampThumbnailDimension('1920')).toBe(1920);
+  });
 });

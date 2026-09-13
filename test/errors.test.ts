@@ -66,6 +66,12 @@ describe('Errors factory', () => {
     expect(err.status).toBe(409);
     expect(err.errcode).toBe(ErrorCodes.M_CONFLICT);
   });
+
+  it('uses default messages when factory args are omitted', () => {
+    expect(Errors.forbidden().message).toBeTruthy();
+    expect(Errors.notFound().message).toBeTruthy();
+    expect(Errors.unknownToken().message).toBeTruthy();
+  });
 });
 
 describe('response helpers', () => {

@@ -67,6 +67,13 @@ describe('selectSRVRecord', () => {
     // totalWeight=30, random=15 → subtract a(10)=5, subtract b(10)=-5 → b
     expect(selectSRVRecord([a, b, c]).target).toBe('b.example.com');
   });
+
+  it('ignores higher-priority groups entirely when a lower priority exists', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const backup: SRVRecord = { priority: 20, weight: 100, port: 8448, target: 'backup.example.com' };
+    const primary: SRVRecord = { priority: 0, weight: 1, port: 8448, target: 'primary.example.com' };
+    expect(selectSRVRecord([backup, primary]).target).toBe('primary.example.com');
+  });
 });
 
 describe('buildServerUrl', () => {
@@ -79,6 +86,15 @@ describe('buildServerUrl', () => {
   it('includes non-default ports such as 8448', () => {
     expect(buildServerUrl({ host: 'example.com', port: 8448, tlsHostname: 'example.com' })).toBe(
       'https://example.com:8448'
+    );
+  });
+
+  it('keeps host literals including bracketed IPv6', () => {
+    expect(
+      buildServerUrl({ host: '[2001:db8::1]', port: 8448, tlsHostname: 'example.com' })
+    ).toBe('https://[2001:db8::1]:8448');
+    expect(buildServerUrl({ host: '1.2.3.4', port: 443, tlsHostname: '1.2.3.4' })).toBe(
+      'https://1.2.3.4'
     );
   });
 });

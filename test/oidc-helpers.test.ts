@@ -88,6 +88,16 @@ describe('deriveUsername', () => {
     );
     expect(() => deriveUsername({ sub: 'id' }, 'nickname')).toThrow(/Unknown username claim/);
   });
+
+  it('lowercases and sanitizes preferred_username punctuation', () => {
+    expect(
+      deriveUsername({ sub: 'id', preferred_username: 'User-Name.OK' }, 'preferred_username')
+    ).toBe('user-name.ok');
+    // "!!!" → "___" which is non-empty, so no user_<sub> fallback
+    expect(
+      deriveUsername({ sub: 'id', preferred_username: '!!!' }, 'preferred_username')
+    ).toBe('___');
+  });
 });
 
 describe('generateRandomString (oidc)', () => {

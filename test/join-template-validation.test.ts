@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { validateRemoteJoinTemplate } from '../src/workflows/join-template-validation';
+import {
+  SUPPORTED_ROOM_VERSIONS,
+  validateRemoteJoinTemplate,
+} from '../src/workflows/join-template-validation';
 
 const roomId = '!room:example.com';
 const userId = '@alice:example.com';
@@ -106,5 +109,35 @@ describe('validateRemoteJoinTemplate', () => {
     expect(() =>
       validateRemoteJoinTemplate(validTemplate({ room_id: '' }), roomId, userId)
     ).toThrow(/room_id mismatch/);
+  });
+
+  it('accepts every supported Matrix room version 1–12', () => {
+    for (const v of SUPPORTED_ROOM_VERSIONS) {
+      expect(() =>
+        validateRemoteJoinTemplate({ ...validTemplate(), room_version: v }, roomId, userId)
+      ).not.toThrow();
+    }
+    expect(SUPPORTED_ROOM_VERSIONS.size).toBe(12);
+  });
+
+  it('rejects missing content, non-array event ID lists, and negative depth', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ content: undefined }), roomId, userId)
+    ).toThrow(/membership/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ auth_events: '$only' }), roomId, userId)
+    ).toThrow(/auth_events/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ prev_events: null }), roomId, userId)
+    ).toThrow(/prev_events/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: -1 }), roomId, userId)
+    ).toThrow(/depth/);
+  });
+
+  it('rejects invalid prev_events IDs even when auth_events are valid', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ prev_events: ['not-an-id'] }), roomId, userId)
+    ).toThrow(/prev_events/);
   });
 });

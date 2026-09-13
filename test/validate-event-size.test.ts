@@ -58,4 +58,12 @@ describe('validateEventSize', () => {
     expect(JSON.stringify(event.content).length).toBe(65_536);
     expect(() => validateEventSize(event)).not.toThrow();
   });
+
+  it('rejects content one byte over the soft cap', () => {
+    const overhead = JSON.stringify({ body: '' }).length;
+    const body = 'z'.repeat(65_536 - overhead + 1);
+    const event = baseEvent({ body });
+    expect(JSON.stringify(event.content).length).toBe(65_537);
+    expect(() => validateEventSize(event)).toThrow(/content exceeds/);
+  });
 });

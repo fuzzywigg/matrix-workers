@@ -23,5 +23,32 @@ describe('isValidServerName (federation notary gate)', () => {
   it('rejects blocked ports', () => {
     expect(isValidServerName('evil.example.com:22')).toBe(false);
     expect(isValidServerName('evil.example.com:3306')).toBe(false);
+    expect(isValidServerName('evil.example.com:6379')).toBe(false);
+    expect(isValidServerName('evil.example.com:5432')).toBe(false);
+  });
+
+  it('rejects link-local, CGNAT-adjacent private ranges, and 0.x', () => {
+    expect(isValidServerName('169.254.169.254')).toBe(false);
+    expect(isValidServerName('172.16.0.1')).toBe(false);
+    expect(isValidServerName('172.31.255.255')).toBe(false);
+    expect(isValidServerName('0.0.0.0')).toBe(false);
+  });
+
+  it('rejects .local / .internal / metadata hostnames', () => {
+    expect(isValidServerName('printer.local')).toBe(false);
+    expect(isValidServerName('db.internal')).toBe(false);
+    expect(isValidServerName('metadata')).toBe(false);
+    expect(isValidServerName('metadata.google.internal')).toBe(false);
+  });
+
+  it('rejects IPv6 loopback and unique-local literals', () => {
+    expect(isValidServerName('[::1]')).toBe(false);
+    expect(isValidServerName('[fc00::1]')).toBe(false);
+    expect(isValidServerName('[fe80::1]')).toBe(false);
+  });
+
+  it('accepts public host:8448 and multi-label domains', () => {
+    expect(isValidServerName('matrix.org:8448')).toBe(true);
+    expect(isValidServerName('a.b.c.example.com')).toBe(true);
   });
 });

@@ -28,4 +28,15 @@ describe('isModernRoomVersion', () => {
     expect(isModernRoomVersion('2.5')).toBe(false);
     expect(isModernRoomVersion('3.9')).toBe(true);
   });
+
+  it('treats NaN-producing strings as modern (fail-closed)', () => {
+    expect(isModernRoomVersion('v10')).toBe(true);
+    expect(isModernRoomVersion('ten')).toBe(true);
+    expect(isModernRoomVersion(' ')).toBe(true);
+  });
+
+  it('treats very large numeric versions as modern', () => {
+    expect(isModernRoomVersion('100')).toBe(true);
+    expect(isModernRoomVersion('9999')).toBe(true);
+  });
 });
