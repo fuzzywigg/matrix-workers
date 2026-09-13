@@ -16,9 +16,10 @@ interface MatrixAuthParams {
 }
 
 /**
- * Parse the X-Matrix authorization header
+ * Parse the X-Matrix authorization header.
+ * Exported for unit tests.
  */
-function parseAuthHeader(authHeader: string): MatrixAuthParams | null {
+export function parseAuthHeader(authHeader: string): MatrixAuthParams | null {
   if (!authHeader.startsWith('X-Matrix ')) {
     return null;
   }
@@ -53,9 +54,10 @@ function parseAuthHeader(authHeader: string): MatrixAuthParams | null {
 }
 
 /**
- * Build the request object that was signed
+ * Build the request object that was signed.
+ * Exported for unit tests.
  */
-function buildSignedRequest(
+export function buildSignedRequest(
   method: string,
   uri: string,
   origin: string,

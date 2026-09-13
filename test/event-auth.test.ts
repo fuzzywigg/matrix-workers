@@ -292,4 +292,101 @@ describe('checkEventAuth', () => {
     expect(result.allowed).toBe(false);
     expect(result.error).toMatch(/redact/i);
   });
+
+  it('allows knocking on v7+ knock rooms', () => {
+    const state = [
+      createEvent(),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'knock' },
+      }),
+    ];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'knock'), state, '10').allowed).toBe(
+      true
+    );
+  });
+
+  it('rejects non-integer power levels on v10+', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const result = checkEventAuth(
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl-bad',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100, '@bob:example.com': 50.5 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+      state,
+      '10'
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.error).toMatch(/integers/i);
+  });
+
+  it('rejects power-level escalation above the sender own level', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50 }),
+    ];
+    const result = checkEventAuth(
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl-escalate',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 50, '@bob:example.com': 100 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+      state,
+      '10'
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.error).toMatch(/higher than own/i);
+  });
+
+  it('allows restricted joins with an authorizing joined inviter', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'restricted' },
+      }),
+    ];
+    const join = memberEvent('@bob:example.com', 'join');
+    join.content = {
+      membership: 'join',
+      join_authorised_via_users_server: '@alice:example.com',
+    };
+    expect(checkEventAuth(join, state, '10').allowed).toBe(true);
+  });
 });

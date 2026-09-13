@@ -1,0 +1,47 @@
+import { describe, it, expect } from 'vitest';
+import { validateStateEvent } from '../src/api/rooms';
+
+describe('validateStateEvent', () => {
+  it('rejects non-objects and missing type/content', () => {
+    expect(validateStateEvent(null, 0).valid).toBe(false);
+    expect(validateStateEvent({ content: {} }, 1).error).toMatch(/type/);
+    expect(validateStateEvent({ type: 'm.room.name' }, 2).error).toMatch(/content/);
+  });
+
+  it('rejects non-string state_key', () => {
+    expect(
+      validateStateEvent({ type: 'm.room.name', state_key: 1, content: { name: 'x' } }, 0).valid
+    ).toBe(false);
+  });
+
+  it('rejects auto-created event types', () => {
+    for (const type of ['m.room.create', 'm.room.member', 'm.room.power_levels']) {
+      expect(validateStateEvent({ type, content: {} }, 0).valid).toBe(false);
+    }
+  });
+
+  it('validates m.room.encryption algorithm', () => {
+    expect(
+      validateStateEvent({ type: 'm.room.encryption', content: {} }, 0).error
+    ).toMatch(/algorithm/);
+    expect(
+      validateStateEvent(
+        { type: 'm.room.encryption', content: { algorithm: 'm.bad' } },
+        0
+      ).error
+    ).toMatch(/unsupported algorithm/);
+    expect(
+      validateStateEvent(
+        { type: 'm.room.encryption', content: { algorithm: 'm.megolm.v1.aes-sha2' } },
+        0
+      ).valid
+    ).toBe(true);
+  });
+
+  it('accepts name/topic with empty state_key', () => {
+    expect(
+      validateStateEvent({ type: 'm.room.name', state_key: '', content: { name: 'General' } }, 0)
+        .valid
+    ).toBe(true);
+  });
+});

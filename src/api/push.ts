@@ -36,7 +36,8 @@ interface Pusher {
   append?: boolean;
 }
 
-interface PushRule {
+/** Exported for unit tests. */
+export interface PushRule {
   rule_id: string;
   default: boolean;
   enabled: boolean;
@@ -45,7 +46,8 @@ interface PushRule {
   pattern?: string;
 }
 
-interface PushCondition {
+/** Exported for unit tests. */
+export interface PushCondition {
   kind: string;
   key?: string;
   pattern?: string;
@@ -905,7 +907,8 @@ export async function evaluatePushRules(
   return { notify: false, actions: [], highlight: false };
 }
 
-function matchesRule(
+/** Exported for unit tests. */
+export function matchesRule(
   rule: PushRule,
   event: any,
   userId: string,
@@ -933,7 +936,8 @@ function matchesRule(
   return true;
 }
 
-function matchesCondition(
+/** Exported for unit tests. */
+export function matchesCondition(
   condition: PushCondition,
   event: any,
   userId: string,
@@ -1003,7 +1007,8 @@ function matchesCondition(
   }
 }
 
-function getNestedValue(obj: any, path: string): any {
+/** Exported for unit tests. */
+export function getNestedValue(obj: any, path: string): any {
   const keys = path.split('.');
   let value = obj;
 
