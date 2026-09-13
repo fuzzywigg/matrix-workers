@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { beforeAll, afterAll, describe, it, expect } from 'vitest';
 import {
   canonicalJson,
   timingSafeEqual,
@@ -10,6 +10,10 @@ import {
   generateRandomString,
   calculateContentHash,
   verifyContentHash,
+  generateSigningKeyPair,
+  generateSigningKeyPairLegacy,
+  signJson,
+  verifySignature,
 } from '../src/utils/crypto';
 
 describe('canonicalJson', () => {
@@ -168,5 +172,144 @@ describe('crypto TOKENMAXX edge paths after #50', () => {
 
   it('encodes nested null values in canonicalJson', () => {
     expect(canonicalJson({ a: null })).toBe('{"a":null}');
+  });
+});
+
+
+/** Remap Cloudflare's NODE-ED25519 algorithm name to Node's Ed25519 for unit tests. */
+function installNodeEd25519Shim() {
+  const subtle = crypto.subtle;
+  const origGenerateKey = subtle.generateKey.bind(subtle);
+  const origImportKey = subtle.importKey.bind(subtle);
+  const origSign = subtle.sign.bind(subtle);
+  const origVerify = subtle.verify.bind(subtle);
+
+  const mapAlg = (alg: AlgorithmIdentifier | EcKeyGenParams | EcKeyImportParams | EcdsaParams | unknown): AlgorithmIdentifier => {
+    if (typeof alg === 'string') {
+      return alg === 'NODE-ED25519' ? 'Ed25519' : alg;
+    }
+    if (alg && typeof alg === 'object' && (alg as { name?: string }).name === 'NODE-ED25519') {
+      return 'Ed25519';
+    }
+    return alg as AlgorithmIdentifier;
+  };
+
+  subtle.generateKey = ((alg: AlgorithmIdentifier, extractable: boolean, usages: KeyUsage[]) =>
+    origGenerateKey(mapAlg(alg), extractable, usages)) as typeof subtle.generateKey;
+  subtle.importKey = ((
+    format: KeyFormat,
+    keyData: BufferSource | JsonWebKey,
+    alg: AlgorithmIdentifier,
+    extractable: boolean,
+    usages: KeyUsage[]
+  ) => origImportKey(format, keyData, mapAlg(alg), extractable, usages)) as typeof subtle.importKey;
+  subtle.sign = ((alg: AlgorithmIdentifier, key: CryptoKey, data: BufferSource) =>
+    origSign(mapAlg(alg), key, data)) as typeof subtle.sign;
+  subtle.verify = ((
+    alg: AlgorithmIdentifier,
+    key: CryptoKey,
+    signature: BufferSource,
+    data: BufferSource
+  ) => origVerify(mapAlg(alg), key, signature, data)) as typeof subtle.verify;
+
+  return () => {
+    subtle.generateKey = origGenerateKey;
+    subtle.importKey = origImportKey;
+    subtle.sign = origSign;
+    subtle.verify = origVerify;
+  };
+}
+
+describe('federation signing TOKENMAXX edge paths after #52', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('round-trips signJson → verifySignature and strips signatures/unsigned', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    expect(keyId).toMatch(/^ed25519:[0-9a-f]{8}$/);
+
+    const obj = {
+      type: 'm.room.message',
+      content: { body: 'hi' },
+      signatures: { 'other.example.com': { 'ed25519:old': 'keep-me' } },
+      unsigned: { age: 1 },
+    };
+    const signed = await signJson(obj, 'matrix.example.com', keyId, privateKeyJwk);
+    expect(signed.unsigned).toEqual({ age: 1 });
+    expect((signed.signatures as Record<string, Record<string, string>>)['other.example.com']).toEqual({
+      'ed25519:old': 'keep-me',
+    });
+    expect(await verifySignature(signed, 'matrix.example.com', keyId, publicKey)).toBe(true);
+  });
+
+  it('merges a second keyId under the same server without dropping the first', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const base = { type: 'm.test', content: {} };
+    const once = await signJson(base, 'ex.com', a.keyId, a.privateKeyJwk);
+    const twice = await signJson(once, 'ex.com', b.keyId, b.privateKeyJwk);
+    const sigs = (twice.signatures as Record<string, Record<string, string>>)['ex.com'];
+    expect(Object.keys(sigs).sort()).toEqual([a.keyId, b.keyId].sort());
+    expect(await verifySignature(twice, 'ex.com', a.keyId, a.publicKey)).toBe(true);
+    expect(await verifySignature(twice, 'ex.com', b.keyId, b.publicKey)).toBe(true);
+  });
+
+  it('accepts privateKeyJwk as a JSON string (legacy path)', async () => {
+    const legacy = await generateSigningKeyPairLegacy();
+    expect(() => JSON.parse(legacy.privateKey)).not.toThrow();
+    const signed = await signJson({ type: 'm.test' }, 'ex.com', legacy.keyId, legacy.privateKey);
+    expect(await verifySignature(signed, 'ex.com', legacy.keyId, legacy.publicKey)).toBe(true);
+  });
+
+  it('returns false for missing signature, wrong key, or tampered body', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test', content: { n: 1 } }, 'ex.com', keyId, privateKeyJwk);
+    expect(await verifySignature(signed, 'ex.com', 'ed25519:deadbeef', publicKey)).toBe(false);
+    expect(await verifySignature({ type: 'm.test' }, 'ex.com', keyId, publicKey)).toBe(false);
+    const tampered = { ...signed, content: { n: 2 } };
+    expect(await verifySignature(tampered, 'ex.com', keyId, publicKey)).toBe(false);
+  });
+});
+
+describe('crypto TOKENMAXX edge paths after #52', () => {
+  it('rejects verifyPassword below 100000 iterations and wrong scheme', async () => {
+    expect(await verifyPassword('password1', '$pbkdf2-sha256$99999$c2FsdA$hash')).toBe(false);
+    expect(await verifyPassword('password1', '$pbkdf2-sha1$100000$c2FsdA$hash')).toBe(false);
+  });
+
+  it('accepts the 100000 iteration lower bound via a real hash', async () => {
+    const hash = await hashPassword('bound-check-1');
+    expect(hash).toMatch(/^\$pbkdf2-sha256\$100000\$/);
+    expect(await verifyPassword('bound-check-1', hash)).toBe(true);
+  });
+
+  it('produces distinct salts across hashPassword calls', async () => {
+    const a = await hashPassword('same-password-1');
+    const b = await hashPassword('same-password-1');
+    expect(a).not.toBe(b);
+    expect(await verifyPassword('same-password-1', a)).toBe(true);
+    expect(await verifyPassword('same-password-1', b)).toBe(true);
+  });
+
+  it('defaults generateRandomString length to 32', () => {
+    expect(generateRandomString()).toHaveLength(32);
+  });
+
+  it('encodes NaN, Infinity, and -0 via JSON.stringify number path', () => {
+    expect(canonicalJson(Number.NaN)).toBe('null');
+    expect(canonicalJson(Number.POSITIVE_INFINITY)).toBe('null');
+    expect(canonicalJson(-0)).toBe('0');
+  });
+
+  it('escapes unicode in canonicalJson strings', () => {
+    expect(canonicalJson('café')).toBe('"café"');
+    expect(canonicalJson({ '🔑': 1 })).toBe('{"🔑":1}');
   });
 });

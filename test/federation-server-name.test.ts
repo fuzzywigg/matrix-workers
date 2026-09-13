@@ -119,3 +119,30 @@ describe('isValidServerName TOKENMAXX edge paths after #50', () => {
     expect(isValidServerName('matrix.org:5432')).toBe(false);
   });
 });
+
+
+describe('isValidServerName TOKENMAXX edge paths after #52', () => {
+  it('documents CGNAT literals are allowed by federation gate (delegates to validateUrl)', () => {
+    expect(isValidServerName('100.64.0.1')).toBe(true);
+  });
+
+  it('rejects unique-local fd and fe9–feb IPv6 literals', () => {
+    expect(isValidServerName('[fd00::1]')).toBe(false);
+    expect(isValidServerName('[fe90::1]')).toBe(false);
+    expect(isValidServerName('[feb0::1]')).toBe(false);
+  });
+
+  it('accepts public IPv4 without a port', () => {
+    expect(isValidServerName('8.8.8.8')).toBe(true);
+    expect(isValidServerName('203.0.113.10')).toBe(true);
+  });
+
+  it('allows underscore hostnames (WHATWG URL + validateUrl do not block them)', () => {
+    expect(isValidServerName('bad_host.example.com')).toBe(true);
+  });
+
+  it('contrasts with ids.isValidServerName: federation rejects localhost', () => {
+    expect(isValidServerName('localhost')).toBe(false);
+    expect(isValidServerName('127.0.0.1')).toBe(false);
+  });
+});

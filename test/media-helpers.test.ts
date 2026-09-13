@@ -385,3 +385,57 @@ describe('media helpers TOKENMAXX edge paths after #50', () => {
     expect(clampThumbnailDimension('-0')).toBe(96);
   });
 });
+
+
+describe('media helpers TOKENMAXX edge paths after #52', () => {
+  it('sets the exact media CSP including style-src unsafe-inline', () => {
+    const headers = new Headers();
+    addMediaSecurityHeaders(headers);
+    expect(headers.get('Content-Security-Policy')).toBe(
+      "default-src 'none'; style-src 'unsafe-inline'"
+    );
+  });
+
+  it('snapshots SUPPORTED_TYPES length and membership', () => {
+    expect(SUPPORTED_TYPES).toHaveLength(16);
+    expect(SUPPORTED_TYPES).toEqual([
+      'image/jpeg',
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'image/svg+xml',
+      'video/mp4',
+      'video/webm',
+      'audio/mp3',
+      'audio/mpeg',
+      'audio/ogg',
+      'audio/wav',
+      'audio/webm',
+      'application/pdf',
+      'application/json',
+      'text/plain',
+      'application/octet-stream',
+    ]);
+  });
+
+  it('leaves empty and entity-free strings unchanged in decodeHtmlEntities', () => {
+    expect(decodeHtmlEntities('')).toBe('');
+    expect(decodeHtmlEntities('plain text')).toBe('plain text');
+  });
+
+  it('parses leading-plus thumbnail dimensions via parseInt', () => {
+    expect(clampThumbnailDimension('+96')).toBe(96);
+    expect(clampThumbnailDimension('+1')).toBe(1);
+  });
+
+  it('builds disposition after unicode sanitization to underscores', () => {
+    expect(safeContentDisposition('写真.png')).toBe('inline; filename="__.png"');
+  });
+
+  it('reads uppercase TITLE tags and empty og:title content', () => {
+    expect(extractOpenGraphPreview('<TITLE>Up</TITLE>')['og:title']).toBe('Up');
+    expect(
+      extractOpenGraphPreview('<meta property="og:title" content="" />')['og:title']
+    ).toBe('');
+  });
+});
