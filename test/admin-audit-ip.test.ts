@@ -85,3 +85,15 @@ describe('getActorIp TOKENMAXX edge paths after #49', () => {
     ).toBe('198.51.100.7');
   });
 });
+
+describe('getActorIp TOKENMAXX edge paths after #50', () => {
+  it('returns IPv6 CF-Connecting-IP values as-is', () => {
+    expect(
+      getActorIp(makeContext({ 'CF-Connecting-IP': '2001:db8::1' }))
+    ).toBe('2001:db8::1');
+  });
+
+  it('returns null when TRUST_FORWARDED_FOR is true but XFF is absent', () => {
+    expect(getActorIp(makeContext({}, { TRUST_FORWARDED_FOR: 'true' }))).toBeNull();
+  });
+});

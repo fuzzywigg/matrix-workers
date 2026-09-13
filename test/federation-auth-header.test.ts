@@ -202,3 +202,36 @@ describe('parseAuthHeader TOKENMAXX edge paths after #49', () => {
     expect(parseAuthHeader('X-Matrix key="k"')).toBeNull();
   });
 });
+
+describe('parseAuthHeader / buildSignedRequest TOKENMAXX edge paths after #50', () => {
+  it('keeps commas inside quoted signature values intact', () => {
+    expect(
+      parseAuthHeader('X-Matrix origin="a.example.com",key="ed25519:k",sig="a,b,c"')
+    ).toEqual({
+      origin: 'a.example.com',
+      key: 'ed25519:k',
+      sig: 'a,b,c',
+    });
+  });
+
+  it('truncates unquoted values at the first comma', () => {
+    expect(
+      parseAuthHeader('X-Matrix origin=a.example.com,key=ed25519:k,sig=a,b')
+    ).toEqual({
+      origin: 'a.example.com',
+      key: 'ed25519:k',
+      sig: 'a',
+    });
+  });
+
+  it('omits content when buildSignedRequest receives explicit undefined', () => {
+    expect(
+      buildSignedRequest('GET', '/_matrix/federation/v1/version', 'a', 'b', undefined)
+    ).toEqual({
+      method: 'GET',
+      uri: '/_matrix/federation/v1/version',
+      origin: 'a',
+      destination: 'b',
+    });
+  });
+});

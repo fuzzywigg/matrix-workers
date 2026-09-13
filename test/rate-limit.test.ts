@@ -253,3 +253,37 @@ describe('rate-limit TOKENMAXX edge paths after #49', () => {
     expect(getRateLimitType('/_matrix/client/v3/login', 'POST')).toBe('login');
   });
 });
+
+describe('rate-limit TOKENMAXX edge paths after #50', () => {
+  it('treats empty-string userId as absent and falls through to CF IP', () => {
+    expect(
+      getClientId(
+        makeContext({
+          userId: '',
+          headers: { 'CF-Connecting-IP': '203.0.113.50' },
+        })
+      )
+    ).toBe('ip:203.0.113.50');
+  });
+
+  it('classifies URL-encoded room send paths as send_message', () => {
+    expect(
+      getRateLimitType('/_matrix/client/v3/rooms/%21r%3Aexample.com/send/m.room.message/1', 'PUT')
+    ).toBe('send_message');
+  });
+
+  it('classifies /keys/ substring mid-path as e2ee', () => {
+    expect(getRateLimitType('/_matrix/client/v3/keys/changes', 'GET')).toBe('e2ee');
+  });
+
+  it('uses a single trusted XFF hop without spaces', () => {
+    expect(
+      getClientId(
+        makeContext({
+          headers: { 'X-Forwarded-For': '198.51.100.1' },
+          env: { TRUST_FORWARDED_FOR: 'true' },
+        })
+      )
+    ).toBe('ip:198.51.100.1');
+  });
+});

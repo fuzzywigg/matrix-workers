@@ -145,3 +145,20 @@ describe('room-versions TOKENMAXX edge paths after #49', () => {
     );
   });
 });
+
+describe('room-versions TOKENMAXX edge paths after #50', () => {
+  it('exposes authRuleVariant transitions across v7/v8/v10', () => {
+    expect(getRoomVersion('7')?.authRuleVariant).toBe('v1');
+    expect(getRoomVersion('8')?.authRuleVariant).toBe('v8');
+    expect(getRoomVersion('10')?.authRuleVariant).toBe('v10');
+  });
+
+  it('preserves redacts on redaction events for v12 like v11', () => {
+    const v12 = getRoomVersion('12')!;
+    expect(getRedactionAllowedKeys('m.room.redaction', v12)).toContain('redacts');
+  });
+
+  it('marks v3 eventIdFormat as v3', () => {
+    expect(getRoomVersion('3')?.eventIdFormat).toBe('v3');
+  });
+});

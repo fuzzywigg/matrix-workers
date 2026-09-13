@@ -356,3 +356,63 @@ describe('push rules TOKENMAXX edge paths after #49', () => {
     expect(getNestedValue({ a: { b: 1 } }, 'a.missing.x')).toBeUndefined();
   });
 });
+
+describe('push-rules TOKENMAXX edge paths after #50', () => {
+  it('escapes literal ? and + in content patterns', () => {
+    const rule: PushRule = {
+      rule_id: 'q',
+      default: false,
+      enabled: true,
+      pattern: 'a?b',
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, { content: { body: 'axb' } }, userId, 2)).toBe(false);
+    expect(matchesRule(rule, { content: { body: 'a?b' } }, userId, 2)).toBe(true);
+
+    const plus: PushRule = {
+      rule_id: 'plus',
+      default: false,
+      enabled: true,
+      pattern: 'a+b',
+      actions: ['notify'],
+    };
+    expect(matchesRule(plus, { content: { body: 'aab' } }, userId, 2)).toBe(false);
+    expect(matchesRule(plus, { content: { body: 'a+b' } }, userId, 2)).toBe(true);
+  });
+
+  it('matches contains_display_name case-insensitively', () => {
+    expect(
+      matchesCondition(
+        { kind: 'contains_display_name' },
+        { content: { body: 'hello Alice there' } },
+        userId,
+        2,
+        'ALICE'
+      )
+    ).toBe(true);
+  });
+
+  it('unescapes \\\\. in event_property_contains keys before nested lookup', () => {
+    // replace(/\\\./g, '.') turns content.mentions\.user_ids into content.mentions.user_ids
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.mentions\\.user_ids', value: userId },
+        { content: { mentions: { user_ids: [userId] } } },
+        userId,
+        2
+      )
+    ).toBe(true);
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.mentions.user_ids', value: userId },
+        { content: { mentions: { user_ids: [userId] } } },
+        userId,
+        2
+      )
+    ).toBe(true);
+  });
+
+  it('stops getNestedValue on undefined mid-path', () => {
+    expect(getNestedValue({ a: undefined }, 'a.b')).toBeUndefined();
+  });
+});

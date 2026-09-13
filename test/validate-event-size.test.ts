@@ -80,3 +80,37 @@ describe('validateEventSize TOKENMAXX edge paths after #49', () => {
     expect(() => validateEventSize(event)).toThrow(/content exceeds/);
   });
 });
+
+describe('validateEventSize TOKENMAXX edge paths after #50', () => {
+  it('accepts a full PDU exactly at the 921_600 hard-cap boundary', () => {
+    const event = baseEvent({ body: 'ok' });
+    const target = 921_600;
+    // Inflate non-content fields so content stays under the soft cap
+    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(event).length).toBeGreaterThan(target);
+    while (JSON.stringify(event).length > target) {
+      event.auth_events.pop();
+    }
+    const need = target - JSON.stringify(event).length;
+    if (need > 0) {
+      event.auth_events.push(`$p${'x'.repeat(Math.max(0, need - 2))}`);
+      while (JSON.stringify(event).length < target) {
+        event.auth_events[event.auth_events.length - 1] += 'x';
+      }
+      while (JSON.stringify(event).length > target) {
+        const last = event.auth_events[event.auth_events.length - 1];
+        event.auth_events[event.auth_events.length - 1] = last.slice(0, -1);
+      }
+    }
+    expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(event).length).toBe(target);
+    expect(() => validateEventSize(event)).not.toThrow();
+  });
+
+  it('treats null content as {} for the soft-cap path', () => {
+    const event = baseEvent();
+    (event as { content: unknown }).content = null;
+    expect(() => validateEventSize(event)).not.toThrow();
+  });
+});

@@ -66,3 +66,11 @@ describe('isModernRoomVersion TOKENMAXX edge paths after #49', () => {
     expect(isModernRoomVersion('  10')).toBe(true);
   });
 });
+
+describe('isModernRoomVersion TOKENMAXX edge paths after #50', () => {
+  it('treats scientific notation via parseInt prefix (1e1 → 1 → legacy)', () => {
+    expect(isModernRoomVersion('1e1')).toBe(false);
+    // parseInt('3e1', 10) === 3 → modern
+    expect(isModernRoomVersion('3e1')).toBe(true);
+  });
+});

@@ -114,3 +114,41 @@ describe('oidc TOKENMAXX edge paths after #49', () => {
     expect(() => decodeJWT('not-json.not-json.sig')).toThrow();
   });
 });
+
+describe('oidc TOKENMAXX edge paths after #50', () => {
+  it('defaults generateRandomString to 32 bytes (64 hex chars)', () => {
+    const s = generateRandomString();
+    expect(s).toHaveLength(64);
+    expect(s).toMatch(/^[0-9a-f]+$/);
+  });
+
+  it('URL-encodes spaces and special characters in authorization params', () => {
+    const url = new URL(
+      buildAuthorizationUrl(
+        discovery,
+        'client-1',
+        'https://matrix.example.com/cb?x=1',
+        'openid',
+        'state a',
+        'nonce'
+      )
+    );
+    expect(url.searchParams.get('state')).toBe('state a');
+    expect(url.searchParams.get('redirect_uri')).toBe('https://matrix.example.com/cb?x=1');
+  });
+
+  it('sanitizes email local-parts that are only punctuation to underscores', () => {
+    expect(deriveUsername({ sub: 'abcdefghijkl', email: '!!!@x.com' }, 'email')).toBe('___');
+  });
+
+  it('decodes base64url payloads that use - and _ alphabets', () => {
+    // {"sub":"a>b"} uses characters that force base64url -/_ when encoded without padding
+    const payload = Buffer.from(JSON.stringify({ sub: 'a>b?c' }))
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    const token = `${b64url({ alg: 'none' })}.${payload}.sig`;
+    expect(decodeJWT(token).payload).toEqual({ sub: 'a>b?c' });
+  });
+});

@@ -90,3 +90,18 @@ describe('server-config TOKENMAXX edge paths after #49', () => {
     });
   });
 });
+
+describe('server-config TOKENMAXX edge paths after #50', () => {
+  it('returns null LiveKit config when only LIVEKIT_URL is missing', () => {
+    expect(
+      getLiveKitConfig(env({ LIVEKIT_API_KEY: 'k', LIVEKIT_API_SECRET: 's' }))
+    ).toBeNull();
+  });
+
+  it('redacts TURN key IDs at the exact 8-char boundary with an ellipsis', () => {
+    expect(getTurnStatus(env({ TURN_KEY_ID: 'abcdefgh', TURN_API_TOKEN: 'tok' }))).toEqual({
+      configured: true,
+      keyId: 'abcdefgh...',
+    });
+  });
+});

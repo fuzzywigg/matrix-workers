@@ -210,3 +210,32 @@ describe('appservice TOKENMAXX edge paths after #49', () => {
     expect(isExclusiveAppServiceUser([first, second], '@_shared_bot:example.com')).toBe(first);
   });
 });
+
+describe('appservice TOKENMAXX edge paths after #50', () => {
+  it('lets the first exclusive alias registration win among duplicates', () => {
+    const first = registration('first', {
+      users: [],
+      rooms: [],
+      aliases: [{ exclusive: true, regex: '^#_shared_.*:example\\.com$' }],
+    });
+    const second = registration('second', {
+      users: [],
+      rooms: [],
+      aliases: [{ exclusive: true, regex: '^#_shared_.*:example\\.com$' }],
+    });
+    expect(isExclusiveAppServiceAlias([first, second], '#_shared_room:example.com')).toBe(first);
+  });
+
+  it('is interested when the sender matches an exclusive user ns even if room ns misses', () => {
+    const interested = getInterestedAppServices(
+      [bridge],
+      {
+        type: 'm.room.message',
+        sender: '@_bridge_bot:example.com',
+        room_id: '!unrelated:example.com',
+        content: { body: 'hi', msgtype: 'm.text' },
+      } as never
+    );
+    expect(interested.map((r) => r.id)).toContain('bridge');
+  });
+});

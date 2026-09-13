@@ -127,3 +127,15 @@ describe('federation-keys TOKENMAXX edge paths after #49', () => {
     expect(isKeyTooStale(Number.NaN, 1_700_000_000_000, 1_000)).toBe(false);
   });
 });
+
+describe('federation-keys TOKENMAXX edge paths after #50', () => {
+  it('treats Infinity valid_until as not stale', () => {
+    expect(isKeyTooStale(Number.POSITIVE_INFINITY, 1_700_000_000_000, 1_000)).toBe(false);
+  });
+
+  it('falls back to default when env override is the Infinity string', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: 'Infinity' })).toBe(
+      DEFAULT_KEY_MAX_STALENESS_MS
+    );
+  });
+});

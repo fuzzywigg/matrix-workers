@@ -139,3 +139,23 @@ describe('server-discovery TOKENMAXX edge paths after #49', () => {
     expect(selectSRVRecord([a, b]).target).toBe('a.example.com');
   });
 });
+
+describe('server-discovery TOKENMAXX edge paths after #50', () => {
+  it('builds URLs from host/port and ignores tlsHostname for the authority', () => {
+    expect(
+      buildServerUrl({ host: 'a.example.com', port: 8448, tlsHostname: 'b.example.com' })
+    ).toBe('https://a.example.com:8448');
+  });
+
+  it('detects loopback IPv4 as an IP literal', () => {
+    expect(isIPLiteral('127.0.0.1')).toBe(true);
+  });
+
+  it('selects the mid-list peer when random hits its cumulative weight boundary', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.1);
+    const a: SRVRecord = { priority: 0, weight: 10, port: 8448, target: 'a.example.com' };
+    const b: SRVRecord = { priority: 0, weight: 90, port: 8448, target: 'b.example.com' };
+    // total=100, random*total=10 → first peer where cumulative >= 10 is a (weight 10)
+    expect(selectSRVRecord([a, b]).target).toBe('a.example.com');
+  });
+});
