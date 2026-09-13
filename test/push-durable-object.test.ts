@@ -611,13 +611,16 @@ describe('PushDurableObject TOKENMAXX APNs configured path after #74', () => {
   });
 
   it('batch send mixes success and failure with credentials configured', async () => {
-    fetchMock
-      .mockResolvedValueOnce(
-        new Response(null, { status: 200, headers: { 'apns-id': 'ok-1' } })
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ reason: 'Unregistered' }), { status: 410 })
-      );
+    // Dispatch by device token — Promise.all races mockResolvedValueOnce order
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).endsWith('/device/a')) {
+        return new Response(null, { status: 200, headers: { 'apns-id': 'ok-1' } });
+      }
+      if (String(url).endsWith('/device/b')) {
+        return new Response(JSON.stringify({ reason: 'Unregistered' }), { status: 410 });
+      }
+      return new Response('unexpected', { status: 500 });
+    });
     const { do: push } = makePush(apnsEnv(pem));
 
     const res = await push.fetch(
