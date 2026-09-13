@@ -107,3 +107,10 @@ describe('generateRandomString (oidc)', () => {
     expect(s).toMatch(/^[0-9a-f]+$/);
   });
 });
+
+
+describe('oidc TOKENMAXX edge paths after #49', () => {
+  it('throws when JWT payload is not JSON', () => {
+    expect(() => decodeJWT('not-json.not-json.sig')).toThrow();
+  });
+});

@@ -80,3 +80,13 @@ describe('TURN / Calls / LiveKit config helpers', () => {
     expect(getTurnStatus(env())).toEqual({ configured: false, keyId: undefined });
   });
 });
+
+
+describe('server-config TOKENMAXX edge paths after #49', () => {
+  it('redacts short TURN key IDs with an ellipsis suffix', () => {
+    expect(getTurnStatus(env({ TURN_KEY_ID: 'ab', TURN_API_TOKEN: 'tok' }))).toEqual({
+      configured: true,
+      keyId: 'ab...',
+    });
+  });
+});

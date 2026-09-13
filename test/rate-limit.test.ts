@@ -201,3 +201,55 @@ describe('getRateLimitType method / path failure edges', () => {
     );
   });
 });
+
+
+describe('rate-limit TOKENMAXX edge paths after #49', () => {
+  it('prefers CF-Connecting-IP over trusted X-Forwarded-For', () => {
+    expect(
+      getClientId(
+        makeContext({
+          headers: {
+            'CF-Connecting-IP': '203.0.113.9',
+            'X-Forwarded-For': '198.51.100.9',
+          },
+          env: { TRUST_FORWARDED_FOR: 'true' },
+        })
+      )
+    ).toBe('ip:203.0.113.9');
+  });
+
+  it('requires exact lowercase true for TRUST_FORWARDED_FOR', () => {
+    expect(
+      getClientId(
+        makeContext({
+          headers: { 'X-Forwarded-For': '198.51.100.1' },
+          env: { TRUST_FORWARDED_FOR: 'TRUE' },
+        })
+      )
+    ).toBe('ip:unknown');
+    expect(
+      getClientId(
+        makeContext({
+          headers: { 'X-Forwarded-For': '198.51.100.1' },
+          env: { TRUST_FORWARDED_FOR: '1' },
+        })
+      )
+    ).toBe('ip:unknown');
+  });
+
+  it('falls through blank CF-Connecting-IP to trusted XFF', () => {
+    expect(
+      getClientId(
+        makeContext({
+          headers: { 'CF-Connecting-IP': '', 'X-Forwarded-For': '198.51.100.7' },
+          env: { TRUST_FORWARDED_FOR: 'true' },
+        })
+      )
+    ).toBe('ip:198.51.100.7');
+  });
+
+  it('treats login method comparison as case-sensitive', () => {
+    expect(getRateLimitType('/_matrix/client/v3/login', 'post')).toBe('default');
+    expect(getRateLimitType('/_matrix/client/v3/login', 'POST')).toBe('login');
+  });
+});

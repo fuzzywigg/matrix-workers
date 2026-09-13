@@ -160,3 +160,44 @@ describe('validateUrl blocked hostname list edges', () => {
     expect(validateUrl('http://evil.localhost/').valid).toBe(false);
   });
 });
+
+
+describe('validateUrl TOKENMAXX edge paths after #49', () => {
+  it('rejects remaining blocked service ports on public hosts', () => {
+    for (const port of [23, 135, 139, 5900]) {
+      const result = validateUrl(`https://example.com:${port}`);
+      expect(result.valid).toBe(false);
+      expect(result.error).toMatch(/port/i);
+    }
+  });
+
+  it('rejects the full kubernetes.default.svc.cluster.local hostname', () => {
+    expect(validateUrl('http://kubernetes.default.svc.cluster.local/').valid).toBe(false);
+  });
+
+  it('lowercases hostnames before blocklist matching', () => {
+    expect(validateUrl('http://LOCALHOST/').valid).toBe(false);
+    expect(validateUrl('http://Metadata/').valid).toBe(false);
+    expect(validateUrl('http://Ip6-Localhost/').valid).toBe(false);
+  });
+
+  it('blocks RFC1918 172.16/12 at the lower boundary but allows 172.15.x', () => {
+    expect(validateUrl('http://172.15.255.255/').valid).toBe(true);
+    expect(validateUrl('http://172.16.0.0/').valid).toBe(false);
+    expect(validateUrl('http://172.31.255.255/').valid).toBe(false);
+  });
+
+  it('rejects IPv4-mapped private addresses beyond loopback', () => {
+    // ::ffff:10.0.0.1 → ::ffff:a00:1
+    expect(validateUrl('http://[::ffff:a00:1]/').valid).toBe(false);
+    expect(validateUrl('http://[::ffff:10.0.0.1]/').valid).toBe(false);
+  });
+
+  it('returns Invalid URL format for empty strings', () => {
+    expect(validateUrl('')).toEqual({ valid: false, error: 'Invalid URL format' });
+  });
+
+  it('rejects whitespace-only URL strings', () => {
+    expect(validateUrl('   ').valid).toBe(false);
+  });
+});

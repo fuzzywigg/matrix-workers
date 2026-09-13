@@ -206,3 +206,31 @@ describe('ID parse failure edges', () => {
     expect(isValidServerName('https://example.com')).toBe(false);
   });
 });
+
+
+describe('ids TOKENMAXX edge paths after #49', () => {
+  it('uses domain-suffixed deterministic IDs for room version 1', async () => {
+    const id = await generateDeterministicEventId(
+      'matrix.example.com',
+      '!room:matrix.example.com',
+      '@alice:matrix.example.com',
+      'join',
+      1_700_000_000_000,
+      1,
+      '1'
+    );
+    expect(id).toMatch(/^\$[^:]+:matrix\.example\.com$/);
+  });
+
+  it('accepts localparts at the 255-char upper boundary', () => {
+    expect(isValidLocalpart('a'.repeat(255))).toBe(true);
+    expect(isValidLocalpart('a'.repeat(256))).toBe(false);
+  });
+
+  it('parses user IDs whose server name includes a port', () => {
+    expect(parseUserId('@alice:example.com:8448' as '@alice:example.com')).toEqual({
+      localpart: 'alice',
+      serverName: 'example.com:8448',
+    });
+  });
+});

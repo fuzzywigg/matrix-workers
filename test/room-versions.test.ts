@@ -129,3 +129,19 @@ describe('getRedactionAllowedKeys', () => {
     expect(getRedactionAllowedKeys('m.room.redaction', v10)).toContain('event_id');
   });
 });
+
+
+describe('room-versions TOKENMAXX edge paths after #49', () => {
+  it('rejects empty and non-numeric version strings', () => {
+    expect(isRoomVersionSupported('')).toBe(false);
+    expect(isRoomVersionSupported('v10')).toBe(false);
+    expect(getRoomVersion('')).toBeNull();
+  });
+
+  it('preserves allow list keys for join_rules under v11 redaction rules', () => {
+    const v11 = getRoomVersion('11')!;
+    expect(getRedactionAllowedKeys('m.room.join_rules', v11)).toEqual(
+      expect.arrayContaining(['join_rule', 'allow'])
+    );
+  });
+});

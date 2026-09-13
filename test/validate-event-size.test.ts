@@ -67,3 +67,16 @@ describe('validateEventSize', () => {
     expect(() => validateEventSize(event)).toThrow(/content exceeds/);
   });
 });
+
+
+describe('validateEventSize TOKENMAXX edge paths after #49', () => {
+  it('accepts empty content objects and array/null content JSON sizes', () => {
+    expect(() => validateEventSize(baseEvent({}))).not.toThrow();
+    expect(() => validateEventSize(baseEvent({ items: [] }))).not.toThrow();
+  });
+
+  it('rejects content that is over the soft cap even when nested', () => {
+    const event = baseEvent({ nested: { blob: 'n'.repeat(65_536) } });
+    expect(() => validateEventSize(event)).toThrow(/content exceeds/);
+  });
+});

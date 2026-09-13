@@ -91,3 +91,17 @@ describe('isValidServerName (federation notary gate)', () => {
     expect(isValidServerName('a'.repeat(256))).toBe(false);
   });
 });
+
+
+describe('isValidServerName TOKENMAXX edge paths after #49', () => {
+  it('rejects whitespace-only and padded blank names', () => {
+    expect(isValidServerName(' ')).toBe(false);
+    expect(isValidServerName('   ')).toBe(false);
+  });
+
+  it('rejects remaining blocked ports used by telnet/RPC/VNC', () => {
+    expect(isValidServerName('evil.example.com:23')).toBe(false);
+    expect(isValidServerName('evil.example.com:135')).toBe(false);
+    expect(isValidServerName('evil.example.com:5900')).toBe(false);
+  });
+});

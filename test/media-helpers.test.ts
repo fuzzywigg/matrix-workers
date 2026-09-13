@@ -314,3 +314,47 @@ describe('extractOpenGraphPreview absolutization / decode edges', () => {
     expect(preview['og:type']).toBe('web&amp;site');
   });
 });
+
+
+describe('media helpers TOKENMAXX edge paths after #49', () => {
+  it('reads meta description with content-before-name attribute order', () => {
+    const html = `<meta content="D &amp; E" name="description" />`;
+    expect(extractOpenGraphPreview(html)['og:description']).toBe('D & E');
+  });
+
+  it('decodes entities in og:site_name', () => {
+    const html = `<meta property="og:site_name" content="Acme &amp; Co" />`;
+    expect(extractOpenGraphPreview(html)['og:site_name']).toBe('Acme & Co');
+  });
+
+  it('uses a custom fallback when clamp sees falsy parseInt zero', () => {
+    expect(clampThumbnailDimension('0', 32)).toBe(32);
+    expect(clampThumbnailDimension('', 64)).toBe(64);
+  });
+
+  it('accepts remaining audio/video whitelist MIME entries', () => {
+    expect(isSupportedContentType('audio/mp3')).toBe(true);
+    expect(isSupportedContentType('audio/mpeg')).toBe(true);
+    expect(isSupportedContentType('video/mp4')).toBe(true);
+    expect(isSupportedContentType('audio/wav')).toBe(true);
+    expect(parseBaseContentType('')).toBe('');
+  });
+
+  it('leaves filenames at the 255-char truncate boundary unchanged in length', () => {
+    const exact = 'x'.repeat(255);
+    expect(sanitizeFilename(exact)).toBe(exact);
+    expect(sanitizeFilename(exact).length).toBe(255);
+  });
+
+  it('builds disposition for empty filenames', () => {
+    expect(safeContentDisposition('')).toBe('inline; filename=""');
+  });
+
+  it('prefers og:description over meta description when both exist', () => {
+    const html = `
+      <meta property="og:description" content="OG" />
+      <meta name="description" content="Meta" />
+    `;
+    expect(extractOpenGraphPreview(html)['og:description']).toBe('OG');
+  });
+});

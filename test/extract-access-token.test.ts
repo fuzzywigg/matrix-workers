@@ -81,3 +81,19 @@ describe('extractAccessToken', () => {
     expect(extractAccessToken(req)).toBeNull();
   });
 });
+
+
+describe('extractAccessToken TOKENMAXX edge paths after #49', () => {
+  it('falls back to query when Authorization is an empty string', () => {
+    const req = new Request('https://matrix.example.com/?access_token=from_query', {
+      headers: { Authorization: '' },
+    });
+    // Empty Authorization header is typically omitted by Fetch; if present as empty, no Bearer match
+    expect(extractAccessToken(req)).toBe('from_query');
+  });
+
+  it('decodes percent-encoded access_token query values', () => {
+    const req = new Request('https://matrix.example.com/?access_token=syt%5Fabc');
+    expect(extractAccessToken(req)).toBe('syt_abc');
+  });
+});

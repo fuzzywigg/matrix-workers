@@ -50,3 +50,17 @@ describe('generateLiveKitToken', () => {
     expect(claims.exp - claims.nbf).toBe(3600);
   });
 });
+
+
+describe('livekit TOKENMAXX edge paths after #49', () => {
+  it('falls back empty participant names to identity and allows zero TTL', async () => {
+    const token = await generateLiveKitToken('k', 's', 'room', 'id-only', '', 0);
+    const claims = decodePart(token.split('.')[1]) as {
+      name: string;
+      nbf: number;
+      exp: number;
+    };
+    expect(claims.name).toBe('id-only');
+    expect(claims.exp).toBe(claims.nbf);
+  });
+});

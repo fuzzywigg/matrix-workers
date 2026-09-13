@@ -201,3 +201,14 @@ describe('applyEventFilter mid-string wildcard edges', () => {
     ).toEqual([]);
   });
 });
+
+
+describe('sync filters TOKENMAXX edge paths after #49', () => {
+  it('parses empty string tokens as zero positions', () => {
+    expect(parseSyncToken('')).toEqual({ events: 0, toDevice: 0 });
+  });
+
+  it('legacy-parses float prefixes via parseInt', () => {
+    expect(parseSyncToken('3.14')).toEqual({ events: 3, toDevice: 3 });
+  });
+});

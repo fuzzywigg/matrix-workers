@@ -121,3 +121,18 @@ describe('Errors federation / media-adjacent factories', () => {
     expect(Errors.forbidden('denied').message).toBe('denied');
   });
 });
+
+
+describe('errors TOKENMAXX edge paths after #49', () => {
+  it('omits retry_after_ms when retryAfterMs is zero (falsy)', () => {
+    const err = new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'slow', 429, 0);
+    expect(err.toJSON()).toEqual({ errcode: 'M_LIMIT_EXCEEDED', error: 'slow' });
+  });
+
+  it('allows custom emptyResponse status codes with a JSON body', async () => {
+    // 204/205/304 forbid bodies in the Fetch Response constructor
+    const res = emptyResponse(201);
+    expect(res.status).toBe(201);
+    await expect(res.json()).resolves.toEqual({});
+  });
+});
