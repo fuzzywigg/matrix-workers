@@ -279,3 +279,104 @@ describe('parseAuthHeader TOKENMAXX edge paths after #55', () => {
     ).toBeNull();
   });
 });
+
+describe('parseAuthHeader / buildSignedRequest TOKENMAXX leftovers after #81', () => {
+  it('parses key ids that contain colons beyond the algorithm prefix', () => {
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin="a.example.com",key="ed25519:abc:def",sig="s"'
+      )
+    ).toEqual({
+      origin: 'a.example.com',
+      key: 'ed25519:abc:def',
+      sig: 's',
+    });
+  });
+
+  it('parses unquoted key ids truncated at whitespace', () => {
+    expect(
+      parseAuthHeader('X-Matrix origin=a.example.com,key=ed25519:k,sig=sigvalue')
+    ).toEqual({
+      origin: 'a.example.com',
+      key: 'ed25519:k',
+      sig: 'sigvalue',
+    });
+    // Unquoted regex stops at whitespace — trailing junk after space is ignored
+    expect(
+      parseAuthHeader('X-Matrix origin=a.example.com,key=ed25519:k,sig=abc junk')
+    ).toEqual({
+      origin: 'a.example.com',
+      key: 'ed25519:k',
+      sig: 'abc',
+    });
+  });
+
+  it('ignores unknown quoted keys without clobbering required fields', () => {
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin="a.example.com",key="ed25519:k",sig="s",algorithm="ed25519",version="1"'
+      )
+    ).toEqual({
+      origin: 'a.example.com',
+      key: 'ed25519:k',
+      sig: 's',
+    });
+  });
+
+  it('does not fill missing origin from an unquoted destination-only header', () => {
+    expect(
+      parseAuthHeader('X-Matrix destination=b.example.com,key=ed25519:k,sig=s')
+    ).toBeNull();
+  });
+
+  it('preserves method casing and absolute-looking uri strings verbatim', () => {
+    const req = buildSignedRequest(
+      'pOsT',
+      'https://matrix.example.com/_matrix/federation/v1/send/t',
+      'o',
+      'd',
+      { n: 1 }
+    );
+    expect(req.method).toBe('pOsT');
+    expect(req.uri).toBe('https://matrix.example.com/_matrix/federation/v1/send/t');
+    expect(req.content).toEqual({ n: 1 });
+  });
+
+  it('includes numeric and boolean JSON content without coercion', () => {
+    expect(buildSignedRequest('PUT', '/x', 'a', 'b', 42).content).toBe(42);
+    expect(buildSignedRequest('PUT', '/x', 'a', 'b', true).content).toBe(true);
+  });
+
+  it('lets a later quoted sig overwrite an earlier quoted sig', () => {
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin="a.example.com",key="ed25519:k",sig="first",sig="second"'
+      )?.sig
+    ).toBe('second');
+  });
+
+  it('does not let a later unquoted sig overwrite an earlier quoted sig', () => {
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin="a.example.com",key="ed25519:k",sig="quoted",sig=unquoted'
+      )?.sig
+    ).toBe('quoted');
+  });
+
+  it('parses destination-only gaps when origin/key/sig are present as unquoted', () => {
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin=origin.example.com,key=ed25519:1,sig=deadbeef,destination=dest.example.com'
+      )
+    ).toEqual({
+      origin: 'origin.example.com',
+      destination: 'dest.example.com',
+      key: 'ed25519:1',
+      sig: 'deadbeef',
+    });
+  });
+
+  it('rejects headers that only have the X-Matrix scheme prefix with no params', () => {
+    expect(parseAuthHeader('X-Matrix')).toBeNull();
+  });
+});
