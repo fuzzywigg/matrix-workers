@@ -48,7 +48,8 @@ export function getRateLimitType(path: string, method: string): string {
 //   - When no trusted IP source is available we use a single 'unknown' bucket.
 //     This is intentionally a strict shared bucket — if you see legitimate
 //     'unknown' traffic, fix the deployment to expose a trusted IP source.
-function getClientId(c: Context<AppEnv>): string {
+/** Exported for unit tests. */
+export function getClientId(c: Context<AppEnv>): string {
   // Try to get user ID first (for authenticated requests)
   const userId = c.get('userId');
   if (userId) {

@@ -19,6 +19,8 @@ import {
   generateEventId,
   generateRoomId,
   generateDeviceId,
+  generateTransactionId,
+  generateLegacyEventId,
 } from '../src/utils/ids';
 
 describe('format/parse Matrix IDs', () => {
@@ -159,5 +161,13 @@ describe('event ID formats', () => {
     );
     expect(a).toBe(b);
     expect(a).not.toBe(c);
+  });
+
+  it('generates legacy domain-suffixed event IDs and transaction IDs', async () => {
+    const legacy = await generateLegacyEventId('matrix.example.com');
+    expect(legacy).toMatch(/^\$[^:]+:matrix\.example\.com$/);
+    const txn = await generateTransactionId();
+    expect(txn.length).toBeGreaterThan(10);
+    expect(txn).not.toMatch(/[+/=]/);
   });
 });
