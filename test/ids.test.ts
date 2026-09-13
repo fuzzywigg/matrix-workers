@@ -188,3 +188,21 @@ describe('getServerName edge cases', () => {
     expect(getServerName('@user:matrix.example.com:8448')).toBe('8448');
   });
 });
+
+describe('ID parse failure edges', () => {
+  it('rejects empty and prefix-only Matrix IDs', () => {
+    expect(parseUserId('@:' as '@x:y')).toBeNull();
+    expect(parseRoomId('!:' as '!x:y')).toBeNull();
+    expect(parseRoomAlias('#:' as '#x:y')).toBeNull();
+  });
+
+  it('rejects localparts with uppercase or disallowed punctuation', () => {
+    expect(isValidLocalpart('Alice-Bob')).toBe(false);
+    expect(isValidLocalpart('alice+bob')).toBe(false);
+  });
+
+  it('rejects server names with spaces or scheme prefixes', () => {
+    expect(isValidServerName('example .com')).toBe(false);
+    expect(isValidServerName('https://example.com')).toBe(false);
+  });
+});

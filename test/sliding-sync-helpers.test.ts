@@ -204,3 +204,63 @@ describe('detectNSERequest', () => {
     expect(result.isLikelyNSE).toBe(false);
   });
 });
+
+describe('isDmRoom / filter / range failure edges', () => {
+  it('treats zero and negative member counts without a name as DMs', () => {
+    expect(isDmRoom(0, null)).toBe(true);
+    expect(isDmRoom(-1, '')).toBe(true);
+  });
+
+  it('skips room_name_like for empty-string names (falsy)', () => {
+    expect(matchesSlidingRoomFilters('', false, { room_name_like: 'hq' })).toBe(true);
+  });
+
+  it('falls through empty ranges arrays to MSC4186 range when preferRangesFirst', () => {
+    expect(resolveListRange({ ranges: [], range: [1, 2] }, 10, true)).toEqual({
+      startIndex: 1,
+      endIndex: 2,
+    });
+  });
+
+  it('does not clamp startIndex when the requested window is past the end', () => {
+    // Existing behavior: startIndex is not clamped; callers may get empty slices
+    expect(resolveListRange({ range: [10, 20] }, 5)).toEqual({
+      startIndex: 10,
+      endIndex: 4,
+    });
+  });
+});
+
+describe('detectNSERequest timeline and extension edges', () => {
+  it('does not flag small-timeline-limit when timeline_limit is omitted (defaults to 10)', () => {
+    const result = detectNSERequest(undefined, {
+      room_subscriptions: { '!a:example.com': {} },
+    });
+    expect(result.indicators).not.toContain('small-timeline-limit');
+    expect(result.indicators).toContain('single-room-subscription');
+  });
+
+  it('treats timeline_limit 0 as falsy (defaults to 10) but flags explicit 1', () => {
+    expect(
+      detectNSERequest(undefined, {
+        room_subscriptions: { '!a:example.com': { timeline_limit: 0 } },
+      }).indicators
+    ).not.toContain('small-timeline-limit');
+    expect(
+      detectNSERequest(undefined, {
+        room_subscriptions: { '!a:example.com': { timeline_limit: 1 } },
+      }).indicators
+    ).toContain('small-timeline-limit');
+  });
+
+  it('does not treat empty room_subscriptions as single-room', () => {
+    const result = detectNSERequest(undefined, { room_subscriptions: {} });
+    expect(result.indicators).not.toContain('single-room-subscription');
+  });
+
+  it('does not flag minimal-extensions when typing is present alone', () => {
+    expect(
+      detectNSERequest(undefined, { extensions: { typing: { enabled: true } } }).indicators
+    ).not.toContain('minimal-extensions');
+  });
+});

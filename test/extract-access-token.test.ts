@@ -65,4 +65,19 @@ describe('extractAccessToken', () => {
     });
     expect(extractAccessToken(req)).toBe('tok with spaces');
   });
+
+  it('ignores non-Bearer schemes even when access_token query is present', () => {
+    // Authorization is present but not Bearer → falls through to query
+    const req = new Request('https://matrix.example.com/?access_token=from_query', {
+      headers: { Authorization: 'Basic abc' },
+    });
+    expect(extractAccessToken(req)).toBe('from_query');
+  });
+
+  it('returns null for Bearer with only a scheme and tab/space noise after Header trim', () => {
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Authorization: 'Bearer\t' },
+    });
+    expect(extractAccessToken(req)).toBeNull();
+  });
 });

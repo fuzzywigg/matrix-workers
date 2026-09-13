@@ -112,4 +112,39 @@ describe('validateUrl additional ranges', () => {
     expect(validateUrl('https://example.com:3306').valid).toBe(false);
     expect(validateUrl('https://example.com:6379').valid).toBe(false);
   });
+
+  it('rejects mail, DNS, SMB, RDP, and DB service ports', () => {
+    for (const port of [25, 53, 445, 1433, 1521, 3389, 9200, 27017]) {
+      expect(validateUrl(`https://example.com:${port}`).valid).toBe(false);
+    }
+  });
+
+  it('rejects unspecified and site-local IPv6', () => {
+    expect(validateUrl('http://[::]/').valid).toBe(false);
+    expect(validateUrl('http://[fec0::1]/').valid).toBe(false);
+    expect(validateUrl('http://[fed0::1]/').valid).toBe(false);
+  });
+
+  it('rejects non-http schemes used in SSRF gadgets', () => {
+    expect(validateUrl('javascript:alert(1)').valid).toBe(false);
+    expect(validateUrl('data:text/html,hi').valid).toBe(false);
+    expect(validateUrl('gopher://example.com/1').valid).toBe(false);
+  });
+
+  it('allows public IPv4-mapped addresses that are not private', () => {
+    // ::ffff:8.8.8.8 → ::ffff:808:808
+    expect(validateUrl('http://[::ffff:8.8.8.8]/').valid).toBe(true);
+  });
+});
+
+describe('validateUrlForPreview port edges', () => {
+  it('rejects federation-default 8448 even though SSRF allow-list would pass', () => {
+    expect(validateUrl('https://example.com:8448').valid).toBe(true);
+    expect(validateUrlForPreview('https://example.com:8448').valid).toBe(false);
+  });
+
+  it('rejects preview targets with blocked hostnames before port checks', () => {
+    expect(validateUrlForPreview('http://localhost:8080').valid).toBe(false);
+    expect(validateUrlForPreview('http://metadata:443').valid).toBe(false);
+  });
 });

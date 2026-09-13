@@ -154,3 +154,42 @@ describe('appservice empty namespaces', () => {
     ).toEqual([]);
   });
 });
+
+describe('appservice interest failure edges', () => {
+  it('does not treat exclusive room namespaces as exclusive users', () => {
+    const roomOnly = registration('roomy', {
+      users: [],
+      rooms: [{ exclusive: true, regex: '^!secret_.*:example\\.com$' }],
+      aliases: [],
+    });
+    expect(isExclusiveAppServiceUser([roomOnly], '@anyone:example.com')).toBeNull();
+    expect(
+      getInterestedAppServices([roomOnly], {
+        room_id: '!secret_portal:example.com',
+        sender: '@alice:example.com',
+        type: 'm.room.message',
+      })
+    ).toEqual([roomOnly]);
+  });
+
+  it('matches non-exclusive user namespaces for interest but not exclusivity', () => {
+    expect(isExclusiveAppServiceUser([soft], '@_soft_bot:example.com')).toBeNull();
+    expect(
+      getInterestedAppServices([soft], {
+        room_id: '!plain:example.com',
+        sender: '@_soft_bot:example.com',
+        type: 'm.room.message',
+      })
+    ).toEqual([soft]);
+  });
+
+  it('returns empty interest for an empty appservice list', () => {
+    expect(
+      getInterestedAppServices([], {
+        room_id: '!r:example.com',
+        sender: '@a:example.com',
+        type: 'm.room.message',
+      })
+    ).toEqual([]);
+  });
+});

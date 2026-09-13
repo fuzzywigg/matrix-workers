@@ -95,4 +95,33 @@ describe('validateStateEvent', () => {
   it('includes the index in error messages', () => {
     expect(validateStateEvent(null, 7).error).toMatch(/initial_state\[7\]/);
   });
+
+  it('rejects encryption with non-string algorithm values', () => {
+    expect(
+      validateStateEvent(
+        { type: 'm.room.encryption', content: { algorithm: null } },
+        0
+      ).error
+    ).toMatch(/algorithm/);
+    expect(
+      validateStateEvent(
+        { type: 'm.room.encryption', content: { algorithm: 1 } },
+        0
+      ).error
+    ).toMatch(/algorithm/);
+  });
+
+  it('rejects non-object event values such as arrays and strings', () => {
+    expect(validateStateEvent([], 0).valid).toBe(false);
+    expect(validateStateEvent('m.room.name', 1).valid).toBe(false);
+  });
+
+  it('accepts unknown custom state types with object content', () => {
+    expect(
+      validateStateEvent(
+        { type: 'org.example.custom', state_key: 'k', content: { ok: true } },
+        0
+      ).valid
+    ).toBe(true);
+  });
 });

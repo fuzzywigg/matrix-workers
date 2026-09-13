@@ -183,3 +183,97 @@ describe('MIME helpers edge cases', () => {
     expect(clampThumbnailDimension('1920')).toBe(1920);
   });
 });
+
+describe('sanitizeFilename / disposition failure edges', () => {
+  it('neutralizes path separators and null bytes', () => {
+    expect(sanitizeFilename('a\\b/c')).toBe('a_b_c');
+    expect(sanitizeFilename('evil\0name.png')).toBe('evil_name.png');
+    expect(sanitizeFilename('..')).toBe('..');
+  });
+
+  it('builds disposition from injection-prone names', () => {
+    expect(safeContentDisposition('../x\r\nSet-Cookie: a=b.png')).toBe(
+      'inline; filename=".._x__Set-Cookie__a_b.png"'
+    );
+  });
+});
+
+describe('decodeHtmlEntities failure edges', () => {
+  it('leaves unknown entities and bare ampersands alone', () => {
+    expect(decodeHtmlEntities('&unknown;')).toBe('&unknown;');
+    expect(decodeHtmlEntities('a & b')).toBe('a & b');
+  });
+
+  it('decodes greater-than and nested amp-gt once', () => {
+    expect(decodeHtmlEntities('&gt;')).toBe('>');
+    expect(decodeHtmlEntities('&amp;gt;')).toBe('&gt;');
+  });
+});
+
+describe('extractOpenGraphPreview failure / alternate attribute order', () => {
+  it('reads single-quoted meta attributes', () => {
+    const html = `<meta property='og:title' content='Quoted' />`;
+    expect(extractOpenGraphPreview(html)['og:title']).toBe('Quoted');
+  });
+
+  it('extracts content-before-property for description, image, site_name, and type', () => {
+    const html = `
+      <meta content="D" property="og:description" />
+      <meta content="/rel.png" property="og:image" />
+      <meta content="SiteX" property="og:site_name" />
+      <meta content="article" property="og:type" />
+    `;
+    const base = { protocol: 'https:', host: 'ex.test' };
+    expect(extractOpenGraphPreview(html, base)).toEqual({
+      'og:description': 'D',
+      'og:image': 'https://ex.test/rel.png',
+      'og:site_name': 'SiteX',
+      'og:type': 'article',
+    });
+  });
+
+  it('does not absolutize when baseUrl is omitted', () => {
+    expect(
+      extractOpenGraphPreview(`<meta property="og:image" content="/rel.png" />`)['og:image']
+    ).toBe('/rel.png');
+  });
+
+  it('leaves http(s) images unchanged even when relative absolutization is enabled', () => {
+    const base = { protocol: 'https:', host: 'ex.test' };
+    expect(
+      extractOpenGraphPreview(
+        `<meta property="og:image" content="http://cdn.test/a.png" />`,
+        base
+      )['og:image']
+    ).toBe('http://cdn.test/a.png');
+  });
+});
+
+describe('MIME / thumbnail / security header edges', () => {
+  it('accepts audio and video whitelist entries with parameters', () => {
+    expect(isSupportedContentType('audio/ogg; codecs=vorbis')).toBe(true);
+    expect(isSupportedContentType('video/webm; codecs=vp9')).toBe(true);
+    expect(isSupportedContentType('application/json; charset=utf-8')).toBe(true);
+  });
+
+  it('rejects leading-semicolon MIME that parses to empty base type', () => {
+    expect(parseBaseContentType(';charset=utf-8')).toBe('');
+    expect(isSupportedContentType(';charset=utf-8')).toBe(false);
+  });
+
+  it('clamps hex-looking and whitespace dimension strings via parseInt', () => {
+    expect(clampThumbnailDimension('0x10')).toBe(96); // parseInt → 0 → fallback
+    expect(clampThumbnailDimension(' 128 ')).toBe(128);
+  });
+
+  it('overwrites existing security headers', () => {
+    const headers = new Headers({
+      'X-Content-Type-Options': 'old',
+      'Content-Security-Policy': 'old',
+      'X-Frame-Options': 'ALLOWALL',
+    });
+    addMediaSecurityHeaders(headers);
+    expect(headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(headers.get('X-Frame-Options')).toBe('DENY');
+  });
+});

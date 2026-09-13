@@ -108,3 +108,16 @@ describe('response helpers', () => {
     await expect(withErrorHandler(async () => 42)).resolves.toBe(42);
   });
 });
+
+describe('Errors federation / media-adjacent factories', () => {
+  it('maps unsupported room version and too-large media errors', () => {
+    expect(Errors.unsupportedRoomVersion('99').message).toContain('99');
+    expect(Errors.tooLarge('upload').status).toBe(413);
+    expect(Errors.tooLarge('upload').errcode).toBe(ErrorCodes.M_TOO_LARGE);
+  });
+
+  it('preserves custom messages on unauthorized/forbidden', () => {
+    expect(Errors.unauthorized('nope').message).toBe('nope');
+    expect(Errors.forbidden('denied').message).toBe('denied');
+  });
+});

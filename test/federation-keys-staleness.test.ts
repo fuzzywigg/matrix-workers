@@ -90,3 +90,23 @@ describe('isKeyTooStale future-dated keys', () => {
     expect(isKeyTooStale(now + 365 * 24 * 60 * 60 * 1000, now, 1)).toBe(false);
   });
 });
+
+describe('isKeyTooStale / resolveMaxStalenessMs boundary edges', () => {
+  it('is not stale when now equals valid_until', () => {
+    const now = 1_700_000_000_000;
+    expect(isKeyTooStale(now, now, 1_000)).toBe(false);
+  });
+
+  it('treats negative valid_until as truthy and evaluates staleness', () => {
+    const now = 1_000;
+    expect(isKeyTooStale(-1, now, 10)).toBe(true);
+  });
+
+  it('rejects scientific-notation env strings that parseInt truncates to 0-ish invalid', () => {
+    // parseInt('1e6', 10) === 1 → accepted as 1ms override
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '1e6' })).toBe(1);
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: 'NaN' })).toBe(
+      DEFAULT_KEY_MAX_STALENESS_MS
+    );
+  });
+});

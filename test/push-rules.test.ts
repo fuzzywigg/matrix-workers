@@ -193,3 +193,89 @@ describe('getNestedValue deeper paths', () => {
     expect(getNestedValue({ a: null }, 'a.b')).toBeUndefined();
   });
 });
+
+describe('matchesCondition failure edges', () => {
+  it('rejects event_match without key or when the path is missing', () => {
+    expect(
+      matchesCondition({ kind: 'event_match', pattern: 'x' }, message, userId, 2)
+    ).toBe(false);
+    expect(
+      matchesCondition(
+        { kind: 'event_match', key: 'content.nope', pattern: 'x' },
+        message,
+        userId,
+        2
+      )
+    ).toBe(false);
+  });
+
+  it('treats bare member-count numbers as ==', () => {
+    expect(matchesCondition({ kind: 'room_member_count', is: '2' }, message, userId, 2)).toBe(
+      true
+    );
+    expect(matchesCondition({ kind: 'room_member_count', is: '3' }, message, userId, 2)).toBe(
+      false
+    );
+  });
+
+  it('rejects contains_display_name without a name or body', () => {
+    expect(matchesCondition({ kind: 'contains_display_name' }, message, userId, 2)).toBe(false);
+    expect(
+      matchesCondition(
+        { kind: 'contains_display_name' },
+        { content: {} },
+        userId,
+        2,
+        'alice'
+      )
+    ).toBe(false);
+  });
+
+  it('rejects event_property_is without a key and mismatches values', () => {
+    expect(
+      matchesCondition({ kind: 'event_property_is', value: 'm.text' }, message, userId, 2)
+    ).toBe(false);
+    expect(
+      matchesCondition(
+        { kind: 'event_property_is', key: 'content.msgtype', value: 'm.image' },
+        message,
+        userId,
+        2
+      )
+    ).toBe(false);
+  });
+
+  it('defaults unknown condition kinds to true (lenient)', () => {
+    expect(
+      matchesCondition({ kind: 'not_a_real_kind' as 'event_match' }, message, userId, 2)
+    ).toBe(true);
+  });
+});
+
+describe('matchesRule content failure edges', () => {
+  it('rejects content rules when body is missing or empty', () => {
+    const rule: PushRule = {
+      rule_id: 'body-required',
+      default: false,
+      enabled: true,
+      pattern: 'alice',
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, { content: { body: '' } }, userId, 2)).toBe(false);
+    expect(matchesRule(rule, { content: null }, userId, 2)).toBe(false);
+  });
+
+  it('fails closed when any condition fails in an AND list', () => {
+    const rule: PushRule = {
+      rule_id: 'and',
+      default: false,
+      enabled: true,
+      conditions: [
+        { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        { kind: 'event_match', key: 'sender', pattern: '@nobody:example.com' },
+      ],
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, message, userId, 2)).toBe(false);
+  });
+});

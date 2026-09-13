@@ -150,3 +150,42 @@ describe('applyEventFilter sender whitelist empty', () => {
     ).toEqual(['@bob:example.com']);
   });
 });
+
+describe('applyEventFilter / room filter failure edges', () => {
+  it('caps results when limit exceeds the filtered set', () => {
+    expect(applyEventFilter(events, { limit: 100 })).toHaveLength(3);
+  });
+
+  it('applies not_rooms without a rooms whitelist', () => {
+    expect(shouldIncludeRoom('!a:example.com', { not_rooms: ['!b:example.com'] })).toBe(true);
+    expect(shouldIncludeRoom('!b:example.com', { not_rooms: ['!b:example.com'] })).toBe(false);
+  });
+
+  it('excludes rooms missing from a non-empty whitelist', () => {
+    expect(
+      shouldIncludeRoom('!c:example.com', {
+        rooms: ['!a:example.com', '!b:example.com'],
+        not_rooms: ['!z:example.com'],
+      })
+    ).toBe(false);
+  });
+});
+
+describe('sync token failure edges', () => {
+  it('rejects composite tokens with extra suffixes', () => {
+    expect(parseSyncToken('s1_td2_extra')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('S1_td2')).toEqual({ events: 0, toDevice: 0 });
+  });
+
+  it('parses very large legacy numeric tokens', () => {
+    expect(parseSyncToken('9007199254740991')).toEqual({
+      events: 9007199254740991,
+      toDevice: 9007199254740991,
+    });
+  });
+
+  it('builds asymmetric event/to-device positions', () => {
+    expect(buildSyncToken(1, 999)).toBe('s1_td999');
+    expect(parseSyncToken(buildSyncToken(7, 0))).toEqual({ events: 7, toDevice: 0 });
+  });
+});

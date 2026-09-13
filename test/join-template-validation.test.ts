@@ -140,4 +140,52 @@ describe('validateRemoteJoinTemplate', () => {
       validateRemoteJoinTemplate(validTemplate({ prev_events: ['not-an-id'] }), roomId, userId)
     ).toThrow(/prev_events/);
   });
+
+  it('rejects non-string room_version and non-object event templates', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        { room_version: 10 as unknown as string, event: validTemplate().event },
+        roomId,
+        userId
+      )
+    ).toThrow(/unsupported room_version/);
+    // Arrays are typeof 'object' in JS — fall through until content.membership fails
+    expect(() =>
+      validateRemoteJoinTemplate({ room_version: '10', event: [] }, roomId, userId)
+    ).toThrow(/membership/);
+    expect(() =>
+      validateRemoteJoinTemplate({ room_version: '10', event: 'nope' }, roomId, userId)
+    ).toThrow(/missing event/);
+  });
+
+  it('rejects auth_events containing non-strings or whitespace IDs', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ auth_events: [123] }), roomId, userId)
+    ).toThrow(/invalid event ID/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ auth_events: ['$ bad'] }), roomId, userId)
+    ).toThrow(/invalid event ID/);
+  });
+
+  it('rejects depth provided as a numeric string', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: '3' as unknown as number }), roomId, userId)
+    ).toThrow(/depth/);
+  });
+
+  it('allows omitting type and state_key when the remote leaves them unset', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ type: undefined, state_key: undefined }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+
+  it('rejects empty string room_version', () => {
+    expect(() =>
+      validateRemoteJoinTemplate({ ...validTemplate(), room_version: '' }, roomId, userId)
+    ).toThrow(/unsupported room_version/);
+  });
 });
