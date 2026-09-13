@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { generateLiveKitToken } from '../src/services/livekit';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createLiveKitRoom,
+  generateLiveKitToken,
+  getLiveKitConfig,
+  listLiveKitRooms,
+} from '../src/services/livekit';
+import type { Env } from '../src/types';
 
 function decodePart(part: string): Record<string, unknown> {
   const padded = part.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((part.length + 3) % 4);
@@ -7,6 +13,18 @@ function decodePart(part: string): Record<string, unknown> {
 }
 
 describe('generateLiveKitToken', () => {
+  const NOW_MS = 1_740_000_000_000;
+  const NOW_SEC = Math.floor(NOW_MS / 1000);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_MS);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('returns a three-part HS256 JWT with expected claims', async () => {
     const token = await generateLiveKitToken(
       'APIkey',
@@ -35,7 +53,8 @@ describe('generateLiveKitToken', () => {
     expect(claims.name).toBe('Alice');
     expect(claims.video.room).toBe('room-1');
     expect(claims.video.roomJoin).toBe(true);
-    expect(claims.exp - claims.nbf).toBe(120);
+    expect(claims.nbf).toBe(NOW_SEC);
+    expect(claims.exp).toBe(NOW_SEC + 120);
   });
 
   it('defaults participant name to identity', async () => {
@@ -86,5 +105,78 @@ describe('livekit TOKENMAXX edge paths after #50', () => {
     const token = await generateLiveKitToken('k', 's', 'room', 'id', 'Name', -10);
     const claims = decodePart(token.split('.')[1]) as { nbf: number; exp: number };
     expect(claims.exp).toBe(claims.nbf - 10);
+  });
+});
+
+describe('livekit room API + config after #59', () => {
+  it('getLiveKitConfig returns null unless all three fields are set', () => {
+    expect(getLiveKitConfig({} as Env)).toBeNull();
+    expect(
+      getLiveKitConfig({
+        LIVEKIT_API_KEY: 'k',
+        LIVEKIT_API_SECRET: 's',
+        LIVEKIT_URL: 'wss://lk',
+      } as Env)
+    ).toEqual({ apiKey: 'k', apiSecret: 's', wsUrl: 'wss://lk' });
+  });
+
+  it('createLiveKitRoom posts Twirp CreateRoom and returns JSON', async () => {
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toContain('/twirp/livekit.RoomService/CreateRoom');
+      expect(init?.method).toBe('POST');
+      expect(JSON.parse(String(init?.body))).toEqual({ name: 'room-a' });
+      return new Response(JSON.stringify({ room: { name: 'room-a', sid: 'RM_1' } }), {
+        status: 200,
+      });
+    });
+    const env = { LIVEKIT_API: { fetch: fetchFn } } as unknown as Env;
+    await expect(createLiveKitRoom(env, 'room-a')).resolves.toEqual({
+      room: { name: 'room-a', sid: 'RM_1' },
+    });
+  });
+
+  it('createLiveKitRoom returns null on non-OK and on throw', async () => {
+    const envFail = {
+      LIVEKIT_API: {
+        fetch: async () => new Response('nope', { status: 500 }),
+      },
+    } as unknown as Env;
+    expect(await createLiveKitRoom(envFail, 'r')).toBeNull();
+
+    const envThrow = {
+      LIVEKIT_API: {
+        fetch: async () => {
+          throw new Error('network');
+        },
+      },
+    } as unknown as Env;
+    expect(await createLiveKitRoom(envThrow, 'r')).toBeNull();
+  });
+
+  it('listLiveKitRooms posts Twirp ListRooms and returns JSON', async () => {
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toContain('/twirp/livekit.RoomService/ListRooms');
+      expect(JSON.parse(String(init?.body))).toEqual({});
+      return new Response(JSON.stringify({ rooms: [{ name: 'a' }] }), { status: 200 });
+    });
+    const env = { LIVEKIT_API: { fetch: fetchFn } } as unknown as Env;
+    await expect(listLiveKitRooms(env)).resolves.toEqual({ rooms: [{ name: 'a' }] });
+  });
+
+  it('listLiveKitRooms returns null on non-OK and on throw', async () => {
+    expect(
+      await listLiveKitRooms({
+        LIVEKIT_API: { fetch: async () => new Response('x', { status: 404 }) },
+      } as unknown as Env)
+    ).toBeNull();
+    expect(
+      await listLiveKitRooms({
+        LIVEKIT_API: {
+          fetch: async () => {
+            throw new Error('boom');
+          },
+        },
+      } as unknown as Env)
+    ).toBeNull();
   });
 });
