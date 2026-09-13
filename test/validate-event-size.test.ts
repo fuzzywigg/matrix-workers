@@ -114,3 +114,80 @@ describe('validateEventSize TOKENMAXX edge paths after #50', () => {
     expect(() => validateEventSize(event)).not.toThrow();
   });
 });
+
+
+describe('validateEventSize TOKENMAXX edge paths after #69', () => {
+  it('includes the measured byte count in soft-cap and hard-cap error messages', () => {
+    const soft = baseEvent({ body: 'x'.repeat(65_536) });
+    const softLen = JSON.stringify(soft.content).length;
+    try {
+      validateEventSize(soft);
+      expect.unreachable('soft cap');
+    } catch (err) {
+      const e = err as MatrixApiError;
+      expect(e.message).toBe(
+        `Event content exceeds 65536 byte limit (got ${softLen})`
+      );
+      expect(e.errcode).toBe('M_TOO_LARGE');
+      expect(e.status).toBe(413);
+    }
+
+    const hard = baseEvent({ body: 'ok' });
+    hard.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    const hardLen = JSON.stringify(hard).length;
+    expect(hardLen).toBeGreaterThan(921_600);
+    try {
+      validateEventSize(hard);
+      expect.unreachable('hard cap');
+    } catch (err) {
+      const e = err as MatrixApiError;
+      expect(e.message).toBe(
+        `Serialized event exceeds 921600 byte D1 row limit (got ${hardLen})`
+      );
+    }
+  });
+
+  it('treats undefined content like missing content (soft-cap uses {})', () => {
+    const event = baseEvent();
+    (event as { content?: unknown }).content = undefined;
+    expect(() => validateEventSize(event)).not.toThrow();
+  });
+
+  it('accepts unicode content under the soft cap and rejects when over', () => {
+    // Multi-byte UTF-8 still counts as JS string length in JSON.stringify
+    const ok = baseEvent({ body: '😀'.repeat(100) });
+    expect(() => validateEventSize(ok)).not.toThrow();
+    const big = baseEvent({ body: 'あ'.repeat(65_536) });
+    expect(() => validateEventSize(big)).toThrow(/content exceeds/);
+  });
+
+  it('rejects when soft cap passes but hard cap fails due to large prev_events', () => {
+    const event = baseEvent({ body: 'small' });
+    event.prev_events = Array.from({ length: 40_000 }, (_, i) => `$prev-${i}:example.com`);
+    expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(event).length).toBeGreaterThan(921_600);
+    expect(() => validateEventSize(event)).toThrow(/D1 row limit/);
+  });
+
+  it('accepts a PDU one byte under the hard cap', () => {
+    const event = baseEvent({ body: 'ok' });
+    const target = 921_599;
+    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    while (JSON.stringify(event).length > target) {
+      event.auth_events.pop();
+    }
+    while (JSON.stringify(event).length < target) {
+      const gap = target - JSON.stringify(event).length;
+      event.auth_events.push(`$p${'x'.repeat(Math.max(0, gap - 2))}`);
+      while (JSON.stringify(event).length < target) {
+        event.auth_events[event.auth_events.length - 1] += 'x';
+      }
+      while (JSON.stringify(event).length > target) {
+        const last = event.auth_events[event.auth_events.length - 1];
+        event.auth_events[event.auth_events.length - 1] = last.slice(0, -1);
+      }
+    }
+    expect(JSON.stringify(event).length).toBe(target);
+    expect(() => validateEventSize(event)).not.toThrow();
+  });
+});

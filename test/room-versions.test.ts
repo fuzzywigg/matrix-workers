@@ -162,3 +162,268 @@ describe('room-versions TOKENMAXX edge paths after #50', () => {
     expect(getRoomVersion('3')?.eventIdFormat).toBe('v3');
   });
 });
+
+
+describe('room-versions TOKENMAXX edge paths after #69', () => {
+  it('exposes the full capability matrix for versions 1–12', () => {
+    const expected: Record<
+      string,
+      {
+        stateResolution: string;
+        eventIdFormat: string;
+        redactionAlgorithm: string;
+        knockingSupported: boolean;
+        restrictedJoinsSupported: boolean;
+        integerPowerLevels: boolean;
+        updatedRedactionRules: boolean;
+        authRuleVariant: string;
+        knockRestrictedSupported: boolean;
+      }
+    > = {
+      '1': {
+        stateResolution: 'v1',
+        eventIdFormat: 'v1',
+        redactionAlgorithm: 'v1',
+        knockingSupported: false,
+        restrictedJoinsSupported: false,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v1',
+        knockRestrictedSupported: false,
+      },
+      '2': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v1',
+        redactionAlgorithm: 'v1',
+        knockingSupported: false,
+        restrictedJoinsSupported: false,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v1',
+        knockRestrictedSupported: false,
+      },
+      '3': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v3',
+        redactionAlgorithm: 'v1',
+        knockingSupported: false,
+        restrictedJoinsSupported: false,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v1',
+        knockRestrictedSupported: false,
+      },
+      '4': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v1',
+        knockingSupported: false,
+        restrictedJoinsSupported: false,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v1',
+        knockRestrictedSupported: false,
+      },
+      '5': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v1',
+        knockingSupported: false,
+        restrictedJoinsSupported: false,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v1',
+        knockRestrictedSupported: false,
+      },
+      '6': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v1',
+        knockingSupported: false,
+        restrictedJoinsSupported: false,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v1',
+        knockRestrictedSupported: false,
+      },
+      '7': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v1',
+        knockingSupported: true,
+        restrictedJoinsSupported: false,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v1',
+        knockRestrictedSupported: false,
+      },
+      '8': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v1',
+        knockingSupported: true,
+        restrictedJoinsSupported: true,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v8',
+        knockRestrictedSupported: false,
+      },
+      '9': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v1',
+        knockingSupported: true,
+        restrictedJoinsSupported: true,
+        integerPowerLevels: false,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v8',
+        knockRestrictedSupported: false,
+      },
+      '10': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v1',
+        knockingSupported: true,
+        restrictedJoinsSupported: true,
+        integerPowerLevels: true,
+        updatedRedactionRules: false,
+        authRuleVariant: 'v10',
+        knockRestrictedSupported: true,
+      },
+      '11': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v11',
+        knockingSupported: true,
+        restrictedJoinsSupported: true,
+        integerPowerLevels: true,
+        updatedRedactionRules: true,
+        authRuleVariant: 'v10',
+        knockRestrictedSupported: true,
+      },
+      '12': {
+        stateResolution: 'v2',
+        eventIdFormat: 'v4',
+        redactionAlgorithm: 'v11',
+        knockingSupported: true,
+        restrictedJoinsSupported: true,
+        integerPowerLevels: true,
+        updatedRedactionRules: true,
+        authRuleVariant: 'v10',
+        knockRestrictedSupported: true,
+      },
+    };
+
+    for (const [version, caps] of Object.entries(expected)) {
+      const behavior = getRoomVersion(version)!;
+      expect(behavior.version).toBe(version);
+      expect(behavior.stable).toBe(true);
+      for (const [k, v] of Object.entries(caps)) {
+        expect(behavior[k as keyof typeof behavior]).toBe(v);
+      }
+    }
+  });
+
+  it('returns exact v10 vs v11 power_levels / member / create redaction content keys', () => {
+    const v10 = getRoomVersion('10')!;
+    const v11 = getRoomVersion('11')!;
+    const envelope = [
+      'event_id',
+      'type',
+      'room_id',
+      'sender',
+      'state_key',
+      'hashes',
+      'signatures',
+      'depth',
+      'prev_events',
+      'auth_events',
+      'origin_server_ts',
+    ];
+
+    expect(getRedactionAllowedKeys('m.room.power_levels', v10)).toEqual([
+      ...envelope,
+      'ban',
+      'events',
+      'events_default',
+      'invite',
+      'kick',
+      'redact',
+      'state_default',
+      'users',
+      'users_default',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.power_levels', v11)).toEqual([
+      ...envelope,
+      'ban',
+      'events',
+      'events_default',
+      'invite',
+      'kick',
+      'redact',
+      'state_default',
+      'users',
+      'users_default',
+      'notifications',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.member', v10)).toEqual([
+      ...envelope,
+      'membership',
+      'join_authorised_via_users_server',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.member', v11)).toEqual([
+      ...envelope,
+      'membership',
+      'join_authorised_via_users_server',
+      'third_party_invite',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.create', v10)).toEqual([...envelope, 'creator']);
+    expect(getRedactionAllowedKeys('m.room.create', v11)).toEqual([
+      ...envelope,
+      'creator',
+      'room_version',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.redaction', v10)).toEqual(envelope);
+    expect(getRedactionAllowedKeys('m.room.redaction', v11)).toEqual([...envelope, 'redacts']);
+    expect(getRedactionAllowedKeys('m.room.join_rules', v10)).toEqual([
+      ...envelope,
+      'join_rule',
+      'allow',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.history_visibility', v10)).toEqual([
+      ...envelope,
+      'history_visibility',
+    ]);
+  });
+
+  it('returns envelope-only keys for encrypted and custom event types on v10 and v12', () => {
+    const v10 = getRoomVersion('10')!;
+    const v12 = getRoomVersion('12')!;
+    for (const type of ['m.room.encrypted', 'm.reaction', 'org.example.custom']) {
+      for (const behavior of [v10, v12]) {
+        const keys = getRedactionAllowedKeys(type, behavior);
+        expect(keys).toContain('event_id');
+        expect(keys).toContain('origin_server_ts');
+        expect(keys).not.toContain('ciphertext');
+        expect(keys).not.toContain('body');
+        expect(keys).not.toContain('redacts');
+      }
+    }
+  });
+
+  it('keeps getSupportedRoomVersions keys aligned with isRoomVersionSupported', () => {
+    const supported = getSupportedRoomVersions();
+    for (const v of Object.keys(supported)) {
+      expect(isRoomVersionSupported(v)).toBe(true);
+      expect(getRoomVersion(v)?.stable).toBe(true);
+    }
+    expect(Object.keys(supported)).toHaveLength(12);
+  });
+
+  it('rejects leading-zero and whitespace version strings as unsupported', () => {
+    expect(isRoomVersionSupported('010')).toBe(false);
+    expect(isRoomVersionSupported(' 10')).toBe(false);
+    expect(isRoomVersionSupported('10 ')).toBe(false);
+    expect(getRoomVersion('10.0')).toBeNull();
+  });
+});

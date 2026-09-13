@@ -162,3 +162,79 @@ describe('validateStateEvent TOKENMAXX edge paths after #50', () => {
     ).toBe(true);
   });
 });
+
+
+describe('validateStateEvent TOKENMAXX edge paths after #69', () => {
+  it('rejects disallowed auto-created types with exact indexed error strings', () => {
+    expect(validateStateEvent({ type: 'm.room.create', content: {} }, 2)).toEqual({
+      valid: false,
+      error: "initial_state[2]: 'm.room.create' cannot be set via initial_state",
+    });
+    expect(validateStateEvent({ type: 'm.room.member', content: { membership: 'join' } }, 0)).toEqual({
+      valid: false,
+      error: "initial_state[0]: 'm.room.member' cannot be set via initial_state",
+    });
+    expect(validateStateEvent({ type: 'm.room.power_levels', content: {} }, 9)).toEqual({
+      valid: false,
+      error: "initial_state[9]: 'm.room.power_levels' cannot be set via initial_state",
+    });
+  });
+
+  it('rejects encryption missing algorithm with exact message', () => {
+    expect(validateStateEvent({ type: 'm.room.encryption', content: {} }, 4)).toEqual({
+      valid: false,
+      error: "initial_state[4]: m.room.encryption requires 'algorithm'",
+    });
+  });
+
+  it('rejects unsupported encryption algorithms with the algorithm quoted', () => {
+    expect(
+      validateStateEvent(
+        { type: 'm.room.encryption', content: { algorithm: 'm.olm.v1.curve25519-aes-sha2' } },
+        1
+      )
+    ).toEqual({
+      valid: false,
+      error: "initial_state[1]: unsupported algorithm 'm.olm.v1.curve25519-aes-sha2'",
+    });
+  });
+
+  it('rejects number / boolean / function event roots', () => {
+    expect(validateStateEvent(0, 0).error).toMatch(/must be an object/);
+    expect(validateStateEvent(false, 1).error).toMatch(/must be an object/);
+    expect(validateStateEvent(() => ({}), 2).error).toMatch(/must be an object/);
+  });
+
+  it('rejects non-string type values including numbers and objects', () => {
+    expect(validateStateEvent({ type: 1, content: {} }, 0).error).toMatch(/type/);
+    expect(validateStateEvent({ type: { t: 'm.room.name' }, content: {} }, 0).error).toMatch(
+      /type/
+    );
+  });
+
+  it('accepts empty-string state_key for encryption and custom types', () => {
+    expect(
+      validateStateEvent(
+        {
+          type: 'm.room.encryption',
+          state_key: '',
+          content: { algorithm: 'm.megolm.v1.aes-sha2' },
+        },
+        0
+      ).valid
+    ).toBe(true);
+    expect(
+      validateStateEvent(
+        { type: 'com.example.widget', state_key: '', content: { url: 'https://x' } },
+        0
+      ).valid
+    ).toBe(true);
+  });
+
+  it('rejects content provided as a string or number', () => {
+    expect(
+      validateStateEvent({ type: 'm.room.name', content: 'General' }, 0).error
+    ).toMatch(/content/);
+    expect(validateStateEvent({ type: 'm.room.name', content: 3 }, 0).error).toMatch(/content/);
+  });
+});
