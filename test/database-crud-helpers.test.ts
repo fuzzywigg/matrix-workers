@@ -1,0 +1,2365 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  createUser,
+  getUserById,
+  getUserByLocalpart,
+  getPasswordHash,
+  updateUserProfile,
+  createDevice,
+  getDevice,
+  getUserDevices,
+  deleteDevice,
+  createAccessToken,
+  getUserByTokenHash,
+  deleteAccessToken,
+  deleteAllUserTokens,
+  createRoom,
+  getRoom,
+  storeEvent,
+  storeEventIdempotent,
+  getEvent,
+  getRoomEvents,
+  getRoomState,
+  getStateEvent,
+  updateMembership,
+  tryInsertJoinMembership,
+  getMembership,
+  getUserRooms,
+  getRoomMembers,
+  createRoomAlias,
+  getRoomByAlias,
+  deleteRoomAlias,
+  getLatestStreamPosition,
+  getEventsSince,
+  getEventsByIds,
+  validateEventSize,
+} from '../src/services/database';
+import { MatrixApiError } from '../src/utils/errors';
+import type { PDU } from '../src/types';
+
+const NOW = 1_700_000_000_000;
+const USER = '@alice:example.com';
+const BOB = '@bob:example.com';
+const ROOM = '!r:example.com';
+
+type UserRow = {
+  user_id: string;
+  localpart: string;
+  password_hash: string | null;
+  display_name: string | null;
+  avatar_url: string | null;
+  is_guest: number;
+  is_deactivated: number;
+  admin: number;
+  created_at: number;
+  updated_at: number;
+};
+
+type DeviceRow = {
+  user_id: string;
+  device_id: string;
+  display_name: string | null;
+  last_seen_ts: number | null;
+  last_seen_ip: string | null;
+  created_at: number;
+};
+
+type TokenRow = {
+  token_id: string;
+  token_hash: string;
+  user_id: string;
+  device_id: string | null;
+  created_at: number;
+};
+
+type RoomRow = {
+  room_id: string;
+  room_version: string;
+  creator_id: string | null;
+  is_public: number;
+  created_at: number;
+};
+
+type EventRow = {
+  event_id: string;
+  room_id: string;
+  sender: string;
+  event_type: string;
+  state_key: string | null;
+  content: string;
+  origin_server_ts: number;
+  unsigned: string | null;
+  depth: number;
+  auth_events: string;
+  prev_events: string;
+  hashes: string | null;
+  signatures: string | null;
+  stream_ordering: number;
+};
+
+type MembershipRow = {
+  room_id: string;
+  user_id: string;
+  membership: string;
+  event_id: string;
+  display_name: string | null;
+  avatar_url: string | null;
+};
+
+type AliasRow = {
+  alias: string;
+  room_id: string;
+  creator_id: string;
+  created_at: number;
+};
+
+type StateKey = `${string}\0${string}\0${string}`;
+
+function pdu(partial: Partial<PDU> & Pick<PDU, 'event_id' | 'type'>): PDU {
+  return {
+    room_id: ROOM,
+    sender: USER,
+    content: {},
+    origin_server_ts: NOW,
+    auth_events: [],
+    prev_events: [],
+    depth: 1,
+    hashes: { sha256: 'h' },
+    signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+    ...partial,
+  };
+}
+
+function eventRowFromPdu(event: PDU, streamOrdering: number): EventRow {
+  return {
+    event_id: event.event_id,
+    room_id: event.room_id,
+    sender: event.sender,
+    event_type: event.type,
+    state_key: event.state_key ?? null,
+    content: JSON.stringify(event.content),
+    origin_server_ts: event.origin_server_ts,
+    unsigned: event.unsigned ? JSON.stringify(event.unsigned) : null,
+    depth: event.depth,
+    auth_events: JSON.stringify(event.auth_events),
+    prev_events: JSON.stringify(event.prev_events),
+    hashes: event.hashes ? JSON.stringify(event.hashes) : null,
+    signatures: event.signatures ? JSON.stringify(event.signatures) : null,
+    stream_ordering: streamOrdering,
+  };
+}
+
+/** In-memory D1 stand-in covering database.ts CRUD SQL shapes. */
+function createCrudDb(seed: {
+  users?: UserRow[];
+  devices?: DeviceRow[];
+  tokens?: TokenRow[];
+  rooms?: RoomRow[];
+  events?: EventRow[];
+  memberships?: MembershipRow[];
+  aliases?: AliasRow[];
+  roomState?: Array<{ room_id: string; event_type: string; state_key: string; event_id: string }>;
+  streamPosition?: number;
+} = {}) {
+  const users = [...(seed.users ?? [])];
+  const devices = [...(seed.devices ?? [])];
+  const tokens = [...(seed.tokens ?? [])];
+  const rooms = [...(seed.rooms ?? [])];
+  const events = [...(seed.events ?? [])];
+  const memberships = [...(seed.memberships ?? [])];
+  const aliases = [...(seed.aliases ?? [])];
+  const roomState = new Map<StateKey, string>();
+  for (const s of seed.roomState ?? []) {
+    roomState.set(`${s.room_id}\0${s.event_type}\0${s.state_key}`, s.event_id);
+  }
+  let streamPosition = seed.streamPosition ?? 0;
+
+  const prepares: string[] = [];
+  const binds: unknown[][] = [];
+  const runs: Array<{ sql: string; args: unknown[] }> = [];
+
+  function stmt(sql: string, args: unknown[] = []) {
+    return {
+      bind(...bindArgs: unknown[]) {
+        binds.push(bindArgs);
+        return stmt(sql, bindArgs);
+      },
+      async first<T>() {
+        // stream_positions UPDATE...RETURNING
+        if (sql.includes('UPDATE stream_positions') && sql.includes('RETURNING position')) {
+          streamPosition += 1;
+          return { position: streamPosition } as T;
+        }
+
+        if (sql.includes('FROM users WHERE user_id = ?') && sql.includes('password_hash')) {
+          const user = users.find((u) => u.user_id === args[0]);
+          return (user ? { password_hash: user.password_hash } : null) as T;
+        }
+
+        if (sql.includes('FROM users WHERE user_id = ?')) {
+          const user = users.find((u) => u.user_id === args[0]);
+          return (user ?? null) as T;
+        }
+
+        if (sql.includes('FROM users WHERE localpart = ?')) {
+          const user = users.find((u) => u.localpart === args[0]);
+          return (user ?? null) as T;
+        }
+
+        if (sql.includes('FROM devices WHERE user_id = ? AND device_id = ?')) {
+          const device = devices.find(
+            (d) => d.user_id === args[0] && d.device_id === args[1]
+          );
+          return (device ?? null) as T;
+        }
+
+        if (sql.includes('FROM access_tokens WHERE token_hash = ?')) {
+          const token = tokens.find((t) => t.token_hash === args[0]);
+          return (token
+            ? { user_id: token.user_id, device_id: token.device_id }
+            : null) as T;
+        }
+
+        if (sql.includes('FROM rooms WHERE room_id = ?')) {
+          const room = rooms.find((r) => r.room_id === args[0]);
+          return (room ?? null) as T;
+        }
+
+        if (
+          sql.includes('FROM events WHERE event_id = ?') &&
+          !sql.includes('JOIN') &&
+          !sql.includes('IN (')
+        ) {
+          const event = events.find((e) => e.event_id === args[0]);
+          return (event ?? null) as T;
+        }
+
+        if (
+          sql.includes('FROM room_state rs') &&
+          sql.includes('JOIN events e') &&
+          sql.includes('rs.event_type = ?')
+        ) {
+          const [roomId, eventType, stateKey] = args as [string, string, string];
+          const key = `${roomId}\0${eventType}\0${stateKey}` as StateKey;
+          const eventId = roomState.get(key);
+          if (!eventId) return null as T;
+          const event = events.find((e) => e.event_id === eventId);
+          return (event ?? null) as T;
+        }
+
+        if (sql.includes('FROM room_memberships WHERE room_id = ? AND user_id = ?')) {
+          const m = memberships.find(
+            (row) => row.room_id === args[0] && row.user_id === args[1]
+          );
+          return (m
+            ? { membership: m.membership, event_id: m.event_id }
+            : null) as T;
+        }
+
+        if (sql.includes('FROM room_aliases WHERE alias = ?')) {
+          const alias = aliases.find((a) => a.alias === args[0]);
+          return (alias ? { room_id: alias.room_id } : null) as T;
+        }
+
+        if (sql.includes('MAX(stream_ordering)')) {
+          const max = events.reduce(
+            (acc, e) => Math.max(acc, e.stream_ordering),
+            -Infinity
+          );
+          return {
+            max_ordering: events.length === 0 ? null : max === -Infinity ? null : max,
+          } as T;
+        }
+
+        if (sql.includes('INSERT INTO room_memberships') && sql.includes('RETURNING event_id')) {
+          const [roomId, userId, eventId, displayName, avatarUrl] = args as [
+            string,
+            string,
+            string,
+            string | null,
+            string | null,
+          ];
+          const existing = memberships.find(
+            (m) => m.room_id === roomId && m.user_id === userId
+          );
+          if (existing?.membership === 'join') {
+            return { event_id: existing.event_id } as T;
+          }
+          if (existing) {
+            existing.membership = 'join';
+            existing.event_id = eventId;
+            existing.display_name = displayName;
+            existing.avatar_url = avatarUrl;
+            return { event_id: eventId } as T;
+          }
+          memberships.push({
+            room_id: roomId,
+            user_id: userId,
+            membership: 'join',
+            event_id: eventId,
+            display_name: displayName,
+            avatar_url: avatarUrl,
+          });
+          return { event_id: eventId } as T;
+        }
+
+        return null as T;
+      },
+      async all<T>() {
+        if (sql.includes('FROM devices WHERE user_id = ?')) {
+          return {
+            results: devices.filter((d) => d.user_id === args[0]) as T[],
+          };
+        }
+
+        if (sql.includes('FROM room_memberships WHERE user_id = ?')) {
+          let rows = memberships.filter((m) => m.user_id === args[0]);
+          if (sql.includes('AND membership = ?')) {
+            rows = rows.filter((m) => m.membership === args[1]);
+          }
+          return { results: rows.map((m) => ({ room_id: m.room_id })) as T[] };
+        }
+
+        if (
+          sql.includes('FROM room_memberships WHERE room_id = ?') &&
+          sql.includes('user_id, membership')
+        ) {
+          let rows = memberships.filter((m) => m.room_id === args[0]);
+          if (sql.includes('AND membership = ?')) {
+            rows = rows.filter((m) => m.membership === args[1]);
+          }
+          return {
+            results: rows.map((m) => ({
+              user_id: m.user_id,
+              membership: m.membership,
+              display_name: m.display_name,
+              avatar_url: m.avatar_url,
+            })) as T[],
+          };
+        }
+
+        if (sql.includes('FROM room_state rs') && sql.includes('JOIN events e')) {
+          const roomId = args[0] as string;
+          const results: EventRow[] = [];
+          for (const [key, eventId] of roomState) {
+            const [rid] = key.split('\0');
+            if (rid !== roomId) continue;
+            const event = events.find((e) => e.event_id === eventId);
+            if (event) results.push(event);
+          }
+          return { results: results as T[] };
+        }
+
+        if (sql.includes('FROM events') && sql.includes('IN (')) {
+          const ids = args as string[];
+          return {
+            results: events.filter((e) => ids.includes(e.event_id)) as T[],
+          };
+        }
+
+        // getRoomEvents (single-line) and getEventsSince (multi-line) both filter by room_id
+        if (sql.includes('FROM events') && sql.includes('room_id = ?')) {
+          const roomId = args[0] as string;
+          let rows = events.filter((e) => e.room_id === roomId);
+
+          if (sql.includes('stream_ordering < ?')) {
+            const fromToken = args[1] as number;
+            const limit = args[2] as number;
+            rows = rows
+              .filter((e) => e.stream_ordering < fromToken)
+              .sort((a, b) => b.stream_ordering - a.stream_ordering)
+              .slice(0, limit);
+          } else if (
+            sql.includes('stream_ordering > ?') &&
+            sql.includes('ORDER BY stream_ordering ASC')
+          ) {
+            const sinceOrFrom = args[1] as number;
+            const limit = args[2] as number;
+            rows = rows
+              .filter((e) => e.stream_ordering > sinceOrFrom)
+              .sort((a, b) => a.stream_ordering - b.stream_ordering)
+              .slice(0, limit);
+          } else if (sql.includes('ORDER BY stream_ordering DESC')) {
+            const limit = args[1] as number;
+            rows = rows
+              .sort((a, b) => b.stream_ordering - a.stream_ordering)
+              .slice(0, limit);
+          } else if (sql.includes('ORDER BY stream_ordering ASC')) {
+            const limit = args[1] as number;
+            rows = rows
+              .sort((a, b) => a.stream_ordering - b.stream_ordering)
+              .slice(0, limit);
+          }
+
+          return { results: rows as T[] };
+        }
+
+        return { results: [] };
+      },
+      async run() {
+        runs.push({ sql, args });
+
+        if (sql.includes('INSERT INTO users')) {
+          const [userId, localpart, passwordHash, isGuest, createdAt, updatedAt] =
+            args as [string, string, string | null, number, number, number];
+          users.push({
+            user_id: userId,
+            localpart,
+            password_hash: passwordHash,
+            display_name: null,
+            avatar_url: null,
+            is_guest: isGuest,
+            is_deactivated: 0,
+            admin: 0,
+            created_at: createdAt,
+            updated_at: updatedAt,
+          });
+          return { meta: { changes: 1 } };
+        }
+
+        if (sql.includes('UPDATE users SET display_name')) {
+          const [displayName, updatedAt, userId] = args as [string, number, string];
+          const user = users.find((u) => u.user_id === userId);
+          if (user) {
+            user.display_name = displayName;
+            user.updated_at = updatedAt;
+          }
+          return { meta: { changes: user ? 1 : 0 } };
+        }
+
+        if (sql.includes('UPDATE users SET avatar_url')) {
+          const [avatarUrl, updatedAt, userId] = args as [string, number, string];
+          const user = users.find((u) => u.user_id === userId);
+          if (user) {
+            user.avatar_url = avatarUrl;
+            user.updated_at = updatedAt;
+          }
+          return { meta: { changes: user ? 1 : 0 } };
+        }
+
+        if (sql.includes('INSERT INTO devices')) {
+          const [userId, deviceId, displayName, createdAt] = args as [
+            string,
+            string,
+            string | null,
+            number,
+          ];
+          devices.push({
+            user_id: userId,
+            device_id: deviceId,
+            display_name: displayName,
+            last_seen_ts: null,
+            last_seen_ip: null,
+            created_at: createdAt,
+          });
+          return { meta: { changes: 1 } };
+        }
+
+        if (sql.includes('DELETE FROM devices')) {
+          const [userId, deviceId] = args as [string, string];
+          const before = devices.length;
+          for (let i = devices.length - 1; i >= 0; i--) {
+            if (devices[i].user_id === userId && devices[i].device_id === deviceId) {
+              devices.splice(i, 1);
+            }
+          }
+          return { meta: { changes: before - devices.length } };
+        }
+
+        if (sql.includes('INSERT INTO access_tokens')) {
+          const [tokenId, tokenHash, userId, deviceId, createdAt] = args as [
+            string,
+            string,
+            string,
+            string | null,
+            number,
+          ];
+          tokens.push({
+            token_id: tokenId,
+            token_hash: tokenHash,
+            user_id: userId,
+            device_id: deviceId,
+            created_at: createdAt,
+          });
+          return { meta: { changes: 1 } };
+        }
+
+        if (sql.includes('DELETE FROM access_tokens WHERE token_hash')) {
+          const before = tokens.length;
+          for (let i = tokens.length - 1; i >= 0; i--) {
+            if (tokens[i].token_hash === args[0]) tokens.splice(i, 1);
+          }
+          return { meta: { changes: before - tokens.length } };
+        }
+
+        if (sql.includes('DELETE FROM access_tokens WHERE user_id')) {
+          const before = tokens.length;
+          for (let i = tokens.length - 1; i >= 0; i--) {
+            if (tokens[i].user_id === args[0]) tokens.splice(i, 1);
+          }
+          return { meta: { changes: before - tokens.length } };
+        }
+
+        if (sql.includes('INSERT INTO rooms')) {
+          const [roomId, roomVersion, creatorId, isPublic, createdAt] = args as [
+            string,
+            string,
+            string,
+            number,
+            number,
+          ];
+          rooms.push({
+            room_id: roomId,
+            room_version: roomVersion,
+            creator_id: creatorId,
+            is_public: isPublic,
+            created_at: createdAt,
+          });
+          return { meta: { changes: 1 } };
+        }
+
+        if (sql.includes('INSERT OR IGNORE INTO events') || sql.includes('INSERT INTO events')) {
+          const [
+            eventId,
+            roomId,
+            sender,
+            eventType,
+            stateKey,
+            content,
+            originServerTs,
+            unsigned,
+            depth,
+            authEvents,
+            prevEvents,
+            hashes,
+            signatures,
+            streamOrdering,
+          ] = args as [
+            string,
+            string,
+            string,
+            string,
+            string | null,
+            string,
+            number,
+            string | null,
+            number,
+            string,
+            string,
+            string | null,
+            string | null,
+            number,
+          ];
+          const exists = events.some((e) => e.event_id === eventId);
+          if (exists && sql.includes('OR IGNORE')) {
+            return { meta: { changes: 0 } };
+          }
+          if (exists) {
+            return { meta: { changes: 0 } };
+          }
+          events.push({
+            event_id: eventId,
+            room_id: roomId,
+            sender,
+            event_type: eventType,
+            state_key: stateKey,
+            content,
+            origin_server_ts: originServerTs,
+            unsigned,
+            depth,
+            auth_events: authEvents,
+            prev_events: prevEvents,
+            hashes,
+            signatures,
+            stream_ordering: streamOrdering,
+          });
+          return { meta: { changes: 1 } };
+        }
+
+        if (sql.includes('INSERT OR REPLACE INTO room_state')) {
+          const [roomId, eventType, stateKey, eventId] = args as [
+            string,
+            string,
+            string,
+            string,
+          ];
+          roomState.set(`${roomId}\0${eventType}\0${stateKey}`, eventId);
+          return { meta: { changes: 1 } };
+        }
+
+        if (sql.includes('INSERT OR REPLACE INTO room_memberships')) {
+          const [roomId, userId, membership, eventId, displayName, avatarUrl] =
+            args as [string, string, string, string, string | null, string | null];
+          const existing = memberships.find(
+            (m) => m.room_id === roomId && m.user_id === userId
+          );
+          if (existing) {
+            existing.membership = membership;
+            existing.event_id = eventId;
+            existing.display_name = displayName;
+            existing.avatar_url = avatarUrl;
+          } else {
+            memberships.push({
+              room_id: roomId,
+              user_id: userId,
+              membership,
+              event_id: eventId,
+              display_name: displayName,
+              avatar_url: avatarUrl,
+            });
+          }
+          return { meta: { changes: 1 } };
+        }
+
+        if (sql.includes('INSERT INTO room_aliases')) {
+          const [alias, roomId, creatorId, createdAt] = args as [
+            string,
+            string,
+            string,
+            number,
+          ];
+          aliases.push({ alias, room_id: roomId, creator_id: creatorId, created_at: createdAt });
+          return { meta: { changes: 1 } };
+        }
+
+        if (sql.includes('DELETE FROM room_aliases')) {
+          const before = aliases.length;
+          for (let i = aliases.length - 1; i >= 0; i--) {
+            if (aliases[i].alias === args[0]) aliases.splice(i, 1);
+          }
+          return { meta: { changes: before - aliases.length } };
+        }
+
+        return { meta: { changes: 0 } };
+      },
+    };
+  }
+
+  return {
+    prepare(sql: string) {
+      prepares.push(sql);
+      return stmt(sql);
+    },
+    _state: {
+      users,
+      devices,
+      tokens,
+      rooms,
+      events,
+      memberships,
+      aliases,
+      roomState,
+      get streamPosition() {
+        return streamPosition;
+      },
+      prepares,
+      binds,
+      runs,
+    },
+  } as unknown as D1Database & {
+    _state: {
+      users: UserRow[];
+      devices: DeviceRow[];
+      tokens: TokenRow[];
+      rooms: RoomRow[];
+      events: EventRow[];
+      memberships: MembershipRow[];
+      aliases: AliasRow[];
+      roomState: Map<StateKey, string>;
+      streamPosition: number;
+      prepares: string[];
+      binds: unknown[][];
+      runs: Array<{ sql: string; args: unknown[] }>;
+    };
+  };
+}
+
+describe('database user helpers', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('createUser inserts guest=0 / non-guest and nullable password', async () => {
+    const db = createCrudDb();
+    await createUser(db, USER, 'alice', 'hash', false);
+    await createUser(db, '@g:example.com', 'g', null, true);
+
+    expect(db._state.users).toHaveLength(2);
+    expect(db._state.users[0]).toMatchObject({
+      user_id: USER,
+      localpart: 'alice',
+      password_hash: 'hash',
+      is_guest: 0,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    expect(db._state.users[1]).toMatchObject({
+      password_hash: null,
+      is_guest: 1,
+    });
+  });
+
+  it('getUserById maps boolean flags and omits null profile fields', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: null,
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 1,
+          admin: 1,
+          created_at: 11,
+          updated_at: 11,
+        },
+      ],
+    });
+    await expect(getUserById(db, USER)).resolves.toEqual({
+      user_id: USER,
+      localpart: 'alice',
+      display_name: undefined,
+      avatar_url: undefined,
+      is_guest: false,
+      is_deactivated: true,
+      admin: true,
+      created_at: 11,
+    });
+    await expect(getUserById(db, '@missing:example.com')).resolves.toBeNull();
+  });
+
+  it('getUserById preserves non-null display_name / avatar_url', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: null,
+          display_name: 'Alice',
+          avatar_url: 'mxc://a/b',
+          is_guest: 1,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+    await expect(getUserById(db, USER)).resolves.toMatchObject({
+      display_name: 'Alice',
+      avatar_url: 'mxc://a/b',
+      is_guest: true,
+      is_deactivated: false,
+      admin: false,
+    });
+  });
+
+  it('getUserByLocalpart returns null / mapped user', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: null,
+          display_name: 'A',
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: 5,
+          updated_at: 5,
+        },
+      ],
+    });
+    await expect(getUserByLocalpart(db, 'alice')).resolves.toMatchObject({
+      user_id: USER,
+      localpart: 'alice',
+      display_name: 'A',
+    });
+    await expect(getUserByLocalpart(db, 'nobody')).resolves.toBeNull();
+  });
+
+  it('getPasswordHash returns hash, null hash, or missing → null', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'pbkdf2',
+          display_name: null,
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: 1,
+          updated_at: 1,
+        },
+        {
+          user_id: BOB,
+          localpart: 'bob',
+          password_hash: null,
+          display_name: null,
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+    await expect(getPasswordHash(db, USER)).resolves.toBe('pbkdf2');
+    await expect(getPasswordHash(db, BOB)).resolves.toBeNull();
+    await expect(getPasswordHash(db, '@x:example.com')).resolves.toBeNull();
+  });
+
+  it('updateUserProfile updates display_name and/or avatar_url independently', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: null,
+          display_name: 'Old',
+          avatar_url: 'mxc://old',
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+
+    await updateUserProfile(db, USER);
+    expect(db._state.users[0].display_name).toBe('Old');
+    expect(db._state.users[0].avatar_url).toBe('mxc://old');
+    expect(db._state.runs).toHaveLength(0);
+
+    await updateUserProfile(db, USER, 'New');
+    expect(db._state.users[0].display_name).toBe('New');
+    expect(db._state.users[0].updated_at).toBe(NOW);
+    expect(db._state.runs).toHaveLength(1);
+
+    await updateUserProfile(db, USER, undefined, 'mxc://new');
+    expect(db._state.users[0].avatar_url).toBe('mxc://new');
+    expect(db._state.runs).toHaveLength(2);
+
+    await updateUserProfile(db, USER, 'Both', 'mxc://both');
+    expect(db._state.users[0]).toMatchObject({
+      display_name: 'Both',
+      avatar_url: 'mxc://both',
+    });
+    expect(db._state.runs).toHaveLength(4);
+  });
+
+  it('updateUserProfile allows clearing fields with empty string', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: null,
+          display_name: 'Alice',
+          avatar_url: 'mxc://a',
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+    await updateUserProfile(db, USER, '', '');
+    expect(db._state.users[0].display_name).toBe('');
+    expect(db._state.users[0].avatar_url).toBe('');
+  });
+});
+
+describe('database device helpers', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('createDevice stores null display_name when omitted', async () => {
+    const db = createCrudDb();
+    await createDevice(db, USER, 'DEVICE1');
+    await createDevice(db, USER, 'DEVICE2', 'Phone');
+    expect(db._state.devices).toEqual([
+      {
+        user_id: USER,
+        device_id: 'DEVICE1',
+        display_name: null,
+        last_seen_ts: null,
+        last_seen_ip: null,
+        created_at: NOW,
+      },
+      {
+        user_id: USER,
+        device_id: 'DEVICE2',
+        display_name: 'Phone',
+        last_seen_ts: null,
+        last_seen_ip: null,
+        created_at: NOW,
+      },
+    ]);
+  });
+
+  it('getDevice maps nullables and returns null when missing', async () => {
+    const db = createCrudDb({
+      devices: [
+        {
+          user_id: USER,
+          device_id: 'D1',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: 9,
+        },
+        {
+          user_id: USER,
+          device_id: 'D2',
+          display_name: 'Laptop',
+          last_seen_ts: 100,
+          last_seen_ip: '1.2.3.4',
+          created_at: 9,
+        },
+      ],
+    });
+    await expect(getDevice(db, USER, 'D1')).resolves.toEqual({
+      device_id: 'D1',
+      user_id: USER,
+      display_name: undefined,
+      last_seen_ts: undefined,
+      last_seen_ip: undefined,
+    });
+    await expect(getDevice(db, USER, 'D2')).resolves.toEqual({
+      device_id: 'D2',
+      user_id: USER,
+      display_name: 'Laptop',
+      last_seen_ts: 100,
+      last_seen_ip: '1.2.3.4',
+    });
+    await expect(getDevice(db, USER, 'NOPE')).resolves.toBeNull();
+    await expect(getDevice(db, BOB, 'D1')).resolves.toBeNull();
+  });
+
+  it('getUserDevices returns empty / mapped list without created_at', async () => {
+    const db = createCrudDb({
+      devices: [
+        {
+          user_id: USER,
+          device_id: 'A',
+          display_name: 'a',
+          last_seen_ts: 1,
+          last_seen_ip: '::1',
+          created_at: 1,
+        },
+        {
+          user_id: BOB,
+          device_id: 'B',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: 1,
+        },
+      ],
+    });
+    await expect(getUserDevices(db, USER)).resolves.toEqual([
+      {
+        device_id: 'A',
+        user_id: USER,
+        display_name: 'a',
+        last_seen_ts: 1,
+        last_seen_ip: '::1',
+      },
+    ]);
+    await expect(getUserDevices(db, '@nobody:example.com')).resolves.toEqual([]);
+  });
+
+  it('deleteDevice removes only the matching user+device pair', async () => {
+    const db = createCrudDb({
+      devices: [
+        {
+          user_id: USER,
+          device_id: 'D1',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: 1,
+        },
+        {
+          user_id: USER,
+          device_id: 'D2',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: 1,
+        },
+        {
+          user_id: BOB,
+          device_id: 'D1',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: 1,
+        },
+      ],
+    });
+    await deleteDevice(db, USER, 'D1');
+    expect(db._state.devices.map((d) => `${d.user_id}:${d.device_id}`)).toEqual([
+      `${USER}:D2`,
+      `${BOB}:D1`,
+    ]);
+  });
+});
+
+describe('database access token helpers', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('createAccessToken stores nullable device_id', async () => {
+    const db = createCrudDb();
+    await createAccessToken(db, 'tid1', 'hash1', USER, 'DEVICE');
+    await createAccessToken(db, 'tid2', 'hash2', USER, null);
+    expect(db._state.tokens).toEqual([
+      {
+        token_id: 'tid1',
+        token_hash: 'hash1',
+        user_id: USER,
+        device_id: 'DEVICE',
+        created_at: NOW,
+      },
+      {
+        token_id: 'tid2',
+        token_hash: 'hash2',
+        user_id: USER,
+        device_id: null,
+        created_at: NOW,
+      },
+    ]);
+  });
+
+  it('getUserByTokenHash returns user/device or null', async () => {
+    const db = createCrudDb({
+      tokens: [
+        {
+          token_id: 't1',
+          token_hash: 'abc',
+          user_id: USER,
+          device_id: 'D',
+          created_at: 1,
+        },
+        {
+          token_id: 't2',
+          token_hash: 'no-device',
+          user_id: BOB,
+          device_id: null,
+          created_at: 1,
+        },
+      ],
+    });
+    await expect(getUserByTokenHash(db, 'abc')).resolves.toEqual({
+      userId: USER,
+      deviceId: 'D',
+    });
+    await expect(getUserByTokenHash(db, 'no-device')).resolves.toEqual({
+      userId: BOB,
+      deviceId: null,
+    });
+    await expect(getUserByTokenHash(db, 'missing')).resolves.toBeNull();
+  });
+
+  it('deleteAccessToken removes by hash only', async () => {
+    const db = createCrudDb({
+      tokens: [
+        {
+          token_id: 't1',
+          token_hash: 'keep',
+          user_id: USER,
+          device_id: null,
+          created_at: 1,
+        },
+        {
+          token_id: 't2',
+          token_hash: 'drop',
+          user_id: USER,
+          device_id: null,
+          created_at: 1,
+        },
+      ],
+    });
+    await deleteAccessToken(db, 'drop');
+    expect(db._state.tokens.map((t) => t.token_hash)).toEqual(['keep']);
+  });
+
+  it('deleteAllUserTokens removes every token for a user', async () => {
+    const db = createCrudDb({
+      tokens: [
+        {
+          token_id: 't1',
+          token_hash: 'a',
+          user_id: USER,
+          device_id: '1',
+          created_at: 1,
+        },
+        {
+          token_id: 't2',
+          token_hash: 'b',
+          user_id: USER,
+          device_id: '2',
+          created_at: 1,
+        },
+        {
+          token_id: 't3',
+          token_hash: 'c',
+          user_id: BOB,
+          device_id: null,
+          created_at: 1,
+        },
+      ],
+    });
+    await deleteAllUserTokens(db, USER);
+    expect(db._state.tokens).toHaveLength(1);
+    expect(db._state.tokens[0].user_id).toBe(BOB);
+  });
+});
+
+describe('database room helpers', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('createRoom defaults isPublic=false and stores is_public 0/1', async () => {
+    const db = createCrudDb();
+    await createRoom(db, ROOM, '10', USER);
+    await createRoom(db, '!pub:example.com', '11', BOB, true);
+    expect(db._state.rooms[0]).toMatchObject({
+      room_id: ROOM,
+      room_version: '10',
+      creator_id: USER,
+      is_public: 0,
+      created_at: NOW,
+    });
+    expect(db._state.rooms[1].is_public).toBe(1);
+  });
+
+  it('getRoom maps is_public and nullable creator', async () => {
+    const db = createCrudDb({
+      rooms: [
+        {
+          room_id: ROOM,
+          room_version: '10',
+          creator_id: null,
+          is_public: 0,
+          created_at: 3,
+        },
+        {
+          room_id: '!p:example.com',
+          room_version: '11',
+          creator_id: USER,
+          is_public: 1,
+          created_at: 4,
+        },
+      ],
+    });
+    await expect(getRoom(db, ROOM)).resolves.toEqual({
+      room_id: ROOM,
+      room_version: '10',
+      is_public: false,
+      creator_id: undefined,
+      created_at: 3,
+    });
+    await expect(getRoom(db, '!p:example.com')).resolves.toEqual({
+      room_id: '!p:example.com',
+      room_version: '11',
+      is_public: true,
+      creator_id: USER,
+      created_at: 4,
+    });
+    await expect(getRoom(db, '!missing:example.com')).resolves.toBeNull();
+  });
+});
+
+describe('database storeEvent / getEvent', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('storeEvent allocates stream ordering, inserts row, updates room_state for state events', async () => {
+    const db = createCrudDb({ streamPosition: 10 });
+    const event = pdu({
+      event_id: '$s1',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'General' },
+    });
+    await expect(storeEvent(db, event)).resolves.toBe(11);
+    expect(db._state.events).toHaveLength(1);
+    expect(db._state.events[0]).toMatchObject({
+      event_id: '$s1',
+      event_type: 'm.room.name',
+      state_key: '',
+      stream_ordering: 11,
+      content: JSON.stringify({ name: 'General' }),
+    });
+    expect(db._state.roomState.get(`${ROOM}\0m.room.name\0`)).toBe('$s1');
+  });
+
+  it('storeEvent skips room_state when state_key is undefined (message)', async () => {
+    const db = createCrudDb({ streamPosition: 0 });
+    const event = pdu({
+      event_id: '$m1',
+      type: 'm.room.message',
+      content: { body: 'hi', msgtype: 'm.text' },
+    });
+    // ensure state_key truly absent
+    delete (event as { state_key?: string }).state_key;
+    await expect(storeEvent(db, event)).resolves.toBe(1);
+    expect(db._state.roomState.size).toBe(0);
+    expect(db._state.events[0].state_key).toBeNull();
+  });
+
+  it('storeEvent defaults stream ordering to 1 when RETURNING is null', async () => {
+    const hybrid = createCrudDb({ streamPosition: 0 });
+    const orig = hybrid.prepare.bind(hybrid);
+    hybrid.prepare = ((sql: string) => {
+      if (sql.includes('UPDATE stream_positions')) {
+        return {
+          bind() {
+            return this;
+          },
+          first: async () => null,
+          all: async () => ({ results: [] }),
+          run: async () => ({ meta: { changes: 0 } }),
+        };
+      }
+      return orig(sql);
+    }) as typeof hybrid.prepare;
+
+    const ordering = await storeEvent(
+      hybrid,
+      pdu({ event_id: '$fallback', type: 'm.room.message', content: { body: 'x' } })
+    );
+    expect(ordering).toBe(1);
+    expect(hybrid._state.events[0].stream_ordering).toBe(1);
+  });
+
+  it('storeEvent rejects oversized content via validateEventSize', async () => {
+    const db = createCrudDb();
+    const event = pdu({
+      event_id: '$big',
+      type: 'm.room.message',
+      content: { body: 'x'.repeat(70_000) },
+    });
+    expect(() => validateEventSize(event)).toThrow(MatrixApiError);
+    await expect(storeEvent(db, event)).rejects.toBeInstanceOf(MatrixApiError);
+    expect(db._state.events).toHaveLength(0);
+  });
+
+  it('storeEvent serializes unsigned/hashes/signatures and nulls when absent', async () => {
+    const db = createCrudDb({ streamPosition: 2 });
+    const withExtras = pdu({
+      event_id: '$u1',
+      type: 'm.room.member',
+      state_key: USER,
+      content: { membership: 'join' },
+      unsigned: { age: 1 },
+    });
+    await storeEvent(db, withExtras);
+    expect(db._state.events[0].unsigned).toBe(JSON.stringify({ age: 1 }));
+    expect(db._state.events[0].hashes).toBe(JSON.stringify({ sha256: 'h' }));
+
+    const bare = pdu({
+      event_id: '$u2',
+      type: 'm.room.message',
+      content: { body: 'n' },
+    });
+    delete (bare as { unsigned?: unknown }).unsigned;
+    delete (bare as { hashes?: unknown }).hashes;
+    delete (bare as { signatures?: unknown }).signatures;
+    await storeEvent(db, bare);
+    expect(db._state.events[1].unsigned).toBeNull();
+    expect(db._state.events[1].hashes).toBeNull();
+    expect(db._state.events[1].signatures).toBeNull();
+  });
+
+  it('storeEventIdempotent inserts new events and updates state when inserted', async () => {
+    const db = createCrudDb({ streamPosition: 5 });
+    const event = pdu({
+      event_id: '$idemp1',
+      type: 'm.room.topic',
+      state_key: '',
+      content: { topic: 't' },
+    });
+    await expect(storeEventIdempotent(db, event)).resolves.toEqual({
+      inserted: true,
+      streamOrdering: 6,
+    });
+    expect(db._state.roomState.get(`${ROOM}\0m.room.topic\0`)).toBe('$idemp1');
+  });
+
+  it('storeEventIdempotent returns inserted:false without updating state on collision', async () => {
+    const existing = eventRowFromPdu(
+      pdu({
+        event_id: '$dup',
+        type: 'm.room.name',
+        state_key: '',
+        content: { name: 'old' },
+      }),
+      3
+    );
+    const db = createCrudDb({
+      streamPosition: 3,
+      events: [existing],
+      roomState: [
+        { room_id: ROOM, event_type: 'm.room.name', state_key: '', event_id: '$dup' },
+      ],
+    });
+    const collision = pdu({
+      event_id: '$dup',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'new' },
+    });
+    await expect(storeEventIdempotent(db, collision)).resolves.toEqual({
+      inserted: false,
+      streamOrdering: null,
+    });
+    // stream id still allocated
+    expect(db._state.streamPosition).toBe(4);
+    expect(db._state.events).toHaveLength(1);
+    expect(db._state.events[0].content).toBe(JSON.stringify({ name: 'old' }));
+    expect(db._state.roomState.get(`${ROOM}\0m.room.name\0`)).toBe('$dup');
+  });
+
+  it('storeEventIdempotent skips room_state for non-state events even when inserted', async () => {
+    const db = createCrudDb({ streamPosition: 0 });
+    const event = pdu({
+      event_id: '$msg',
+      type: 'm.room.message',
+      content: { body: 'x' },
+    });
+    delete (event as { state_key?: string }).state_key;
+    await expect(storeEventIdempotent(db, event)).resolves.toEqual({
+      inserted: true,
+      streamOrdering: 1,
+    });
+    expect(db._state.roomState.size).toBe(0);
+  });
+
+  it('getEvent returns null / fully parsed PDU including optional fields', async () => {
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(
+          pdu({
+            event_id: '$g1',
+            type: 'm.room.member',
+            state_key: USER,
+            content: { membership: 'join' },
+            unsigned: { age: 9 },
+          }),
+          1
+        ),
+        {
+          event_id: '$g2',
+          room_id: ROOM,
+          sender: USER,
+          event_type: 'm.room.message',
+          state_key: null,
+          content: JSON.stringify({ body: 'hi' }),
+          origin_server_ts: NOW,
+          unsigned: null,
+          depth: 2,
+          auth_events: '[]',
+          prev_events: '[]',
+          hashes: null,
+          signatures: null,
+          stream_ordering: 2,
+        },
+      ],
+    });
+    await expect(getEvent(db, '$missing')).resolves.toBeNull();
+    await expect(getEvent(db, '$g1')).resolves.toMatchObject({
+      event_id: '$g1',
+      type: 'm.room.member',
+      state_key: USER,
+      content: { membership: 'join' },
+      unsigned: { age: 9 },
+      hashes: { sha256: 'h' },
+    });
+    await expect(getEvent(db, '$g2')).resolves.toEqual({
+      event_id: '$g2',
+      room_id: ROOM,
+      sender: USER,
+      type: 'm.room.message',
+      state_key: undefined,
+      content: { body: 'hi' },
+      origin_server_ts: NOW,
+      unsigned: undefined,
+      depth: 2,
+      auth_events: [],
+      prev_events: [],
+      hashes: undefined,
+      signatures: undefined,
+    });
+  });
+});
+
+describe('database getRoomEvents / getRoomState / getStateEvent', () => {
+  function seededEvents(): EventRow[] {
+    return [1, 2, 3, 4, 5].map((n) =>
+      eventRowFromPdu(
+        pdu({
+          event_id: `$${n}`,
+          type: 'm.room.message',
+          content: { body: String(n) },
+          depth: n,
+        }),
+        n
+      )
+    );
+  }
+
+  it('getRoomEvents backwards without fromToken returns newest-first page', async () => {
+    const db = createCrudDb({ events: seededEvents() });
+    const { events, end } = await getRoomEvents(db, ROOM, undefined, 2, 'b');
+    expect(events.map((e) => e.event_id)).toEqual(['$5', '$4']);
+    expect(end).toBe(4);
+  });
+
+  it('getRoomEvents backwards with fromToken uses stream_ordering <', async () => {
+    const db = createCrudDb({ events: seededEvents() });
+    const { events, end } = await getRoomEvents(db, ROOM, 4, 2, 'b');
+    expect(events.map((e) => e.event_id)).toEqual(['$3', '$2']);
+    expect(end).toBe(2);
+    expect(db._state.binds.some((b) => b[0] === ROOM && b[1] === 4 && b[2] === 2)).toBe(
+      true
+    );
+  });
+
+  it('getRoomEvents forwards without/with fromToken', async () => {
+    const db = createCrudDb({ events: seededEvents() });
+    const first = await getRoomEvents(db, ROOM, undefined, 2, 'f');
+    expect(first.events.map((e) => e.event_id)).toEqual(['$1', '$2']);
+    expect(first.end).toBe(2);
+
+    const next = await getRoomEvents(db, ROOM, 2, 2, 'f');
+    expect(next.events.map((e) => e.event_id)).toEqual(['$3', '$4']);
+    expect(next.end).toBe(4);
+  });
+
+  it('getRoomEvents end falls back to fromToken then 0 when empty', async () => {
+    const db = createCrudDb({ events: [] });
+    await expect(getRoomEvents(db, ROOM, 9, 10, 'b')).resolves.toEqual({
+      events: [],
+      end: 9,
+    });
+    await expect(getRoomEvents(db, ROOM, undefined, 10, 'f')).resolves.toEqual({
+      events: [],
+      end: 0,
+    });
+  });
+
+  it('getRoomEvents defaults limit=50 direction=b and ignores other rooms', async () => {
+    const db = createCrudDb({
+      events: [
+        ...seededEvents(),
+        eventRowFromPdu(
+          pdu({
+            event_id: '$other',
+            room_id: '!other:example.com',
+            type: 'm.room.message',
+            content: { body: 'x' },
+          }),
+          99
+        ),
+      ],
+    });
+    const { events } = await getRoomEvents(db, ROOM);
+    expect(events).toHaveLength(5);
+    expect(events.every((e) => e.room_id === ROOM)).toBe(true);
+  });
+
+  it('getRoomEvents treats fromToken 0 as falsy (no stream filter)', async () => {
+    const db = createCrudDb({ events: seededEvents() });
+    const { events } = await getRoomEvents(db, ROOM, 0, 2, 'b');
+    // fromToken falsy → no `< ?` branch
+    expect(events.map((e) => e.event_id)).toEqual(['$5', '$4']);
+  });
+
+  it('getRoomState joins current state event ids', async () => {
+    const name = pdu({
+      event_id: '$name',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'N' },
+    });
+    const member = pdu({
+      event_id: '$mem',
+      type: 'm.room.member',
+      state_key: USER,
+      content: { membership: 'join' },
+    });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(name, 1), eventRowFromPdu(member, 2)],
+      roomState: [
+        { room_id: ROOM, event_type: 'm.room.name', state_key: '', event_id: '$name' },
+        {
+          room_id: ROOM,
+          event_type: 'm.room.member',
+          state_key: USER,
+          event_id: '$mem',
+        },
+      ],
+    });
+    const state = await getRoomState(db, ROOM);
+    expect(state.map((e) => e.event_id).sort()).toEqual(['$mem', '$name']);
+    expect(state.find((e) => e.event_id === '$name')?.content).toEqual({ name: 'N' });
+  });
+
+  it('getRoomState returns empty for rooms with no state', async () => {
+    const db = createCrudDb();
+    await expect(getRoomState(db, ROOM)).resolves.toEqual([]);
+  });
+
+  it('getStateEvent returns null / parsed event; defaults stateKey to empty', async () => {
+    const name = pdu({
+      event_id: '$name',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'N' },
+      unsigned: { age: 1 },
+    });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(name, 1)],
+      roomState: [
+        { room_id: ROOM, event_type: 'm.room.name', state_key: '', event_id: '$name' },
+      ],
+    });
+    await expect(getStateEvent(db, ROOM, 'm.room.name')).resolves.toMatchObject({
+      event_id: '$name',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'N' },
+      unsigned: { age: 1 },
+    });
+    await expect(getStateEvent(db, ROOM, 'm.room.topic', '')).resolves.toBeNull();
+    await expect(getStateEvent(db, ROOM, 'm.room.member', USER)).resolves.toBeNull();
+  });
+});
+
+describe('database membership helpers', () => {
+  it('updateMembership inserts or replaces membership rows', async () => {
+    const db = createCrudDb();
+    await updateMembership(db, ROOM, USER, 'join', '$e1', 'Alice', 'mxc://a');
+    expect(db._state.memberships[0]).toEqual({
+      room_id: ROOM,
+      user_id: USER,
+      membership: 'join',
+      event_id: '$e1',
+      display_name: 'Alice',
+      avatar_url: 'mxc://a',
+    });
+    await updateMembership(db, ROOM, USER, 'leave', '$e2');
+    expect(db._state.memberships).toHaveLength(1);
+    expect(db._state.memberships[0]).toMatchObject({
+      membership: 'leave',
+      event_id: '$e2',
+      display_name: null,
+      avatar_url: null,
+    });
+  });
+
+  it('tryInsertJoinMembership inserts when absent', async () => {
+    const db = createCrudDb();
+    await expect(
+      tryInsertJoinMembership(db, ROOM, USER, '$new', 'A', null as unknown as string)
+    ).resolves.toEqual({ inserted: true, eventId: '$new' });
+    expect(db._state.memberships[0].event_id).toBe('$new');
+  });
+
+  it('tryInsertJoinMembership keeps existing join event_id (inserted:false)', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$old',
+          display_name: 'Alice',
+          avatar_url: null,
+        },
+      ],
+    });
+    await expect(
+      tryInsertJoinMembership(db, ROOM, USER, '$new', 'Ignored')
+    ).resolves.toEqual({ inserted: false, eventId: '$old' });
+    expect(db._state.memberships[0].event_id).toBe('$old');
+    expect(db._state.memberships[0].display_name).toBe('Alice');
+  });
+
+  it('tryInsertJoinMembership upgrades invite/leave to join with new event_id', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'invite',
+          event_id: '$inv',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    await expect(
+      tryInsertJoinMembership(db, ROOM, USER, '$join', 'Alice', 'mxc://a')
+    ).resolves.toEqual({ inserted: true, eventId: '$join' });
+    expect(db._state.memberships[0]).toMatchObject({
+      membership: 'join',
+      event_id: '$join',
+      display_name: 'Alice',
+      avatar_url: 'mxc://a',
+    });
+  });
+
+  it('tryInsertJoinMembership falls back to provided eventId when RETURNING is null', async () => {
+    const db = createCrudDb();
+    const orig = db.prepare.bind(db);
+    db.prepare = ((sql: string) => {
+      if (sql.includes('RETURNING event_id')) {
+        return {
+          bind() {
+            return this;
+          },
+          first: async () => null,
+          all: async () => ({ results: [] }),
+          run: async () => ({ meta: { changes: 0 } }),
+        };
+      }
+      return orig(sql);
+    }) as typeof db.prepare;
+    await expect(tryInsertJoinMembership(db, ROOM, USER, '$fb')).resolves.toEqual({
+      inserted: true,
+      eventId: '$fb',
+    });
+  });
+
+  it('getMembership returns null or mapped membership', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$e',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    await expect(getMembership(db, ROOM, USER)).resolves.toEqual({
+      membership: 'join',
+      eventId: '$e',
+    });
+    await expect(getMembership(db, ROOM, BOB)).resolves.toBeNull();
+  });
+
+  it('getUserRooms filters optional membership', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: '!a:example.com',
+          user_id: USER,
+          membership: 'join',
+          event_id: '$1',
+          display_name: null,
+          avatar_url: null,
+        },
+        {
+          room_id: '!b:example.com',
+          user_id: USER,
+          membership: 'leave',
+          event_id: '$2',
+          display_name: null,
+          avatar_url: null,
+        },
+        {
+          room_id: '!c:example.com',
+          user_id: BOB,
+          membership: 'join',
+          event_id: '$3',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    await expect(getUserRooms(db, USER)).resolves.toEqual([
+      '!a:example.com',
+      '!b:example.com',
+    ]);
+    await expect(getUserRooms(db, USER, 'join')).resolves.toEqual(['!a:example.com']);
+    await expect(getUserRooms(db, USER, 'invite')).resolves.toEqual([]);
+  });
+
+  it('getRoomMembers maps display fields and optional membership filter', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$1',
+          display_name: 'Alice',
+          avatar_url: null,
+        },
+        {
+          room_id: ROOM,
+          user_id: BOB,
+          membership: 'invite',
+          event_id: '$2',
+          display_name: null,
+          avatar_url: 'mxc://b',
+        },
+      ],
+    });
+    await expect(getRoomMembers(db, ROOM)).resolves.toEqual([
+      {
+        userId: USER,
+        membership: 'join',
+        displayName: 'Alice',
+        avatarUrl: undefined,
+      },
+      {
+        userId: BOB,
+        membership: 'invite',
+        displayName: undefined,
+        avatarUrl: 'mxc://b',
+      },
+    ]);
+    await expect(getRoomMembers(db, ROOM, 'join')).resolves.toEqual([
+      {
+        userId: USER,
+        membership: 'join',
+        displayName: 'Alice',
+        avatarUrl: undefined,
+      },
+    ]);
+  });
+});
+
+describe('database alias helpers', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('createRoomAlias / getRoomByAlias / deleteRoomAlias round-trip', async () => {
+    const db = createCrudDb();
+    await createRoomAlias(db, '#general:example.com', ROOM, USER);
+    expect(db._state.aliases[0]).toEqual({
+      alias: '#general:example.com',
+      room_id: ROOM,
+      creator_id: USER,
+      created_at: NOW,
+    });
+    await expect(getRoomByAlias(db, '#general:example.com')).resolves.toBe(ROOM);
+    await expect(getRoomByAlias(db, '#missing:example.com')).resolves.toBeNull();
+    await deleteRoomAlias(db, '#general:example.com');
+    await expect(getRoomByAlias(db, '#general:example.com')).resolves.toBeNull();
+    expect(db._state.aliases).toHaveLength(0);
+  });
+
+  it('deleteRoomAlias is a no-op for unknown aliases', async () => {
+    const db = createCrudDb({
+      aliases: [
+        {
+          alias: '#keep:example.com',
+          room_id: ROOM,
+          creator_id: USER,
+          created_at: 1,
+        },
+      ],
+    });
+    await deleteRoomAlias(db, '#gone:example.com');
+    expect(db._state.aliases).toHaveLength(1);
+  });
+});
+
+describe('database stream / batch event helpers', () => {
+  it('getLatestStreamPosition returns 0 for empty / null MAX', async () => {
+    const db = createCrudDb();
+    await expect(getLatestStreamPosition(db)).resolves.toBe(0);
+  });
+
+  it('getLatestStreamPosition returns MAX stream_ordering', async () => {
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(pdu({ event_id: '$1', type: 'm.room.message' }), 3),
+        eventRowFromPdu(pdu({ event_id: '$2', type: 'm.room.message' }), 9),
+        eventRowFromPdu(pdu({ event_id: '$3', type: 'm.room.message' }), 5),
+      ],
+    });
+    await expect(getLatestStreamPosition(db)).resolves.toBe(9);
+  });
+
+  it('getEventsSince filters by room + stream_ordering > since with limit', async () => {
+    const db = createCrudDb({
+      events: [1, 2, 3, 4, 5].map((n) =>
+        eventRowFromPdu(
+          pdu({
+            event_id: `$${n}`,
+            type: 'm.room.message',
+            content: { body: String(n) },
+          }),
+          n
+        )
+      ),
+    });
+    const page = await getEventsSince(db, ROOM, 2, 2);
+    expect(page.map((e) => e.event_id)).toEqual(['$3', '$4']);
+    expect(page[0].content).toEqual({ body: '3' });
+
+    const defaultLimit = await getEventsSince(db, ROOM, 0);
+    expect(defaultLimit).toHaveLength(5);
+
+    await expect(getEventsSince(db, ROOM, 100)).resolves.toEqual([]);
+  });
+
+  it('getEventsByIds returns [] for empty input without preparing', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$1', type: 'm.room.message' }), 1)],
+    });
+    await expect(getEventsByIds(db, [])).resolves.toEqual([]);
+    expect(db._state.prepares).toHaveLength(0);
+  });
+
+  it('getEventsByIds fetches matching ids and parses optional JSON fields', async () => {
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(
+          pdu({
+            event_id: '$a',
+            type: 'm.room.member',
+            state_key: USER,
+            content: { membership: 'join' },
+            unsigned: { age: 1 },
+          }),
+          1
+        ),
+        {
+          event_id: '$b',
+          room_id: ROOM,
+          sender: BOB,
+          event_type: 'm.room.message',
+          state_key: null,
+          content: JSON.stringify({ body: 'b' }),
+          origin_server_ts: NOW,
+          unsigned: null,
+          depth: 2,
+          auth_events: '[]',
+          prev_events: '[]',
+          hashes: null,
+          signatures: null,
+          stream_ordering: 2,
+        },
+      ],
+    });
+    const got = await getEventsByIds(db, ['$a', '$missing', '$b']);
+    expect(got.map((e) => e.event_id)).toEqual(['$a', '$b']);
+    expect(got[0]).toMatchObject({
+      type: 'm.room.member',
+      state_key: USER,
+      unsigned: { age: 1 },
+      hashes: { sha256: 'h' },
+    });
+    expect(got[1]).toMatchObject({
+      type: 'm.room.message',
+      state_key: undefined,
+      hashes: undefined,
+      signatures: undefined,
+    });
+  });
+
+  it('getEventsByIds pages at 100 ids per IN (...) query', async () => {
+    const ids = Array.from({ length: 250 }, (_, i) => `$${i}`);
+    const events = ids.map((id, i) =>
+      eventRowFromPdu(
+        pdu({
+          event_id: id,
+          type: 'm.room.message',
+          content: { body: String(i) },
+        }),
+        i + 1
+      )
+    );
+    const db = createCrudDb({ events });
+    const got = await getEventsByIds(db, ids);
+    expect(got).toHaveLength(250);
+    const inPrepares = db._state.prepares.filter((s) => s.includes('IN ('));
+    expect(inPrepares).toHaveLength(3);
+    // 100 + 100 + 50 placeholders
+    expect((inPrepares[0].match(/\?/g) ?? []).length).toBe(100);
+    expect((inPrepares[1].match(/\?/g) ?? []).length).toBe(100);
+    expect((inPrepares[2].match(/\?/g) ?? []).length).toBe(50);
+  });
+});
+
+describe('database CRUD contracts / isolation', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('createUser defaults isGuest to false when omitted', async () => {
+    const db = createCrudDb();
+    await createUser(db, USER, 'alice', 'h');
+    expect(db._state.users[0].is_guest).toBe(0);
+  });
+
+  it('user/device/token helpers do not cross-contaminate prepares across calls', async () => {
+    const db = createCrudDb();
+    await createUser(db, USER, 'alice', 'h');
+    await createDevice(db, USER, 'D');
+    await createAccessToken(db, 't', 'hash', USER, 'D');
+    const sqls = db._state.prepares.join('\n');
+    expect(sqls).toContain('INSERT INTO users');
+    expect(sqls).toContain('INSERT INTO devices');
+    expect(sqls).toContain('INSERT INTO access_tokens');
+    await expect(getUserByTokenHash(db, 'hash')).resolves.toEqual({
+      userId: USER,
+      deviceId: 'D',
+    });
+  });
+
+  it('empty-string state_key is treated as state (updates room_state)', async () => {
+    const db = createCrudDb({ streamPosition: 0 });
+    await storeEvent(
+      db,
+      pdu({
+        event_id: '$empty-key',
+        type: 'm.room.name',
+        state_key: '',
+        content: { name: 'x' },
+      })
+    );
+    expect(db._state.roomState.has(`${ROOM}\0m.room.name\0`)).toBe(true);
+  });
+
+  it('getRoomEvents parses JSON fields on returned events', async () => {
+    const db = createCrudDb({
+      events: [
+        {
+          event_id: '$p',
+          room_id: ROOM,
+          sender: USER,
+          event_type: 'm.room.message',
+          state_key: null,
+          content: JSON.stringify({ body: 'parsed' }),
+          origin_server_ts: NOW,
+          unsigned: JSON.stringify({ age: 2 }),
+          depth: 1,
+          auth_events: JSON.stringify(['$a']),
+          prev_events: JSON.stringify(['$b']),
+          hashes: null,
+          signatures: null,
+          stream_ordering: 1,
+        },
+      ],
+    });
+    const { events } = await getRoomEvents(db, ROOM, undefined, 10, 'f');
+    expect(events[0]).toMatchObject({
+      content: { body: 'parsed' },
+      unsigned: { age: 2 },
+      auth_events: ['$a'],
+      prev_events: ['$b'],
+      state_key: undefined,
+    });
+  });
+
+  it('storeEvent bind order matches INSERT column list', async () => {
+    const db = createCrudDb({ streamPosition: 0 });
+    const event = pdu({
+      event_id: '$bind',
+      type: 'm.room.member',
+      state_key: USER,
+      content: { membership: 'join' },
+      unsigned: { age: 0 },
+      depth: 7,
+      auth_events: ['$auth'],
+      prev_events: ['$prev'],
+    });
+    await storeEvent(db, event);
+    const insert = db._state.runs.find((r) => r.sql.includes('INSERT INTO events'));
+    expect(insert?.args).toEqual([
+      '$bind',
+      ROOM,
+      USER,
+      'm.room.member',
+      USER,
+      JSON.stringify({ membership: 'join' }),
+      NOW,
+      JSON.stringify({ age: 0 }),
+      7,
+      JSON.stringify(['$auth']),
+      JSON.stringify(['$prev']),
+      JSON.stringify({ sha256: 'h' }),
+      JSON.stringify({ 'example.com': { 'ed25519:1': 'sig' } }),
+      1,
+    ]);
+  });
+});
+
+describe('database CRUD TOKENMAXX edge paths after #73', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('maps unicode display names through user + membership paths', async () => {
+    const db = createCrudDb();
+    await createUser(db, USER, 'alice', 'h');
+    await updateUserProfile(db, USER, 'アリス 🚀');
+    await expect(getUserById(db, USER)).resolves.toMatchObject({
+      display_name: 'アリス 🚀',
+    });
+    await updateMembership(db, ROOM, USER, 'join', '$u', 'アリス 🚀', 'mxc://絵');
+    await expect(getRoomMembers(db, ROOM)).resolves.toEqual([
+      {
+        userId: USER,
+        membership: 'join',
+        displayName: 'アリス 🚀',
+        avatarUrl: 'mxc://絵',
+      },
+    ]);
+  });
+
+  it('getLatestStreamPosition treats max_ordering 0 as present (not ?? fallback)', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$z', type: 'm.room.message' }), 0)],
+    });
+    await expect(getLatestStreamPosition(db)).resolves.toBe(0);
+  });
+
+  it('getEventsSince isolates rooms and honors since:0 as incremental', async () => {
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(pdu({ event_id: '$a1', type: 'm.room.message' }), 1),
+        eventRowFromPdu(
+          pdu({
+            event_id: '$o1',
+            room_id: '!other:example.com',
+            type: 'm.room.message',
+          }),
+          2
+        ),
+        eventRowFromPdu(pdu({ event_id: '$a2', type: 'm.room.message' }), 3),
+      ],
+    });
+    const sinceZero = await getEventsSince(db, ROOM, 0, 10);
+    expect(sinceZero.map((e) => e.event_id)).toEqual(['$a1', '$a2']);
+  });
+
+  it('getEventsByIds exact page-size boundary uses a single prepare', async () => {
+    const ids = Array.from({ length: 100 }, (_, i) => `$${i}`);
+    const db = createCrudDb({
+      events: ids.map((id, i) =>
+        eventRowFromPdu(pdu({ event_id: id, type: 'm.room.message' }), i + 1)
+      ),
+    });
+    await expect(getEventsByIds(db, ids)).resolves.toHaveLength(100);
+    expect(db._state.prepares.filter((s) => s.includes('IN ('))).toHaveLength(1);
+  });
+
+  it('getEventsByIds with 101 ids spills into a second page of 1', async () => {
+    const ids = Array.from({ length: 101 }, (_, i) => `$${i}`);
+    const db = createCrudDb({
+      events: ids.map((id, i) =>
+        eventRowFromPdu(pdu({ event_id: id, type: 'm.room.message' }), i + 1)
+      ),
+    });
+    await getEventsByIds(db, ids);
+    const pages = db._state.prepares.filter((s) => s.includes('IN ('));
+    expect(pages).toHaveLength(2);
+    expect((pages[0].match(/\?/g) ?? []).length).toBe(100);
+    expect((pages[1].match(/\?/g) ?? []).length).toBe(1);
+  });
+
+  it('storeEvent replaces prior room_state for the same type/state_key', async () => {
+    const db = createCrudDb({ streamPosition: 0 });
+    await storeEvent(
+      db,
+      pdu({
+        event_id: '$n1',
+        type: 'm.room.name',
+        state_key: '',
+        content: { name: 'one' },
+      })
+    );
+    await storeEvent(
+      db,
+      pdu({
+        event_id: '$n2',
+        type: 'm.room.name',
+        state_key: '',
+        content: { name: 'two' },
+      })
+    );
+    expect(db._state.roomState.get(`${ROOM}\0m.room.name\0`)).toBe('$n2');
+    await expect(getStateEvent(db, ROOM, 'm.room.name')).resolves.toMatchObject({
+      event_id: '$n2',
+      content: { name: 'two' },
+    });
+  });
+
+  it('storeEventIdempotent allocates stream ids even when colliding', async () => {
+    const db = createCrudDb({
+      streamPosition: 10,
+      events: [
+        eventRowFromPdu(pdu({ event_id: '$same', type: 'm.room.message' }), 10),
+      ],
+    });
+    await storeEventIdempotent(
+      db,
+      pdu({ event_id: '$same', type: 'm.room.message', content: { body: 'x' } })
+    );
+    await storeEventIdempotent(
+      db,
+      pdu({ event_id: '$same', type: 'm.room.message', content: { body: 'y' } })
+    );
+    expect(db._state.streamPosition).toBe(12);
+    expect(db._state.events).toHaveLength(1);
+  });
+
+  it('getRoomEvents forwards fromToken 0 uses unfiltered ASC branch', async () => {
+    const db = createCrudDb({
+      events: [1, 2, 3].map((n) =>
+        eventRowFromPdu(
+          pdu({ event_id: `$${n}`, type: 'm.room.message', content: { body: String(n) } }),
+          n
+        )
+      ),
+    });
+    const { events, end } = await getRoomEvents(db, ROOM, 0, 2, 'f');
+    expect(events.map((e) => e.event_id)).toEqual(['$1', '$2']);
+    expect(end).toBe(2);
+  });
+
+  it('tryInsertJoinMembership omits profile fields when undefined', async () => {
+    const db = createCrudDb();
+    await tryInsertJoinMembership(db, ROOM, USER, '$j');
+    expect(db._state.memberships[0]).toMatchObject({
+      display_name: null,
+      avatar_url: null,
+      event_id: '$j',
+    });
+  });
+
+  it('getUserByTokenHash / getPasswordHash bind the lookup key once', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'secret',
+          display_name: null,
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      tokens: [
+        {
+          token_id: 't',
+          token_hash: 'th',
+          user_id: USER,
+          device_id: 'D',
+          created_at: 1,
+        },
+      ],
+    });
+    db._state.binds.length = 0;
+    await getPasswordHash(db, USER);
+    await getUserByTokenHash(db, 'th');
+    expect(db._state.binds).toEqual([[USER], ['th']]);
+  });
+
+  it('createDevice / createAccessToken / createRoomAlias stamp Date.now()', async () => {
+    const db = createCrudDb();
+    await createDevice(db, USER, 'D', 'n');
+    await createAccessToken(db, 'tid', 'h', USER, 'D');
+    await createRoomAlias(db, '#a:example.com', ROOM, USER);
+    expect(db._state.devices[0].created_at).toBe(NOW);
+    expect(db._state.tokens[0].created_at).toBe(NOW);
+    expect(db._state.aliases[0].created_at).toBe(NOW);
+  });
+
+  it('getRoomMembers returns empty for unknown rooms', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$1',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    await expect(getRoomMembers(db, '!nope:example.com')).resolves.toEqual([]);
+  });
+
+  it('getMembership distinguishes ban/knock/invite states', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'ban',
+          event_id: '$b',
+          display_name: null,
+          avatar_url: null,
+        },
+        {
+          room_id: ROOM,
+          user_id: BOB,
+          membership: 'knock',
+          event_id: '$k',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    await expect(getMembership(db, ROOM, USER)).resolves.toEqual({
+      membership: 'ban',
+      eventId: '$b',
+    });
+    await expect(getMembership(db, ROOM, BOB)).resolves.toEqual({
+      membership: 'knock',
+      eventId: '$k',
+    });
+  });
+
+  it('sequential storeEvent calls allocate monotonically increasing stream ids', async () => {
+    const db = createCrudDb({ streamPosition: 100 });
+    const a = await storeEvent(
+      db,
+      pdu({ event_id: '$s1', type: 'm.room.message', content: { body: '1' } })
+    );
+    const b = await storeEvent(
+      db,
+      pdu({ event_id: '$s2', type: 'm.room.message', content: { body: '2' } })
+    );
+    const c = await storeEvent(
+      db,
+      pdu({ event_id: '$s3', type: 'm.room.message', content: { body: '3' } })
+    );
+    expect([a, b, c]).toEqual([101, 102, 103]);
+  });
+
+  it('getStateEvent with explicit empty state_key matches defaulted call', async () => {
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(
+          pdu({
+            event_id: '$t',
+            type: 'm.room.topic',
+            state_key: '',
+            content: { topic: 'hi' },
+          }),
+          1
+        ),
+      ],
+      roomState: [
+        { room_id: ROOM, event_type: 'm.room.topic', state_key: '', event_id: '$t' },
+      ],
+    });
+    const a = await getStateEvent(db, ROOM, 'm.room.topic');
+    const b = await getStateEvent(db, ROOM, 'm.room.topic', '');
+    expect(a).toEqual(b);
+    expect(a?.content).toEqual({ topic: 'hi' });
+  });
+
+  it('deleteAllUserTokens on a user with no tokens is a quiet no-op', async () => {
+    const db = createCrudDb({
+      tokens: [
+        {
+          token_id: 't',
+          token_hash: 'h',
+          user_id: BOB,
+          device_id: null,
+          created_at: 1,
+        },
+      ],
+    });
+    await deleteAllUserTokens(db, USER);
+    expect(db._state.tokens).toHaveLength(1);
+  });
+
+  it('getUserDevices maps null profile fields to undefined for every device', async () => {
+    const db = createCrudDb({
+      devices: [
+        {
+          user_id: USER,
+          device_id: 'A',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: 1,
+        },
+        {
+          user_id: USER,
+          device_id: 'B',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: 2,
+        },
+      ],
+    });
+    const devices = await getUserDevices(db, USER);
+    expect(devices).toHaveLength(2);
+    expect(devices.every((d) => d.display_name === undefined)).toBe(true);
+    expect(devices.every((d) => d.last_seen_ts === undefined)).toBe(true);
+    expect(devices.every((d) => d.last_seen_ip === undefined)).toBe(true);
+  });
+
+  it('getRoomEvents limit 1 returns end equal to that single event stream_ordering', async () => {
+    const db = createCrudDb({
+      events: [5, 6, 7].map((n) =>
+        eventRowFromPdu(pdu({ event_id: `$${n}`, type: 'm.room.message' }), n)
+      ),
+    });
+    const { events, end } = await getRoomEvents(db, ROOM, undefined, 1, 'b');
+    expect(events).toHaveLength(1);
+    expect(events[0].event_id).toBe('$7');
+    expect(end).toBe(7);
+  });
+});
