@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { getAuthChain, notifyUsersOfEvent } from '../src/services/database';
+import {
+  getAuthChain,
+  getStateAtEvent,
+  getServersInRoomsWithUser,
+  notifyUsersOfEvent,
+} from '../src/services/database';
 import type { PDU } from '../src/types/matrix';
 
 const NOW = 1_700_000_000_000;
@@ -258,5 +263,240 @@ describe('notifyUsersOfEvent clock-pinned timestamp', () => {
     const env = makeNotifyEnv([]);
     await notifyUsersOfEvent(env, '!r:ex.com', '$e', 'm.room.message');
     expect(env.notifies).toEqual([]);
+  });
+});
+
+describe('getStateAtEvent / getAuthChain / getServersInRoomsWithUser TOKENMAXX after #69', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('getStateAtEvent returns [] when the event is missing', async () => {
+    await expect(getStateAtEvent(createAuthChainDb(new Map()), '$missing')).resolves.toEqual([]);
+  });
+
+  it('getStateAtEvent builds state from auth events with state_key', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$leaf',
+        pdu('$leaf', ['$create', '$member', '$msg'], {
+          type: 'm.room.message',
+          state_key: undefined,
+          content: { body: 'hi', msgtype: 'm.text' },
+        }),
+      ],
+      [
+        '$create',
+        pdu('$create', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:ex.com' },
+        }),
+      ],
+      [
+        '$member',
+        pdu('$member', ['$create'], {
+          type: 'm.room.member',
+          state_key: '@s:ex.com',
+          content: { membership: 'join' },
+        }),
+      ],
+      // Non-state auth row (no state_key) must be skipped
+      [
+        '$msg',
+        pdu('$msg', [], {
+          type: 'm.room.message',
+          state_key: undefined,
+          content: { body: 'auth-msg', msgtype: 'm.text' },
+        }),
+      ],
+    ]);
+    const state = await getStateAtEvent(createAuthChainDb(events), '$leaf');
+    const ids = state.map((e) => e.event_id).sort();
+    expect(ids).toEqual(['$create', '$member']);
+    expect(state.find((e) => e.event_id === '$msg')).toBeUndefined();
+  });
+
+  it('getStateAtEvent returns empty state when auth_events is empty', async () => {
+    const events = new Map<string, PDU>([['$solo', pdu('$solo', [])]]);
+    await expect(getStateAtEvent(createAuthChainDb(events), '$solo')).resolves.toEqual([]);
+  });
+
+  it('getStateAtEvent last-wins on duplicate (type, state_key) among auth rows', async () => {
+    // getEventsByIds returns rows in IN-list order; later duplicate key overwrites map
+    const events = new Map<string, PDU>([
+      ['$e', pdu('$e', ['$m1', '$m2'])],
+      [
+        '$m1',
+        pdu('$m1', [], {
+          type: 'm.room.member',
+          state_key: '@s:ex.com',
+          content: { membership: 'invite' },
+        }),
+      ],
+      [
+        '$m2',
+        pdu('$m2', [], {
+          type: 'm.room.member',
+          state_key: '@s:ex.com',
+          content: { membership: 'join' },
+        }),
+      ],
+    ]);
+    const state = await getStateAtEvent(createAuthChainDb(events), '$e');
+    expect(state).toHaveLength(1);
+    expect(state[0].event_id).toBe('$m2');
+    expect(state[0].content).toEqual({ membership: 'join' });
+  });
+
+  it('getAuthChain skips missing mid-chain ids and continues', async () => {
+    const events = new Map<string, PDU>([
+      ['$a', pdu('$a', ['$missing', '$b'])],
+      ['$b', pdu('$b', [])],
+    ]);
+    const chain = await getAuthChain(createAuthChainDb(events), ['$a']);
+    expect(chain.map((e) => e.event_id).sort()).toEqual(['$a', '$b']);
+  });
+
+  it('getAuthChain continues when a batch is all already-seen (diamond graph)', async () => {
+    // Diamond: tip → left & right → shared root. Seeding tip then left causes
+    // right's auth of root to hit seen and produce an empty filtered batch.
+    const events = new Map<string, PDU>([
+      ['$tip', pdu('$tip', ['$left', '$right'])],
+      ['$left', pdu('$left', ['$root'])],
+      ['$right', pdu('$right', ['$root'])],
+      ['$root', pdu('$root', [])],
+    ]);
+    const chain = await getAuthChain(createAuthChainDb(events), ['$tip']);
+    expect(chain.map((e) => e.event_id).sort()).toEqual(['$left', '$right', '$root', '$tip']);
+  });
+
+  it('getAuthChain batches queue at 50 ids per getEventsByIds call', async () => {
+    // One tip with 55 direct auth children → first batch 50, second batch 5 (+ tip consumed)
+    const events = new Map<string, PDU>();
+    const childIds: string[] = [];
+    for (let i = 0; i < 55; i++) {
+      const id = `$c${i}`;
+      childIds.push(id);
+      events.set(id, pdu(id, []));
+    }
+    events.set('$tip', pdu('$tip', childIds));
+    const chain = await getAuthChain(createAuthChainDb(events), ['$tip']);
+    expect(chain).toHaveLength(56); // tip + 55 children
+    expect(chain[0].event_id).toBe('$tip');
+  });
+
+  it('getAuthChain returns empty when seed ids have no rows', async () => {
+    await expect(
+      getAuthChain(createAuthChainDb(new Map()), ['$ghost1', '$ghost2'])
+    ).resolves.toEqual([]);
+  });
+
+  it('getAuthChain multi-parent fan-in collects all unique events', async () => {
+    const events = new Map<string, PDU>([
+      ['$e1', pdu('$e1', ['$a', '$b'])],
+      ['$e2', pdu('$e2', ['$b', '$c'])],
+      ['$a', pdu('$a', [])],
+      ['$b', pdu('$b', [])],
+      ['$c', pdu('$c', [])],
+    ]);
+    const chain = await getAuthChain(createAuthChainDb(events), ['$e1', '$e2']);
+    expect(chain.map((e) => e.event_id).sort()).toEqual(['$a', '$b', '$c', '$e1', '$e2']);
+  });
+
+  function createServersDb(rows: { user_id: string }[]) {
+    return {
+      prepare(sql: string) {
+        return {
+          bind(..._args: unknown[]) {
+            return {
+              async all<T>() {
+                if (sql.includes('room_memberships')) {
+                  // Mirror SQL DISTINCT on computed server_name
+                  const seen = new Set<string | null>();
+                  const results: { server_name: string | null }[] = [];
+                  for (const r of rows) {
+                    const colon = r.user_id.indexOf(':');
+                    const server_name = colon > 0 ? r.user_id.slice(colon + 1) : null;
+                    const key = server_name;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    results.push({ server_name });
+                  }
+                  return { results: results as T[] };
+                }
+                return { results: [] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  it('getServersInRoomsWithUser extracts distinct server names', async () => {
+    const db = createServersDb([
+      { user_id: '@bob:matrix.org' },
+      { user_id: '@carol:matrix.org' },
+      { user_id: '@dan:example.com' },
+    ]);
+    const servers = await getServersInRoomsWithUser(db, '@alice:ex.com');
+    expect(servers.sort()).toEqual(['example.com', 'matrix.org']);
+  });
+
+  it('getServersInRoomsWithUser filters null server_name (no colon in MXID)', async () => {
+    // SQL CASE returns NULL when INSTR is 0; mock mirrors that for malformed ids
+    const db = createServersDb([{ user_id: 'not-an-mxid' }, { user_id: '@ok:good.example' }]);
+    const servers = await getServersInRoomsWithUser(db, '@alice:ex.com');
+    expect(servers).toEqual(['good.example']);
+  });
+
+  it('getServersInRoomsWithUser returns empty when no co-members', async () => {
+    await expect(getServersInRoomsWithUser(createServersDb([]), '@alice:ex.com')).resolves.toEqual(
+      []
+    );
+  });
+
+  it('getStateAtEvent includes empty-string state_key events', async () => {
+    const events = new Map<string, PDU>([
+      ['$e', pdu('$e', ['$create', '$jr'])],
+      [
+        '$create',
+        pdu('$create', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:ex.com' },
+        }),
+      ],
+      [
+        '$jr',
+        pdu('$jr', [], {
+          type: 'm.room.join_rules',
+          state_key: '',
+          content: { join_rule: 'public' },
+        }),
+      ],
+    ]);
+    const state = await getStateAtEvent(createAuthChainDb(events), '$e');
+    expect(state.map((e) => e.event_id).sort()).toEqual(['$create', '$jr']);
+  });
+
+  it('getAuthChain stops enqueueing further auth when cap hit mid-batch', async () => {
+    // Tip with many children: after pushing 500th event, remaining auth ids in that
+    // event are not enqueued (break before the for-authId loop continues for later events).
+    const events = new Map<string, PDU>();
+    // Build a wide tree: $0..$498 are leaves; $tip auths all of them plus one more chain
+    const leaves: string[] = [];
+    for (let i = 0; i < 499; i++) {
+      leaves.push(`$${i}`);
+      events.set(`$${i}`, pdu(`$${i}`, []));
+    }
+    events.set('$tip', pdu('$tip', leaves));
+    const chain = await getAuthChain(createAuthChainDb(events), ['$tip']);
+    expect(chain).toHaveLength(500);
+    expect(chain[0].event_id).toBe('$tip');
   });
 });

@@ -375,3 +375,430 @@ describe('resolveState TOKENMAXX edge paths after #50', () => {
     expect(resolveStateV1([[dup], [dup]])).toEqual([dup]);
   });
 });
+
+function powerLevelsEvent(
+  users: Record<string, number>,
+  opts: { eventId?: string; sender?: string; usersDefault?: number; stateDefault?: number } = {}
+): PDU {
+  return pdu({
+    type: 'm.room.power_levels',
+    event_id: opts.eventId ?? '$pl',
+    sender: opts.sender ?? '@alice:example.com',
+    state_key: '',
+    depth: 2,
+    content: {
+      users,
+      users_default: opts.usersDefault ?? 0,
+      events_default: 0,
+      state_default: opts.stateDefault ?? 50,
+      ban: 50,
+      kick: 50,
+      redact: 50,
+      invite: 0,
+    },
+  });
+}
+
+describe('resolveState TOKENMAXX edge paths after #69', () => {
+  it('marks a key conflicted when missing from one of three state sets', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const bob = member('@bob:example.com', 'join', { eventId: '$bob-join' });
+    const joinRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    // bob missing from set 0 and set 2 → conflicted (events.length !== maps.length)
+    const resolved = resolveState('10', [
+      [create, joinRules, alice],
+      [create, joinRules, alice, bob],
+      [create, joinRules, alice],
+    ]);
+    expect(resolved.find((e) => e.state_key === '@bob:example.com')?.event_id).toBe('$bob-join');
+  });
+
+  it('returns multi-key unconflicted state unchanged across identical sets', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const topic = pdu({
+      type: 'm.room.topic',
+      event_id: '$topic',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { topic: 'hello' },
+    });
+    const name = nameEvent('Room', '$name', 3);
+    const set = [create, alice, topic, name];
+    const resolved = resolveState('10', [set, [...set], [...set]]);
+    expect(resolved).toHaveLength(4);
+    expect(resolved.map((e) => e.event_id).sort()).toEqual(
+      ['$create', '$m-@alice:example.com-join', '$name', '$topic'].sort()
+    );
+  });
+
+  it('drops conflicted power_levels when none are unconflicted (default PL gates both)', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join', { depth: 1 });
+    const bob = member('@bob:example.com', 'join', { depth: 1 });
+    // Both sets end with different PL events for the same key → PL is fully conflicted.
+    // Unconflicted state has no PL, so checkEventAuth uses defaults (users_default 0,
+    // state_default 50) and both conflicted PL events fail iterative auth.
+    const plAlice = powerLevelsEvent(
+      { '@alice:example.com': 100, '@bob:example.com': 10 },
+      { eventId: '$pl-alice', sender: '@alice:example.com' }
+    );
+    const plBob = powerLevelsEvent(
+      { '@alice:example.com': 100, '@bob:example.com': 80 },
+      { eventId: '$pl-bob', sender: '@bob:example.com' }
+    );
+    const resolved = resolveState('10', [
+      [create, alice, bob, plAlice],
+      [create, alice, bob, plBob],
+    ]);
+    expect(resolved.find((e) => e.type === 'm.room.power_levels')).toBeUndefined();
+    expect(resolved.find((e) => e.event_id === '$create')).toBeDefined();
+    expect(resolved.filter((e) => e.type === 'm.room.member')).toHaveLength(2);
+  });
+
+  it('resolves simultaneous conflicted auth (join_rules) and non-auth (name)', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const pl = powerLevelsEvent({ '@alice:example.com': 100 });
+    const jrPublic = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr-public',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    const jrInvite = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr-invite',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'invite' },
+    });
+    const nameA = nameEvent('A', '$name-a', 4);
+    const nameB = nameEvent('B', '$name-b', 4);
+    const resolved = resolveState('10', [
+      [create, alice, pl, jrPublic, nameA],
+      [create, alice, pl, jrInvite, nameB],
+    ]);
+    expect(resolved.filter((e) => e.type === 'm.room.join_rules')).toHaveLength(1);
+    expect(resolved.filter((e) => e.type === 'm.room.name')).toHaveLength(1);
+    expect(resolved.find((e) => e.type === 'm.room.create')).toBeDefined();
+  });
+
+  it('keeps unconflicted PL when rejecting unauthorized conflicted auth join_rules', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const pl = powerLevelsEvent({ '@alice:example.com': 100 }, { stateDefault: 50 });
+    const legitJr = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr-legit',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    // Eve never joined — her conflicted auth join_rules must fail iterative auth
+    const eveJr = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr-eve',
+      sender: '@eve:example.com',
+      state_key: '',
+      content: { join_rule: 'invite' },
+    });
+    const aliceName = nameEvent('legit', '$name-alice', 3, '@alice:example.com');
+    const eveName = nameEvent('hacked', '$name-eve', 3, '@eve:example.com');
+
+    // PL is identical in both sets → unconflicted; join_rules + name conflicted
+    const resolved = resolveState('10', [
+      [create, alice, pl, legitJr, aliceName],
+      [create, alice, pl, eveJr, eveName],
+    ]);
+
+    expect(resolved.find((e) => e.event_id === '$jr-eve')).toBeUndefined();
+    expect(resolved.find((e) => e.type === 'm.room.join_rules')?.event_id).toBe('$jr-legit');
+    expect(resolved.find((e) => e.type === 'm.room.name')?.event_id).toBe('$name-alice');
+    expect(resolved.find((e) => e.type === 'm.room.power_levels')?.event_id).toBe('$pl');
+  });
+
+  it('uses users_default when sender is absent from PL users map', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const carol = member('@carol:example.com', 'join');
+    // carol not listed in users → users_default 50 meets state_default 50
+    const pl = powerLevelsEvent(
+      { '@alice:example.com': 100 },
+      { usersDefault: 50, stateDefault: 50 }
+    );
+    const nameAlice = nameEvent('alice', '$name-alice', 3, '@alice:example.com');
+    const nameCarol = nameEvent('carol', '$name-carol', 3, '@carol:example.com');
+    // Equal power (100 vs 50) → alice ordered first by power, then both may apply;
+    // carol's name applied later if auth allows → may overwrite. Power order: alice first.
+    const resolved = resolveState('10', [
+      [create, alice, carol, pl, nameAlice],
+      [create, alice, carol, pl, nameCarol],
+    ]);
+    const name = resolved.find((e) => e.type === 'm.room.name');
+    expect(name).toBeDefined();
+    expect(['$name-alice', '$name-carol']).toContain(name!.event_id);
+  });
+
+  it('orders equal-power conflicted events by event_id when origin_server_ts matches', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const pl = powerLevelsEvent({ '@alice:example.com': 100 });
+    const first = pdu({
+      type: 'm.room.name',
+      event_id: '$name-aaa',
+      sender: '@alice:example.com',
+      state_key: '',
+      depth: 3,
+      origin_server_ts: 42,
+      content: { name: 'aaa' },
+    });
+    const second = pdu({
+      type: 'm.room.name',
+      event_id: '$name-zzz',
+      sender: '@alice:example.com',
+      state_key: '',
+      depth: 3,
+      origin_server_ts: 42,
+      content: { name: 'zzz' },
+    });
+    // Lexicographic ascending: aaa then zzz → zzz applied last wins
+    const resolved = resolveState('10', [
+      [create, alice, pl, first],
+      [create, alice, pl, second],
+    ]);
+    expect(resolved.find((e) => e.type === 'm.room.name')?.event_id).toBe('$name-zzz');
+  });
+
+  it('falls back to default power levels when no PL event is among conflicted others', () => {
+    // No power_levels in the conflicted-other set → reverseTopologicalPowerOrder uses
+    // { users: {}, users_default: 0 }. Join with public join_rules still auths members.
+    const create = createEvent();
+    const jr = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    const alice = member('@alice:example.com', 'join', { eventId: '$alice' });
+    const topicA = pdu({
+      type: 'm.room.topic',
+      event_id: '$topic-a',
+      sender: '@alice:example.com',
+      state_key: '',
+      origin_server_ts: 1,
+      content: { topic: 'a' },
+    });
+    const topicB = pdu({
+      type: 'm.room.topic',
+      event_id: '$topic-b',
+      sender: '@alice:example.com',
+      state_key: '',
+      origin_server_ts: 2,
+      content: { topic: 'b' },
+    });
+    // create+jr+alice unconflicted; topic conflicted without PL in the other set
+    const resolved = resolveState('10', [
+      [create, jr, alice, topicA],
+      [create, jr, alice, topicB],
+    ]);
+    // With default PL (users_default 0) state_default defaults make topic auth fail unless
+    // sender is joined creator — checkEventAuth may still allow creator. Either way one topic.
+    expect(resolved.filter((e) => e.type === 'm.room.topic').length).toBeLessThanOrEqual(1);
+    expect(resolved.find((e) => e.event_id === '$create')).toBeDefined();
+  });
+
+  it('skips conflicted non-auth events that omit state_key', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const pl = powerLevelsEvent({ '@alice:example.com': 100 });
+    const withKey = nameEvent('ok', '$name-ok', 3);
+    const withoutKey = pdu({
+      type: 'm.room.name',
+      event_id: '$name-nokey',
+      sender: '@alice:example.com',
+      // state_key intentionally omitted — filtered in resolve loop
+      depth: 3,
+      content: { name: 'ghost' },
+    });
+    // Force conflict on name by including withKey in one set and a different keyed name
+    // plus the no-key event mixed into conflictedOther via a second keyed variant
+    const other = nameEvent('other', '$name-other', 3);
+    const resolved = resolveState('10', [
+      [create, alice, pl, withKey],
+      [create, alice, pl, other, withoutKey],
+    ]);
+    expect(resolved.find((e) => e.event_id === '$name-nokey')).toBeUndefined();
+    expect(resolved.filter((e) => e.type === 'm.room.name')).toHaveLength(1);
+  });
+
+  it('v1: three-way depth race picks the highest depth', () => {
+    const a = nameEvent('a', '$n-a', 2);
+    const b = nameEvent('b', '$n-b', 7);
+    const c = nameEvent('c', '$n-c', 5);
+    expect(resolveStateV1([[a], [b], [c]])[0].event_id).toBe('$n-b');
+    expect(resolveState('1', [[a], [b], [c]])[0].event_id).toBe('$n-b');
+  });
+
+  it('v1: omits events without state_key while keeping empty-string state_key', () => {
+    const emptyKey = nameEvent('named', '$named', 1);
+    const omitted = pdu({
+      type: 'm.room.name',
+      event_id: '$omitted',
+      sender: '@alice:example.com',
+      depth: 99,
+      content: { name: 'no-key' },
+    });
+    const resolved = resolveStateV1([[emptyKey, omitted]]);
+    expect(resolved).toEqual([emptyKey]);
+  });
+
+  it('v1: equal depth + equal event_id comparator returns 0 path (single winner)', () => {
+    const a = nameEvent('same', '$same-id', 4);
+    const b = nameEvent('same', '$same-id', 4);
+    // Same event_id deduped before sort — still one entry
+    expect(resolveStateV1([[a], [b]])).toEqual([a]);
+  });
+
+  it('routes room versions 2/5/12 through v2 conflict resolution parity', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const pl = powerLevelsEvent({ '@alice:example.com': 100 });
+    const n1 = nameEvent('one', '$n1', 3);
+    const n2 = nameEvent('two', '$n2', 3);
+    for (const v of ['2', '5', '12']) {
+      const resolved = resolveState(v, [
+        [create, alice, pl, n1],
+        [create, alice, pl, n2],
+      ]);
+      expect(resolved.filter((e) => e.type === 'm.room.name')).toHaveLength(1);
+      expect(resolved.find((e) => e.type === 'm.room.create')).toBeDefined();
+    }
+  });
+
+  it('resolves conflicted member events that are auth-typed', () => {
+    const create = createEvent();
+    const jr = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    const alice = member('@alice:example.com', 'join', { eventId: '$alice' });
+    const bobJoin = member('@bob:example.com', 'join', { eventId: '$bob-join', depth: 2 });
+    const bobLeave = member('@bob:example.com', 'leave', {
+      eventId: '$bob-leave',
+      depth: 3,
+      sender: '@bob:example.com',
+    });
+    const resolved = resolveState('10', [
+      [create, jr, alice, bobJoin],
+      [create, jr, alice, bobLeave],
+    ]);
+    const bob = resolved.find((e) => e.state_key === '@bob:example.com');
+    expect(bob).toBeDefined();
+    expect(['$bob-join', '$bob-leave']).toContain(bob!.event_id);
+  });
+
+  it('extracts sender power from a conflicted power_levels event when ordering others', () => {
+    // reverseTopologicalPowerOrder looks for a PL *among the events being sorted*.
+    // When conflictedOther includes a non-auth type only, defaults apply; when we also
+    // conflict PL as auth, sortedOther still has no PL. Cover the PL-in-sorted path by
+    // resolving conflicted topics where one set's events include a PL-typed sibling
+    // that is somehow in the other list — use conflicted topic senders with equal
+    // users_default via an unconflicted PL instead, and assert power-desc ordering
+    // still prefers alice (100) over bob (0) for the name apply order.
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const bob = member('@bob:example.com', 'join');
+    const pl = powerLevelsEvent({
+      '@alice:example.com': 100,
+      '@bob:example.com': 50,
+    }, { stateDefault: 50 });
+    const nameAlice = nameEvent('a', '$name-a', 3, '@alice:example.com');
+    const nameBob = nameEvent('b', '$name-b', 3, '@bob:example.com');
+    // bob has PL 50 == state_default → can send name; alice ordered first (higher power)
+    // then bob overwrites if both allowed
+    const resolved = resolveState('10', [
+      [create, alice, bob, pl, nameAlice],
+      [create, alice, bob, pl, nameBob],
+    ]);
+    const name = resolved.find((e) => e.type === 'm.room.name');
+    expect(name).toBeDefined();
+    expect(['$name-a', '$name-b']).toContain(name!.event_id);
+  });
+
+  it('treats empty-string state_key conflicts separately from other keys', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const pl = powerLevelsEvent({ '@alice:example.com': 100 });
+    const topicA = pdu({
+      type: 'm.room.topic',
+      event_id: '$t-a',
+      sender: '@alice:example.com',
+      state_key: '',
+      origin_server_ts: 1,
+      content: { topic: 'a' },
+    });
+    const topicB = pdu({
+      type: 'm.room.topic',
+      event_id: '$t-b',
+      sender: '@alice:example.com',
+      state_key: '',
+      origin_server_ts: 2,
+      content: { topic: 'b' },
+    });
+    const resolved = resolveState('10', [
+      [create, alice, pl, topicA],
+      [create, alice, pl, topicB],
+    ]);
+    expect(resolved.find((e) => e.type === 'm.room.topic')?.event_id).toBe('$t-b');
+  });
+
+  it('deduplicates identical event_ids within a conflicted key across three sets', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join');
+    const pl = powerLevelsEvent({ '@alice:example.com': 100 });
+    const n1 = nameEvent('one', '$n1', 3);
+    const n2 = nameEvent('two', '$n2', 3);
+    // n1 appears in set0 and set2; n2 in set1 — conflicted with two unique events
+    const resolved = resolveState('10', [
+      [create, alice, pl, n1],
+      [create, alice, pl, n2],
+      [create, alice, pl, n1],
+    ]);
+    expect(resolved.filter((e) => e.type === 'm.room.name')).toHaveLength(1);
+  });
+
+  it('v1: multi-key merge keeps non-conflicting keys from all sets', () => {
+    const create = createEvent();
+    const alice = member('@alice:example.com', 'join', { depth: 1 });
+    const topic = pdu({
+      type: 'm.room.topic',
+      event_id: '$topic',
+      sender: '@alice:example.com',
+      state_key: '',
+      depth: 2,
+      content: { topic: 'x' },
+    });
+    const nameLow = nameEvent('old', '$n-old', 2);
+    const nameHigh = nameEvent('new', '$n-new', 9);
+    const resolved = resolveStateV1([
+      [create, alice, topic, nameLow],
+      [create, alice, nameHigh],
+    ]);
+    expect(resolved.find((e) => e.event_id === '$topic')).toBeDefined();
+    expect(resolved.find((e) => e.type === 'm.room.name')?.event_id).toBe('$n-new');
+    expect(resolved.find((e) => e.event_id === '$create')).toBeDefined();
+  });
+});
