@@ -184,3 +184,21 @@ describe('parseAuthHeader duplicate quoted params', () => {
     });
   });
 });
+
+
+describe('parseAuthHeader TOKENMAXX edge paths after #49', () => {
+  it('ignores wrong-cased param keys (exact origin/key/sig required)', () => {
+    expect(
+      parseAuthHeader('X-Matrix Origin="a",key="k",sig="s"')
+    ).toBeNull();
+    expect(
+      parseAuthHeader('X-Matrix origin="a",Key="k",sig="s"')
+    ).toBeNull();
+  });
+
+  it('returns null for incomplete required-field matrices', () => {
+    expect(parseAuthHeader('X-Matrix sig="s"')).toBeNull();
+    expect(parseAuthHeader('X-Matrix origin="a",sig="s"')).toBeNull();
+    expect(parseAuthHeader('X-Matrix key="k"')).toBeNull();
+  });
+});

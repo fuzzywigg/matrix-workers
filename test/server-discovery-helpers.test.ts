@@ -128,3 +128,14 @@ describe('selectSRVRecord single zero-weight peer', () => {
     expect(selectSRVRecord([only]).target).toBe('solo.example.com');
   });
 });
+
+
+describe('server-discovery TOKENMAXX edge paths after #49', () => {
+  it('selects the first peer when random hits the exact weight boundary of zero', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const a: SRVRecord = { priority: 0, weight: 10, port: 8448, target: 'a.example.com' };
+    const b: SRVRecord = { priority: 0, weight: 90, port: 8448, target: 'b.example.com' };
+    // total=100, random=0 → random*total=0; first peer with weight>0 when random<=0
+    expect(selectSRVRecord([a, b]).target).toBe('a.example.com');
+  });
+});

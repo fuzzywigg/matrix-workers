@@ -305,3 +305,54 @@ describe('matchesCondition escaped property keys', () => {
     ).toBe(true);
   });
 });
+
+
+describe('push rules TOKENMAXX edge paths after #49', () => {
+  it('treats empty conditions arrays as vacuously matching', () => {
+    const rule: PushRule = {
+      rule_id: 'empty-conds',
+      default: false,
+      enabled: true,
+      conditions: [],
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, message, userId, 2)).toBe(true);
+  });
+
+  it('rejects event_property_contains without a key', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', value: userId },
+        message,
+        userId,
+        2
+      )
+    ).toBe(false);
+  });
+
+  it('escapes literal dots in content patterns but still expands * globs', () => {
+    const ruleDot: PushRule = {
+      rule_id: 'dot',
+      default: false,
+      enabled: true,
+      pattern: 'hello.',
+      actions: ['notify'],
+    };
+    expect(matchesRule(ruleDot, { content: { body: 'helloX' } }, userId, 2)).toBe(false);
+    expect(matchesRule(ruleDot, { content: { body: 'hello.' } }, userId, 2)).toBe(true);
+
+    const ruleGlob: PushRule = {
+      rule_id: 'glob',
+      default: false,
+      enabled: true,
+      pattern: 'hel*o',
+      actions: ['notify'],
+    };
+    expect(matchesRule(ruleGlob, { content: { body: 'hello' } }, userId, 2)).toBe(true);
+  });
+
+  it('returns the root object for an empty getNestedValue path', () => {
+    expect(getNestedValue(message, '')).toBe(message['']);
+    expect(getNestedValue({ a: { b: 1 } }, 'a.missing.x')).toBeUndefined();
+  });
+});

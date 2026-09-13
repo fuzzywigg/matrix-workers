@@ -221,3 +221,10 @@ describe('resolveState routing', () => {
     }
   });
 });
+
+
+describe('resolveState TOKENMAXX edge paths after #49', () => {
+  it('returns an empty array for empty v2 stateSets', () => {
+    expect(resolveState('10', [])).toEqual([]);
+  });
+});

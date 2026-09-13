@@ -142,3 +142,16 @@ describe('crypto failure / boundary edges', () => {
     expect(await verifyContentHash({ ...a, type: 'm.room.member' }, hash)).toBe(false);
   });
 });
+
+
+describe('crypto TOKENMAXX edge paths after #49', () => {
+  it('rejects empty and overlong passwords', () => {
+    expect(validatePasswordStrength('')).toMatch(/at least 8/);
+    expect(validatePasswordStrength('a1' + 'x'.repeat(999))).toMatch(/at most 1000/);
+    expect(validatePasswordStrength('a1' + 'x'.repeat(998))).toBeNull(); // length 1000
+  });
+
+  it('encodes undefined as null in canonicalJson', () => {
+    expect(canonicalJson(undefined)).toBe('null');
+  });
+});

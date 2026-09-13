@@ -205,3 +205,41 @@ describe('validateRemoteJoinTemplate', () => {
     ).toThrow(/membership/);
   });
 });
+
+
+describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #49', () => {
+  it('rejects array content (typeof object) without membership join', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ content: [] }), roomId, userId)
+    ).toThrow(/membership/);
+  });
+
+  it('rejects empty-string membership', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ content: { membership: '' } }),
+        roomId,
+        userId
+      )
+    ).toThrow(/membership/);
+  });
+
+  it('rejects empty-string state_key when provided', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ state_key: '' }), roomId, userId)
+    ).toThrow(/state_key mismatch/);
+  });
+
+  it('accepts event IDs using the full EVENT_ID_REGEX charset', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({
+          auth_events: ['$a+b/c=d_e-f'],
+          prev_events: ['$A1B2C3:matrix.example.com'],
+        }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+});

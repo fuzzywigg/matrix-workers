@@ -120,3 +120,10 @@ describe('isKeyTooStale / resolveMaxStalenessMs boundary edges', () => {
     expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: ' 5000' })).toBe(5000);
   });
 });
+
+
+describe('federation-keys TOKENMAXX edge paths after #49', () => {
+  it('treats NaN valid_until as not stale (!validUntil)', () => {
+    expect(isKeyTooStale(Number.NaN, 1_700_000_000_000, 1_000)).toBe(false);
+  });
+});

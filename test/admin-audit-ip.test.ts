@@ -62,3 +62,26 @@ describe('getActorIp', () => {
     ).toBeNull();
   });
 });
+
+
+describe('getActorIp TOKENMAXX edge paths after #49', () => {
+  it('requires exact lowercase true for TRUST_FORWARDED_FOR', () => {
+    expect(
+      getActorIp(makeContext({ 'X-Forwarded-For': '198.51.100.1' }, { TRUST_FORWARDED_FOR: 'TRUE' }))
+    ).toBeNull();
+    expect(
+      getActorIp(makeContext({ 'X-Forwarded-For': '198.51.100.1' }, { TRUST_FORWARDED_FOR: '1' }))
+    ).toBeNull();
+  });
+
+  it('falls through blank CF-Connecting-IP to trusted XFF', () => {
+    expect(
+      getActorIp(
+        makeContext(
+          { 'CF-Connecting-IP': '', 'X-Forwarded-For': '198.51.100.7' },
+          { TRUST_FORWARDED_FOR: 'true' }
+        )
+      )
+    ).toBe('198.51.100.7');
+  });
+});

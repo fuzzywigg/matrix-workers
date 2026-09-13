@@ -193,3 +193,20 @@ describe('appservice interest failure edges', () => {
     ).toEqual([]);
   });
 });
+
+
+describe('appservice TOKENMAXX edge paths after #49', () => {
+  it('returns the first exclusive user registration when multiple match', () => {
+    const first = registration('first', {
+      users: [{ exclusive: true, regex: '^@_shared_.*:example\\.com$' }],
+      rooms: [],
+      aliases: [],
+    });
+    const second = registration('second', {
+      users: [{ exclusive: true, regex: '^@_shared_.*:example\\.com$' }],
+      rooms: [],
+      aliases: [],
+    });
+    expect(isExclusiveAppServiceUser([first, second], '@_shared_bot:example.com')).toBe(first);
+  });
+});

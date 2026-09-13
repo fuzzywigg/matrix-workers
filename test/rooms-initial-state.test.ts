@@ -125,3 +125,11 @@ describe('validateStateEvent', () => {
     ).toBe(true);
   });
 });
+
+
+describe('validateStateEvent TOKENMAXX edge paths after #49', () => {
+  it('rejects empty-string types and null content', () => {
+    expect(validateStateEvent({ type: '', content: {} }, 0).valid).toBe(false);
+    expect(validateStateEvent({ type: 'm.room.name', content: null }, 1).error).toMatch(/content/);
+  });
+});

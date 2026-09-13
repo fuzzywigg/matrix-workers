@@ -56,3 +56,13 @@ describe('isModernRoomVersion', () => {
     expect(isModernRoomVersion('3foo')).toBe(true);
   });
 });
+
+
+describe('isModernRoomVersion TOKENMAXX edge paths after #49', () => {
+  it('skips leading whitespace via parseInt before comparing to 3', () => {
+    expect(isModernRoomVersion(' 3')).toBe(true);
+    // parseInt('\t2', 10) === 2 → legacy
+    expect(isModernRoomVersion('\t2')).toBe(false);
+    expect(isModernRoomVersion('  10')).toBe(true);
+  });
+});

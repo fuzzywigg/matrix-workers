@@ -269,3 +269,35 @@ describe('detectNSERequest timeline and extension edges', () => {
     expect(detectNSERequest('NSE/1.0', {}).indicators).toContain('user-agent-nse');
   });
 });
+
+
+describe('sliding-sync TOKENMAXX edge paths after #49', () => {
+  it('treats empty room_name_like as unset (falsy guard)', () => {
+    // filters?.room_name_like && name — '' is falsy, so the includes check is skipped
+    expect(matchesSlidingRoomFilters('Matrix HQ', false, { room_name_like: '' })).toBe(true);
+  });
+
+  it('falls through empty ranges to the full list when preferRangesFirst is false', () => {
+    expect(resolveListRange({ ranges: [] }, 5, false)).toEqual({
+      startIndex: 0,
+      endIndex: 4,
+    });
+  });
+
+  it('does not clamp negative range starts (documents current behavior)', () => {
+    expect(resolveListRange({ range: [-1, 2] }, 5)).toEqual({
+      startIndex: -1,
+      endIndex: 2,
+    });
+  });
+
+  it('does not flag single-room-subscription when two rooms are subscribed', () => {
+    const result = detectNSERequest(undefined, {
+      room_subscriptions: {
+        '!a:example.com': { timeline_limit: 10 },
+        '!b:example.com': { timeline_limit: 10 },
+      },
+    });
+    expect(result.indicators).not.toContain('single-room-subscription');
+  });
+});
