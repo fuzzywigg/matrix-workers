@@ -367,3 +367,163 @@ describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #55', () => {
     ).toThrow(/event ID/);
   });
 });
+
+describe('validateRemoteJoinTemplate TOKENMAXX leftovers after #81 (remote join)', () => {
+  it('snapshots SUPPORTED_ROOM_VERSIONS membership for Matrix Spec v1.17', () => {
+    expect([...SUPPORTED_ROOM_VERSIONS].sort((a, b) => Number(a) - Number(b))).toEqual([
+      '1',
+      '2',
+      '3',
+      '4',
+      '5',
+      '6',
+      '7',
+      '8',
+      '9',
+      '10',
+      '11',
+      '12',
+    ]);
+  });
+
+  it('accepts join content with extra non-membership fields', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({
+          content: { membership: 'join', displayname: 'Alice', avatar_url: 'mxc://ex/a' },
+        }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+
+  it('accepts opaque event IDs with base64url alphabet (+ / = _ - .)', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({
+          auth_events: ['$abc+/=_-.XYZ'],
+          prev_events: ['$Zz9._-+=/'],
+        }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+
+  it('rejects auth_events IDs that omit the leading $', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ auth_events: ['auth1:example.com'], prev_events: ['$prev1'] }),
+        roomId,
+        userId
+      )
+    ).toThrow(/invalid event ID/);
+  });
+
+  it('rejects prev_events containing an empty string mid-list', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ auth_events: ['$ok'], prev_events: ['$prev1', ''] }),
+        roomId,
+        userId
+      )
+    ).toThrow(/invalid event ID/);
+  });
+
+  it('rejects room_version null and boolean via unsupported path', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        { room_version: null, event: validTemplate().event },
+        roomId,
+        userId
+      )
+    ).toThrow(/unsupported room_version/);
+    expect(() =>
+      validateRemoteJoinTemplate(
+        { room_version: true as unknown as string, event: validTemplate().event },
+        roomId,
+        userId
+      )
+    ).toThrow(/unsupported room_version/);
+  });
+
+  it('rejects content that is a non-null primitive (string)', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ content: 'join' as unknown as { membership: string } }),
+        roomId,
+        userId
+      )
+    ).toThrow(/membership/);
+  });
+
+  it('rejects depth -0 the same as 0 (relational compare treats -0 as 0)', () => {
+    // Number.isInteger(-0) is true; -0 < 1 is true → rejected like depth 0
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: -0 }), roomId, userId)
+    ).toThrow(/depth/);
+  });
+
+  it('rejects depth Number.MIN_SAFE_INTEGER', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ depth: Number.MIN_SAFE_INTEGER }),
+        roomId,
+        userId
+      )
+    ).toThrow(/depth/);
+  });
+
+  it('accepts omitted room_id/sender/state_key/type together', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({
+          room_id: undefined,
+          sender: undefined,
+          state_key: undefined,
+          type: undefined,
+        }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+
+  it('rejects state_key spoof when sender matches', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ sender: userId, state_key: '@eve:example.com' }),
+        roomId,
+        userId
+      )
+    ).toThrow(/state_key mismatch/);
+  });
+
+  it('interpolates got room_version into the unsupported error string', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        { room_version: '13', event: validTemplate().event },
+        roomId,
+        userId
+      )
+    ).toThrow(/unsupported room_version 13/);
+  });
+
+  it('rejects auth_events that are empty after a valid-looking first check short-circuit', () => {
+    // empty array already covered; ensure sparse-looking list with only undefined fails
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ auth_events: [undefined as unknown as string], prev_events: ['$p'] }),
+        roomId,
+        userId
+      )
+    ).toThrow(/invalid event ID/);
+  });
+
+  it('rejects type m.room.member with trailing whitespace', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ type: 'm.room.member ' }), roomId, userId)
+    ).toThrow(/m.room.member/);
+  });
+});
