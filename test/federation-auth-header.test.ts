@@ -279,3 +279,33 @@ describe('parseAuthHeader TOKENMAXX edge paths after #55', () => {
     ).toBeNull();
   });
 });
+
+
+describe('buildSignedRequest TOKENMAXX edge paths after #82', () => {
+  it('includes empty-object content ({} is neither undefined nor null)', () => {
+    expect(buildSignedRequest('POST', '/send/1', 'a', 'b', {})).toEqual({
+      method: 'POST',
+      uri: '/send/1',
+      origin: 'a',
+      destination: 'b',
+      content: {},
+    });
+  });
+
+  it('includes numeric and boolean content as-is', () => {
+    expect(buildSignedRequest('POST', '/p', 'a', 'b', 42).content).toBe(42);
+    expect(buildSignedRequest('POST', '/p', 'a', 'b', true).content).toBe(true);
+  });
+
+  it('preserves method case and uri exactly', () => {
+    expect(
+      buildSignedRequest('PoSt', '/_matrix/Federation/v1/send/T?x=1', 'o', 'd', { a: 1 })
+    ).toEqual({
+      method: 'PoSt',
+      uri: '/_matrix/Federation/v1/send/T?x=1',
+      origin: 'o',
+      destination: 'd',
+      content: { a: 1 },
+    });
+  });
+});

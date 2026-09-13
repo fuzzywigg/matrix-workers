@@ -133,8 +133,8 @@ app.get('/_matrix/client/v1/rooms/:roomId/hierarchy', requireAuth(), async (c) =
   });
 });
 
-// Helper function to get room info
-async function getRoomInfo(
+/** Exported for unit tests. */
+export async function getRoomInfo(
   db: D1Database,
   roomId: string,
   _serverName: string
