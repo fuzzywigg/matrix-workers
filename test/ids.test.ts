@@ -265,3 +265,42 @@ describe('ids TOKENMAXX edge paths after #50', () => {
     });
   });
 });
+
+
+describe('ids TOKENMAXX edge paths after #52', () => {
+  it('accepts localhost / private IPs / single-label hosts (no SSRF — contrast federation)', () => {
+    expect(isValidServerName('localhost')).toBe(true);
+    expect(isValidServerName('10.0.0.1')).toBe(true);
+    expect(isValidServerName('matrix')).toBe(true);
+  });
+
+  it('rejects trailing-hyphen labels and underscore hosts', () => {
+    expect(isValidServerName('bad-.example.com')).toBe(false);
+    expect(isValidServerName('-bad.example.com')).toBe(false);
+    expect(isValidServerName('bad_host.example.com')).toBe(false);
+  });
+
+  it('parses room aliases whose server name includes a port', () => {
+    expect(parseRoomAlias('#a:host:8448' as '#a:host')).toEqual({
+      localpart: 'a',
+      serverName: 'host:8448',
+    });
+  });
+
+  it('round-trips empty Uint8Array and empty string through base64url', () => {
+    expect(base64UrlEncode(new Uint8Array())).toBe('');
+    expect(Array.from(base64UrlDecode(''))).toEqual([]);
+  });
+
+  it('defaults generateOpaqueId to ~24 chars for 18 random bytes', async () => {
+    const id = await generateOpaqueId();
+    expect(id.length).toBeGreaterThanOrEqual(20);
+    expect(id.length).toBeLessThanOrEqual(28);
+    expect(id).not.toMatch(/[+/=]/);
+  });
+
+  it('treats empty local server names as equal under isLocalServerName', () => {
+    expect(isLocalServerName('', '')).toBe(true);
+    expect(isLocalServerName('', 'example.com')).toBe(false);
+  });
+});

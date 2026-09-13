@@ -229,3 +229,15 @@ describe('sync filters TOKENMAXX edge paths after #50', () => {
     expect(buildSyncToken(-1, -2)).toBe('s-1_td-2');
   });
 });
+
+
+describe('sync filters TOKENMAXX edge paths after #52', () => {
+  it('treats types: ["*"] as a prefix-empty wildcard matching all types', () => {
+    expect(applyEventFilter(events, { types: ['*'] })).toEqual(events);
+  });
+
+  it('treats empty not_types and not_senders as unrestricted', () => {
+    expect(applyEventFilter(events, { not_types: [] })).toEqual(events);
+    expect(applyEventFilter(events, { not_senders: [] })).toEqual(events);
+  });
+});

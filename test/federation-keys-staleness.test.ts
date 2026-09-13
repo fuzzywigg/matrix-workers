@@ -139,3 +139,21 @@ describe('federation-keys TOKENMAXX edge paths after #50', () => {
     );
   });
 });
+
+
+describe('federation-keys TOKENMAXX edge paths after #52', () => {
+  it('parses trailing non-numeric suffixes via parseInt (3600abc → 3600)', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '3600abc' })).toBe(3600);
+  });
+
+  it('falls back to default for -Infinity env string', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '-Infinity' })).toBe(
+      DEFAULT_KEY_MAX_STALENESS_MS
+    );
+  });
+
+  it('treats explicit negative maxStalenessMs with past valid_until as stale', () => {
+    // now - validUntil = 100; 100 > -1 → stale
+    expect(isKeyTooStale(900, 1000, -1)).toBe(true);
+  });
+});

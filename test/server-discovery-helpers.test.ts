@@ -159,3 +159,37 @@ describe('server-discovery TOKENMAXX edge paths after #50', () => {
     expect(selectSRVRecord([a, b]).target).toBe('a.example.com');
   });
 });
+
+
+describe('server-discovery TOKENMAXX edge paths after #52', () => {
+  it('throws when selectSRVRecord receives an empty list (fail-closed)', () => {
+    expect(() => selectSRVRecord([])).toThrow();
+  });
+
+  it('can still select a leading zero-weight peer when random depletes immediately', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const zero: SRVRecord = { priority: 0, weight: 0, port: 8448, target: 'zero.example.com' };
+    const heavy: SRVRecord = { priority: 0, weight: 10, port: 8448, target: 'heavy.example.com' };
+    // total=10, random=0; first peer: random -= 0 → 0 <= 0 → returns zero
+    expect(selectSRVRecord([zero, heavy]).target).toBe('zero.example.com');
+  });
+
+  it('reaches a later nonzero-weight peer when random stays positive past zero-weight', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const zero: SRVRecord = { priority: 0, weight: 0, port: 8448, target: 'zero.example.com' };
+    const heavy: SRVRecord = { priority: 0, weight: 10, port: 8448, target: 'heavy.example.com' };
+    // total=10, random=5; zero subtracts 0; heavy subtracts 10 → selected
+    expect(selectSRVRecord([zero, heavy]).target).toBe('heavy.example.com');
+  });
+
+  it('treats leading-zero IPv4 octets as literals and rejects trailing-dot forms', () => {
+    expect(isIPLiteral('01.02.03.04')).toBe(true);
+    expect(isIPLiteral('1.2.3.4.')).toBe(false);
+  });
+
+  it('includes non-443 numeric ports verbatim in buildServerUrl', () => {
+    expect(buildServerUrl({ host: 'example.com', port: 8448, tlsHostname: 'example.com' })).toBe(
+      'https://example.com:8448'
+    );
+  });
+});

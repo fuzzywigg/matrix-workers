@@ -416,3 +416,62 @@ describe('push-rules TOKENMAXX edge paths after #50', () => {
     expect(getNestedValue({ a: undefined }, 'a.b')).toBeUndefined();
   });
 });
+
+
+describe('push-rules TOKENMAXX edge paths after #52', () => {
+  it('matches event_match and content patterns of lone * against anything', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_match', key: 'type', pattern: '*' },
+        message,
+        userId,
+        2
+      )
+    ).toBe(true);
+    const rule: PushRule = {
+      rule_id: 'star',
+      default: false,
+      enabled: true,
+      pattern: '*',
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, message, userId, 2)).toBe(true);
+  });
+
+  it('parses room_member_count ==02 with leading zeros as 2', () => {
+    expect(
+      matchesCondition({ kind: 'room_member_count', is: '==02' }, message, userId, 2)
+    ).toBe(true);
+    expect(
+      matchesCondition({ kind: 'room_member_count', is: '==02' }, message, userId, 3)
+    ).toBe(false);
+  });
+
+  it('coerces numeric event_match fields via String(value)', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_match', key: 'depth', pattern: '5' },
+        { ...message, depth: 5 },
+        userId,
+        2
+      )
+    ).toBe(true);
+  });
+
+  it('matches contains_display_name as a substring inside a longer token', () => {
+    expect(
+      matchesCondition(
+        { kind: 'contains_display_name' },
+        { content: { body: 'hello malice there' } },
+        userId,
+        2,
+        'alice'
+      )
+    ).toBe(true);
+  });
+
+  it('walks array indices via numeric getNestedValue path segments', () => {
+    expect(getNestedValue({ 0: { name: 'x' } }, '0.name')).toBe('x');
+    expect(getNestedValue([{ name: 'y' }], '0.name')).toBe('y');
+  });
+});

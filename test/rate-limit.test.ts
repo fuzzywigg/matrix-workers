@@ -287,3 +287,31 @@ describe('rate-limit TOKENMAXX edge paths after #50', () => {
     ).toBe('ip:198.51.100.1');
   });
 });
+
+
+describe('rate-limit TOKENMAXX edge paths after #52', () => {
+  it('pins exact RATE_LIMITS request counts and 60s windows', () => {
+    expect(RATE_LIMITS.login).toEqual({ requests: 10, windowMs: 60_000 });
+    expect(RATE_LIMITS.register).toEqual({ requests: 5, windowMs: 60_000 });
+    expect(RATE_LIMITS.default).toEqual({ requests: 100, windowMs: 60_000 });
+    expect(RATE_LIMITS.sync).toEqual({ requests: 300, windowMs: 60_000 });
+    expect(RATE_LIMITS.e2ee).toEqual({ requests: 500, windowMs: 60_000 });
+    expect(RATE_LIMITS.media_upload).toEqual({ requests: 30, windowMs: 60_000 });
+    expect(RATE_LIMITS.media_download).toEqual({ requests: 200, windowMs: 60_000 });
+    expect(RATE_LIMITS.search).toEqual({ requests: 30, windowMs: 60_000 });
+    expect(RATE_LIMITS.federation).toEqual({ requests: 500, windowMs: 60_000 });
+    expect(RATE_LIMITS.send_message).toEqual({ requests: 60, windowMs: 60_000 });
+    expect(RATE_LIMITS.create_room).toEqual({ requests: 10, windowMs: 60_000 });
+  });
+
+  it('classifies mid-path /login /register /search substrings (document traps)', () => {
+    expect(getRateLimitType('/_matrix/client/v3/profile/login', 'POST')).toBe('login');
+    expect(getRateLimitType('/_matrix/client/v3/users/register/foo', 'POST')).toBe('register');
+    expect(getRateLimitType('/_matrix/client/v3/rooms/!r:s/search', 'POST')).toBe('search');
+  });
+
+  it('classifies /_matrix/key/v2/query as federation', () => {
+    expect(getRateLimitType('/_matrix/key/v2/query', 'POST')).toBe('federation');
+    expect(getRateLimitType('/_matrix/key/v2/query', 'GET')).toBe('federation');
+  });
+});

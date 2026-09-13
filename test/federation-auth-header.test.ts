@@ -235,3 +235,35 @@ describe('parseAuthHeader / buildSignedRequest TOKENMAXX edge paths after #50', 
     });
   });
 });
+
+
+describe('parseAuthHeader / buildSignedRequest TOKENMAXX edge paths after #52', () => {
+  it('captures quoted-empty destination via the unquoted fallback as literal quotes', () => {
+    // Quoted regex requires [^"]+ so "" is skipped; unquoted then captures ""
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin="a.example.com",destination="",key="ed25519:k",sig="s"'
+      )
+    ).toEqual({
+      origin: 'a.example.com',
+      destination: '""',
+      key: 'ed25519:k',
+      sig: 's',
+    });
+  });
+
+  it('lets quoted destination win over a later unquoted duplicate', () => {
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin="a.example.com",destination="quoted.example.com",destination=unquoted.example.com,key="ed25519:k",sig="s"'
+      )?.destination
+    ).toBe('quoted.example.com');
+  });
+
+  it('preserves nested signatures field inside content by reference', () => {
+    const content = { signatures: { 'x': { 'ed25519:1': 's' } }, pdus: [] };
+    const req = buildSignedRequest('PUT', '/send/t', 'a', 'b', content);
+    expect(req.content).toBe(content);
+    expect((req.content as typeof content).signatures).toBe(content.signatures);
+  });
+});

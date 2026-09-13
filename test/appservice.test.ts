@@ -239,3 +239,40 @@ describe('appservice TOKENMAXX edge paths after #50', () => {
     expect(interested.map((r) => r.id)).toContain('bridge');
   });
 });
+
+
+describe('appservice TOKENMAXX edge paths after #52', () => {
+  it('matches state_key against user namespaces even when type is not m.room.member', () => {
+    const interested = getInterestedAppServices([bridge], {
+      room_id: '!plain:example.com',
+      sender: '@admin:example.com',
+      state_key: '@_bridge_ghost:example.com',
+      type: 'm.room.message',
+    });
+    expect(interested).toEqual([bridge]);
+  });
+
+  it('is interested via non-exclusive room namespaces', () => {
+    const softRoom = registration('softroom', {
+      users: [],
+      rooms: [{ exclusive: false, regex: '^!soft_.*:example\\.com$' }],
+      aliases: [],
+    });
+    expect(
+      getInterestedAppServices([softRoom], {
+        room_id: '!soft_portal:example.com',
+        sender: '@alice:example.com',
+        type: 'm.room.message',
+      })
+    ).toEqual([softRoom]);
+  });
+
+  it('throws when a namespace regex is invalid', () => {
+    const bad = registration('bad', {
+      users: [{ exclusive: true, regex: '[' }],
+      rooms: [],
+      aliases: [],
+    });
+    expect(() => isExclusiveAppServiceUser([bad], '@x:example.com')).toThrow();
+  });
+});

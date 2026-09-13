@@ -335,3 +335,31 @@ describe('sliding-sync TOKENMAXX edge paths after #50', () => {
     expect(result.isLikelyNSE).toBe(true);
   });
 });
+
+
+describe('sliding-sync TOKENMAXX edge paths after #52', () => {
+  it('does not swap inverted ranges (endIndex may be less than startIndex)', () => {
+    expect(resolveListRange({ range: [5, 1] }, 10)).toEqual({
+      startIndex: 5,
+      endIndex: 1,
+    });
+  });
+
+  it('honors is_dm: undefined as unset even when the property is present', () => {
+    expect(
+      matchesSlidingRoomFilters('Room', false, { is_dm: undefined })
+    ).toBe(true);
+    expect(
+      matchesSlidingRoomFilters('Room', true, { is_dm: undefined })
+    ).toBe(true);
+  });
+
+  it('treats room_name_like as includes() not RegExp (metachars are literal)', () => {
+    expect(
+      matchesSlidingRoomFilters('Room (hq)', false, { room_name_like: '(hq)' })
+    ).toBe(true);
+    expect(
+      matchesSlidingRoomFilters('Room hq', false, { room_name_like: 'h.q' })
+    ).toBe(false);
+  });
+});

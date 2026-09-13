@@ -242,3 +242,48 @@ describe('validateUrl TOKENMAXX edge paths after #50', () => {
     );
   });
 });
+
+
+describe('validateUrl TOKENMAXX edge paths after #52', () => {
+  it('documents that CGNAT 100.64/10 is currently allowed (not in BLOCKED_IPV4_RANGES)', () => {
+    expect(validateUrl('http://100.64.0.1/').valid).toBe(true);
+    expect(validateUrl('http://100.127.255.255/').valid).toBe(true);
+  });
+
+  it('rejects unique-local fd00/fd12 and remaining fe9–feb link-local IPv6', () => {
+    expect(validateUrl('http://[fd00::1]/').valid).toBe(false);
+    expect(validateUrl('http://[fd12::1]/').valid).toBe(false);
+    expect(validateUrl('http://[fe90::1]/').valid).toBe(false);
+    expect(validateUrl('http://[fea0::1]/').valid).toBe(false);
+    expect(validateUrl('http://[feb0::1]/').valid).toBe(false);
+  });
+
+  it('returns exact protocol / hostname / IP error strings', () => {
+    expect(validateUrl('ftp://example.com')).toEqual({
+      valid: false,
+      error: 'Only HTTP and HTTPS protocols are allowed',
+    });
+    expect(validateUrl('http://localhost/')).toEqual({
+      valid: false,
+      error: 'Access to internal hostnames is not allowed',
+    });
+    expect(validateUrl('http://10.0.0.1/')).toEqual({
+      valid: false,
+      error: 'Access to internal IP addresses is not allowed',
+    });
+  });
+
+  it('rejects kubernetes.default subdomains via suffix matching', () => {
+    expect(validateUrl('http://foo.kubernetes.default/').valid).toBe(false);
+    expect(validateUrl('http://a.b.kubernetes.default.svc/').valid).toBe(false);
+  });
+
+  it('allows preview ports 8080/8443 and rejects nearby 8000', () => {
+    expect(validateUrlForPreview('http://example.com:8080').valid).toBe(true);
+    expect(validateUrlForPreview('https://example.com:8443').valid).toBe(true);
+    expect(validateUrlForPreview('http://example.com:8000').valid).toBe(false);
+    expect(validateUrlForPreview('http://example.com:8000').error).toBe(
+      'Only standard HTTP ports (80, 443, 8080, 8443) are allowed for URL preview'
+    );
+  });
+});
