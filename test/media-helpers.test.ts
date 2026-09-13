@@ -7,6 +7,7 @@ import {
   parseBaseContentType,
   isSupportedContentType,
   clampThumbnailDimension,
+  resolveThumbnailFit,
   addMediaSecurityHeaders,
   extractOpenGraphPreview,
 } from '../src/api/media';
@@ -437,5 +438,16 @@ describe('media helpers TOKENMAXX edge paths after #52', () => {
     expect(
       extractOpenGraphPreview('<meta property="og:title" content="" />')['og:title']
     ).toBe('');
+  });
+});
+
+describe('resolveThumbnailFit TOKENMAXX edge paths after #53', () => {
+  it('maps crop to cover and everything else to contain', () => {
+    expect(resolveThumbnailFit('crop')).toBe('cover');
+    expect(resolveThumbnailFit('scale')).toBe('contain');
+    expect(resolveThumbnailFit(undefined)).toBe('contain');
+    expect(resolveThumbnailFit('')).toBe('contain');
+    expect(resolveThumbnailFit('garbage')).toBe('contain');
+    expect(resolveThumbnailFit('CROP')).toBe('contain'); // case-sensitive
   });
 });

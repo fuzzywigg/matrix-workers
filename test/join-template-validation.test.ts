@@ -285,3 +285,37 @@ describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #50', () => {
     ).toThrow(/not an object/);
   });
 });
+
+describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #53', () => {
+  it('rejects empty-string type (defined but not m.room.member)', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ type: '' }), roomId, userId)
+    ).toThrow(/m.room.member/);
+  });
+
+  it('rejects content objects missing membership', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ content: {} }), roomId, userId)
+    ).toThrow(/membership/);
+  });
+
+  it('rejects mixed null entries mid auth_events list', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ auth_events: ['$ok', null], prev_events: ['$prev1'] }),
+        roomId,
+        userId
+      )
+    ).toThrow(/event ID/);
+  });
+
+  it('rejects event IDs whose domain has underscore characters', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ auth_events: ['$id:bad_host'], prev_events: ['$prev1'] }),
+        roomId,
+        userId
+      )
+    ).toThrow(/event ID/);
+  });
+});

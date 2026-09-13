@@ -146,3 +146,10 @@ describe('isValidServerName TOKENMAXX edge paths after #52', () => {
     expect(isValidServerName('127.0.0.1')).toBe(false);
   });
 });
+
+describe('isValidServerName TOKENMAXX edge paths after #53', () => {
+  it('allows preview-style ports 8080/8443 that are not in the blockedPorts set', () => {
+    expect(isValidServerName('matrix.org:8080')).toBe(true);
+    expect(isValidServerName('matrix.org:8443')).toBe(true);
+  });
+});

@@ -276,3 +276,53 @@ describe('appservice TOKENMAXX edge paths after #52', () => {
     expect(() => isExclusiveAppServiceUser([bad], '@x:example.com')).toThrow();
   });
 });
+
+describe('appservice TOKENMAXX edge paths after #53', () => {
+  it('throws when an alias namespace regex is invalid', () => {
+    const bad = registration('badalias', {
+      users: [],
+      rooms: [],
+      aliases: [{ exclusive: true, regex: '[' }],
+    });
+    expect(() => isExclusiveAppServiceAlias([bad], '#x:example.com')).toThrow();
+  });
+
+  it('throws when a room namespace regex is invalid', () => {
+    const bad = registration('badroom', {
+      users: [],
+      rooms: [{ exclusive: true, regex: '(' }],
+      aliases: [],
+    });
+    expect(() =>
+      getInterestedAppServices([bad], {
+        room_id: '!x:example.com',
+        sender: '@a:example.com',
+        type: 'm.room.message',
+      })
+    ).toThrow();
+  });
+
+  it('does not match empty state_key against user namespaces', () => {
+    expect(
+      getInterestedAppServices([bridge], {
+        room_id: '!plain:example.com',
+        sender: '@admin:example.com',
+        state_key: '',
+        type: 'm.room.member',
+      })
+    ).toEqual([]);
+  });
+
+  it('matches exclusive user ns after a non-exclusive miss on the same registration', () => {
+    const multi = registration('multi', {
+      users: [
+        { exclusive: false, regex: '^@_soft_.*:example\\.com$' },
+        { exclusive: true, regex: '^@_multi_.*:example\\.com$' },
+      ],
+      rooms: [],
+      aliases: [],
+    });
+    expect(isExclusiveAppServiceUser([multi], '@_multi_bot:example.com')).toBe(multi);
+    expect(isExclusiveAppServiceUser([multi], '@_soft_bot:example.com')).toBeNull();
+  });
+});

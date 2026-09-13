@@ -287,3 +287,18 @@ describe('validateUrl TOKENMAXX edge paths after #52', () => {
     );
   });
 });
+
+describe('validateUrl TOKENMAXX edge paths after #53', () => {
+  it('uses WHATWG hostname after userinfo (IP-in-userinfo does not bypass public host)', () => {
+    // userinfo=127.0.0.1, hostname=evil.com → allowed
+    expect(validateUrl('http://127.0.0.1@evil.com/').valid).toBe(true);
+    // userinfo=user, hostname=127.0.0.1 → blocked
+    expect(validateUrl('http://user@127.0.0.1/').valid).toBe(false);
+    expect(validateUrl('http://user@localhost/').valid).toBe(false);
+  });
+
+  it('still rejects preview when userinfo targets a blocked hostname', () => {
+    expect(validateUrlForPreview('http://user@127.0.0.1/').valid).toBe(false);
+    expect(validateUrlForPreview('https://user:pass@example.com:8080').valid).toBe(true);
+  });
+});
