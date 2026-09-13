@@ -4,7 +4,7 @@
   "description": "Matrix homeserver running on Cloudflare Workers",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "dev": "wrangler dev",
