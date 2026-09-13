@@ -263,4 +263,9 @@ describe('detectNSERequest timeline and extension edges', () => {
       detectNSERequest(undefined, { extensions: { typing: { enabled: true } } }).indicators
     ).not.toContain('minimal-extensions');
   });
+
+  it('matches NSE User-Agent substrings case-sensitively', () => {
+    expect(detectNSERequest('nse/1.0', {}).indicators).not.toContain('user-agent-nse');
+    expect(detectNSERequest('NSE/1.0', {}).indicators).toContain('user-agent-nse');
+  });
 });

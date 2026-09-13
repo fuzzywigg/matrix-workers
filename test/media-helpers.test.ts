@@ -276,4 +276,41 @@ describe('MIME / thumbnail / security header edges', () => {
     expect(headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(headers.get('X-Frame-Options')).toBe('DENY');
   });
+
+  it('treats MIME whitelist membership as case-sensitive', () => {
+    expect(isSupportedContentType('IMAGE/PNG')).toBe(false);
+    expect(isSupportedContentType('Text/Plain')).toBe(false);
+    expect(isSupportedContentType('image/png')).toBe(true);
+  });
+});
+
+describe('extractOpenGraphPreview absolutization / decode edges', () => {
+  it('treats protocol-relative og:image as a root-path URL', () => {
+    const base = { protocol: 'https:', host: 'ex.com' };
+    // startsWith('/') is true for "//cdn…", so host is prepended without a slash join
+    expect(
+      extractOpenGraphPreview(`<meta property="og:image" content="//cdn.ex/a.png" />`, base)[
+        'og:image'
+      ]
+    ).toBe('https://ex.com//cdn.ex/a.png');
+  });
+
+  it('treats uppercase HTTPS schemes as relative paths (case-sensitive http check)', () => {
+    const base = { protocol: 'https:', host: 'ex.com' };
+    expect(
+      extractOpenGraphPreview(`<meta property="og:image" content="HTTPS://cdn.ex/a.png" />`, base)[
+        'og:image'
+      ]
+    ).toBe('https://ex.com/HTTPS://cdn.ex/a.png');
+  });
+
+  it('decodes entities in og:title but leaves og:type raw', () => {
+    const html = `
+      <meta property="og:title" content="web&amp;site" />
+      <meta property="og:type" content="web&amp;site" />
+    `;
+    const preview = extractOpenGraphPreview(html);
+    expect(preview['og:title']).toBe('web&site');
+    expect(preview['og:type']).toBe('web&amp;site');
+  });
 });

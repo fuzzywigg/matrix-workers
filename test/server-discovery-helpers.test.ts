@@ -110,6 +110,11 @@ describe('isIPLiteral / buildServerUrl edges', () => {
     expect(isIPLiteral('2001:db8::1')).toBe(false);
   });
 
+  it('rejects bracketed IPv6 with a trailing port suffix', () => {
+    // Regex requires the string to end at `]` — host:port forms are not literals here
+    expect(isIPLiteral('[::1]:8448')).toBe(false);
+  });
+
   it('includes non-443 ports including 80 and 8448', () => {
     expect(buildServerUrl({ host: 'example.com', port: 80, tlsHostname: 'example.com' })).toBe(
       'https://example.com:80'

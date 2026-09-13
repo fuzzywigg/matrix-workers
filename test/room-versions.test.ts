@@ -119,4 +119,13 @@ describe('getRedactionAllowedKeys', () => {
       expect(keys).not.toContain('body');
     }
   });
+
+  it('keeps v10 create without room_version and redaction without redacts', () => {
+    const v10 = getRoomVersion('10')!;
+    expect(getRedactionAllowedKeys('m.room.create', v10)).toContain('creator');
+    expect(getRedactionAllowedKeys('m.room.create', v10)).not.toContain('room_version');
+    expect(getRedactionAllowedKeys('m.room.redaction', v10)).not.toContain('redacts');
+    // Envelope keys are still present for redaction events
+    expect(getRedactionAllowedKeys('m.room.redaction', v10)).toContain('event_id');
+  });
 });

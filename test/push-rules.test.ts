@@ -278,4 +278,30 @@ describe('matchesRule content failure edges', () => {
     };
     expect(matchesRule(rule, message, userId, 2)).toBe(false);
   });
+
+  it('prefers pattern matching over conditions when both are present', () => {
+    const rule: PushRule = {
+      rule_id: 'pattern-wins',
+      default: false,
+      enabled: true,
+      pattern: 'zzz',
+      conditions: [{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }],
+      actions: ['notify'],
+    };
+    // Body is "Hello Alice there" — pattern branch returns first and fails
+    expect(matchesRule(rule, message, userId, 2)).toBe(false);
+  });
+});
+
+describe('matchesCondition escaped property keys', () => {
+  it('unescapes backslash-dot paths for event_property_is', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_is', key: 'content\\.msgtype', value: 'm.text' },
+        message,
+        userId,
+        2
+      )
+    ).toBe(true);
+  });
 });

@@ -80,4 +80,14 @@ describe('isValidServerName (federation notary gate)', () => {
     expect(isValidServerName('matrix.org:443')).toBe(true);
     expect(isValidServerName('203.0.113.10:8448')).toBe(true);
   });
+
+  it('rejects subdomains of localhost via hostname suffix matching', () => {
+    expect(isValidServerName('evil.localhost')).toBe(false);
+  });
+
+  it('accepts public IPv6 literals and names at the 255-char length boundary', () => {
+    expect(isValidServerName('[2606:4700:4700::1111]')).toBe(true);
+    expect(isValidServerName('a'.repeat(255))).toBe(true);
+    expect(isValidServerName('a'.repeat(256))).toBe(false);
+  });
 });

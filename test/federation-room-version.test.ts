@@ -49,4 +49,10 @@ describe('isModernRoomVersion', () => {
     // parseInt('-1', 10) === -1 → Number.isFinite → n >= 3 is false
     expect(isModernRoomVersion('-1')).toBe(false);
   });
+
+  it('uses parseInt alphanumeric prefix semantics', () => {
+    // parseInt('2abc', 10) === 2 → legacy; parseInt('3foo', 10) === 3 → modern
+    expect(isModernRoomVersion('2abc')).toBe(false);
+    expect(isModernRoomVersion('3foo')).toBe(true);
+  });
 });

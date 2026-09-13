@@ -188,4 +188,20 @@ describe('validateRemoteJoinTemplate', () => {
       validateRemoteJoinTemplate({ ...validTemplate(), room_version: '' }, roomId, userId)
     ).toThrow(/unsupported room_version/);
   });
+
+  it('accepts depth exactly 1 (floor is exclusive of values below 1)', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: 1 }), roomId, userId)
+    ).not.toThrow();
+  });
+
+  it('rejects membership that differs only by letter case', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ content: { membership: 'Join' } }),
+        roomId,
+        userId
+      )
+    ).toThrow(/membership/);
+  });
 });
