@@ -1,10 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   isExclusiveAppServiceUser,
   isExclusiveAppServiceAlias,
   getInterestedAppServices,
   getAppServiceByToken,
   getAppServices,
+  sendAppServiceTransaction,
   type AppServiceRegistration,
 } from '../src/services/appservice';
 
@@ -480,5 +481,169 @@ describe('appservice TOKENMAXX edge paths after #55', () => {
     expect(list).toHaveLength(2);
     expect(list[0]).toMatchObject({ id: 'a', rate_limited: false, protocols: [] });
     expect(list[1]).toMatchObject({ id: 'b', rate_limited: true, protocols: ['m.login.sso'] });
+  });
+});
+
+describe('sendAppServiceTransaction TOKENMAXX clock boundaries after #62', () => {
+  const NOW = 1_700_000_000_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  function createTxnDb() {
+    const inserts: Array<{ appservice_id: string; events: string; created_at: number }> = [];
+    const updates: Array<{ kind: 'sent' | 'retry'; args: unknown[] }> = [];
+    let nextRowId = 42;
+
+    const db = {
+      inserts,
+      updates,
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async run() {
+                if (sql.includes('INSERT INTO appservice_transactions')) {
+                  const [appservice_id, events, created_at] = args as [string, string, number];
+                  inserts.push({ appservice_id, events, created_at });
+                  return { meta: { last_row_id: nextRowId++ } };
+                }
+                if (sql.includes('SET sent_at')) {
+                  updates.push({ kind: 'sent', args });
+                  return { meta: { changes: 1 } };
+                }
+                if (sql.includes('retry_count')) {
+                  updates.push({ kind: 'retry', args });
+                  return { meta: { changes: 1 } };
+                }
+                return { meta: { changes: 0 } };
+              },
+            };
+          },
+        };
+      },
+    };
+
+    return db as unknown as D1Database & {
+      inserts: typeof inserts;
+      updates: typeof updates;
+    };
+  }
+
+  it('pins created_at and sent_at to Date.now on successful delivery', async () => {
+    const db = createTxnDb();
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response('{}', { status: 200 })
+    );
+
+    const ok = await sendAppServiceTransaction(db, bridge, [
+      { type: 'm.room.message', room_id: '!r:ex.com' },
+    ]);
+
+    expect(ok).toBe(true);
+    expect(db.inserts).toEqual([
+      {
+        appservice_id: 'bridge',
+        events: JSON.stringify([{ type: 'm.room.message', room_id: '!r:ex.com' }]),
+        created_at: NOW,
+      },
+    ]);
+    expect(db.updates).toEqual([{ kind: 'sent', args: [NOW, 42] }]);
+    expect(fetch).toHaveBeenCalledWith(
+      'https://bridge.example.com/_matrix/app/v1/transactions/42',
+      expect.objectContaining({
+        method: 'PUT',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer hs-bridge',
+        }),
+      })
+    );
+  });
+
+  it('pins created_at then increments retry when remote returns non-OK', async () => {
+    const db = createTxnDb();
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response('nope', { status: 500 })
+    );
+
+    const ok = await sendAppServiceTransaction(db, bridge, [{ type: 'm.room.member' }]);
+
+    expect(ok).toBe(false);
+    expect(db.inserts[0].created_at).toBe(NOW);
+    expect(db.updates).toEqual([{ kind: 'retry', args: [42] }]);
+  });
+
+  it('increments retry when fetch throws and does not mark sent_at', async () => {
+    const db = createTxnDb();
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('network down'));
+
+    const ok = await sendAppServiceTransaction(db, soft, []);
+
+    expect(ok).toBe(false);
+    expect(db.inserts[0].created_at).toBe(NOW);
+    expect(db.updates).toEqual([{ kind: 'retry', args: [42] }]);
+  });
+
+  it('uses a later Date.now for sent_at when the clock advances mid-flight', async () => {
+    const db = createTxnDb();
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      vi.setSystemTime(NOW + 5_000);
+      return new Response('{}', { status: 200 });
+    });
+
+    await sendAppServiceTransaction(db, bridge, [{ type: 'm.room.message' }]);
+
+    expect(db.inserts[0].created_at).toBe(NOW);
+    expect(db.updates).toEqual([{ kind: 'sent', args: [NOW + 5_000, 42] }]);
+  });
+});
+
+describe('appservice interest TOKENMAXX edge paths after #62', () => {
+  it('matches multiple interested services and dedupes within a single service', async () => {
+    const roomBridge = registration('rooms', {
+      users: [],
+      rooms: [{ exclusive: false, regex: '^!shared:example\\.com$' }],
+      aliases: [],
+    });
+    const userBridge = registration('users', {
+      users: [{ exclusive: false, regex: '^@alice:example\\.com$' }],
+      rooms: [],
+      aliases: [],
+    });
+
+    const interested = getInterestedAppServices([roomBridge, userBridge, soft], {
+      room_id: '!shared:example.com',
+      sender: '@alice:example.com',
+      type: 'm.room.message',
+    });
+    expect(interested.map((a) => a.id)).toEqual(['rooms', 'users']);
+  });
+
+  it('does not match empty namespace lists', () => {
+    const empty = registration('empty', { users: [], rooms: [], aliases: [] });
+    expect(
+      getInterestedAppServices([empty], {
+        room_id: '!r:ex.com',
+        sender: '@a:ex.com',
+        type: 'm.room.message',
+      })
+    ).toEqual([]);
+  });
+
+  it('honors excludeAsId for exclusive aliases', () => {
+    expect(
+      isExclusiveAppServiceAlias([bridge], '#_bridge_room:example.com', 'bridge')
+    ).toBeNull();
+    expect(
+      isExclusiveAppServiceAlias([bridge], '#_bridge_room:example.com', 'other')
+    ).toBe(bridge);
   });
 });

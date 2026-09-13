@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { FakeDurableObjectState, durableObjectMockFactory } from './helpers/fake-durable-object';
 import type { Env } from '../src/types';
 
@@ -28,6 +28,8 @@ async function waitForEventsTimeout(sync: SyncDurableObject, timeout: number) {
     vi.useRealTimers();
   }
 }
+
+const WAIT_CAP_MS = 25_000;
 
 describe('SyncDurableObject TOKENMAXX edge paths after #57', () => {
   it('returns 404 for unknown paths', async () => {
@@ -292,5 +294,177 @@ describe('SyncDurableObject alarm clock boundaries TOKENMAXX after #60', () => {
     expect(ids).toContain('$mem-eq');
     expect(ids).not.toContain('$mem-old');
     vi.useRealTimers();
+  });
+});
+
+describe('SyncDurableObject wait/pending TOKENMAXX clock boundaries after #62', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('defaults missing timeout to 25s and does not resolve 1ms early', async () => {
+    const { do: sync } = makeSync();
+    const pending = sync.fetch(
+      new Request('https://do/wait-for-events', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      })
+    );
+
+    await vi.advanceTimersByTimeAsync(WAIT_CAP_MS - 1);
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await (await pending).json()).toEqual({ hasEvents: false });
+  });
+
+  it('caps timeout above 25s at exactly the 25s cap', async () => {
+    const { do: sync } = makeSync();
+    const pending = sync.fetch(
+      new Request('https://do/wait-for-events', {
+        method: 'POST',
+        body: JSON.stringify({ timeout: 60_000 }),
+      })
+    );
+
+    await vi.advanceTimersByTimeAsync(WAIT_CAP_MS - 1);
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await (await pending).json()).toEqual({ hasEvents: false });
+  });
+
+  it('excludes pending events at exact since (strict >) and includes since+1', async () => {
+    const { do: sync } = makeSync();
+    const SINCE = 1_700_000_000_000;
+
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$eq',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: SINCE,
+        }),
+      })
+    );
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$after',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: SINCE + 1,
+        }),
+      })
+    );
+
+    const body = (await (
+      await sync.fetch(new Request(`https://do/pending?since=${SINCE}`))
+    ).json()) as { events: Array<{ event_id: string }> };
+    expect(body.events.map((e) => e.event_id)).toEqual(['$after']);
+  });
+
+  it('wakes all concurrent waiters on a single notify before any timeout', async () => {
+    const { do: sync } = makeSync();
+    const w1 = sync.fetch(
+      new Request('https://do/wait-for-events', {
+        method: 'POST',
+        body: JSON.stringify({ timeout: 5_000 }),
+      })
+    );
+    const w2 = sync.fetch(
+      new Request('https://do/wait-for-events', {
+        method: 'POST',
+        body: JSON.stringify({ timeout: 5_000 }),
+      })
+    );
+    await Promise.resolve();
+
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$wake-both',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 42,
+        }),
+      })
+    );
+
+    expect(await (await w1).json()).toEqual({ hasEvents: true });
+    expect(await (await w2).json()).toEqual({ hasEvents: true });
+  });
+
+  it('serves sliding-sync state from in-memory cache after PUT without re-read miss', async () => {
+    const { state, do: sync } = makeSync();
+    const payload = {
+      pos: 7,
+      lastAccess: 99,
+      roomStates: { '!r:ex.com': { lastStreamOrdering: 1, sentState: true } },
+      listStates: {},
+    };
+    await sync.fetch(
+      new Request('https://do/sliding-sync/state?conn_id=cache1', {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      })
+    );
+    // Wipe storage so a cache miss would return null
+    state.storage.map.delete('sliding_sync:cache1');
+
+    const get = await sync.fetch(
+      new Request('https://do/sliding-sync/state?conn_id=cache1')
+    );
+    expect(await get.json()).toMatchObject({ pos: 7, lastAccess: 99 });
+  });
+
+  it('sorts pending events by timestamp ascending across notifies', async () => {
+    const { do: sync } = makeSync();
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$late',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 300,
+        }),
+      })
+    );
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$early',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 100,
+        }),
+      })
+    );
+
+    const body = (await (
+      await sync.fetch(new Request('https://do/pending?since=0'))
+    ).json()) as { events: Array<{ event_id: string; timestamp: number }> };
+    expect(body.events.map((e) => e.event_id)).toEqual(['$early', '$late']);
+    expect(body.events.map((e) => e.timestamp)).toEqual([100, 300]);
   });
 });

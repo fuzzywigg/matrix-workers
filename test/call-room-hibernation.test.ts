@@ -1,10 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { CallRoomDurableObject } from '../src/durable-objects/call-room';
 import type { Env } from '../src/types';
 
-const { addTracksMock, closeTracksMock } = vi.hoisted(() => ({
+const { addTracksMock, closeTracksMock, createSessionMock, renegotiateMock } = vi.hoisted(() => ({
   addTracksMock: vi.fn(),
   closeTracksMock: vi.fn(),
+  createSessionMock: vi.fn(),
+  renegotiateMock: vi.fn(),
 }));
 
 vi.mock('../src/services/cloudflare-calls', async (importOriginal) => {
@@ -13,8 +15,20 @@ vi.mock('../src/services/cloudflare-calls', async (importOriginal) => {
     ...actual,
     addTracks: addTracksMock,
     closeTracks: closeTracksMock,
+    createSession: createSessionMock,
+    renegotiate: renegotiateMock,
   };
 });
+
+// Cloudflare Workers runtime global used by handleJoin for hibernation auto-pong.
+class FakeWebSocketRequestResponsePair {
+  constructor(
+    public readonly request: string,
+    public readonly response: string
+  ) {}
+}
+(globalThis as unknown as { WebSocketRequestResponsePair: unknown }).WebSocketRequestResponsePair =
+  FakeWebSocketRequestResponsePair;
 
 // Minimal stand-ins for the pieces of the DO runtime the hibernation path touches.
 // Storage structured-clones values like real DO storage, so a Map smuggled into a
@@ -613,5 +627,183 @@ describe('CallRoom signaling TOKENMAXX edge paths after #58', () => {
     const res = await room.fetch(new Request('https://do/ws'));
     expect(res.status).toBe(426);
     expect(await res.text()).toBe('Expected WebSocket');
+  });
+});
+
+describe('CallRoom TOKENMAXX clock + signaling after #62', () => {
+  const NOW = 1_700_000_000_000;
+
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    createSessionMock.mockResolvedValue({ sessionId: 'sess-new' });
+    renegotiateMock.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('pins joinedAt to Date.now on join and persists it through hibernation', async () => {
+    const state = new FakeState();
+    const ws = new FakeWebSocket();
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+    );
+
+    expect(createSessionMock).toHaveBeenCalledOnce();
+    const stored = state.storage.map.get('participant:u1|d1') as {
+      joinedAt: number;
+      sessionId: string;
+    };
+    expect(stored.joinedAt).toBe(NOW);
+    expect(stored.sessionId).toBe('sess-new');
+    expect(ws.attachment).toEqual({ participantKey: 'u1|d1' });
+
+    const welcome = JSON.parse(ws.sent[0]);
+    expect(welcome).toMatchObject({ type: 'welcome', participants: [] });
+
+    const stateRes = await room.fetch(new Request('https://do/state'));
+    const body = await stateRes.json();
+    expect(body.participants[0].joinedAt).toBe(NOW);
+  });
+
+  it('broadcasts participant_joined to peers and excludes self from welcome', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u0|d0', storedParticipant('u0', 'd0'));
+    const wsPeer = new FakeWebSocket();
+    wsPeer.serializeAttachment({ participantKey: 'u0|d0' });
+    const wsNew = new FakeWebSocket();
+    state.sockets = [wsPeer, wsNew];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      wsNew,
+      JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+    );
+
+    const welcome = JSON.parse(wsNew.sent[0]);
+    expect(welcome.type).toBe('welcome');
+    expect(welcome.participants).toEqual([
+      { oderId: 'u0', deviceId: 'd0', tracks: [] },
+    ]);
+
+    const joined = wsPeer.sent.map((s: string) => JSON.parse(s)).find(
+      (m: { type: string }) => m.type === 'participant_joined'
+    );
+    expect(joined).toMatchObject({
+      type: 'participant_joined',
+      oderId: 'u1',
+      deviceId: 'd1',
+    });
+  });
+
+  it('successful offer returns offer_response, persists track, and broadcasts track_published', async () => {
+    addTracksMock.mockResolvedValueOnce({
+      sessionDescription: { type: 'answer', sdp: 'v=answer' },
+      tracks: [{ mid: '5' }],
+    });
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const wsA = new FakeWebSocket();
+    wsA.serializeAttachment({ participantKey: 'u1|d1' });
+    const wsB = new FakeWebSocket();
+    wsB.serializeAttachment({ participantKey: 'u2|d2' });
+    state.sockets = [wsA, wsB];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      wsA,
+      JSON.stringify({
+        type: 'offer',
+        trackName: 'video0',
+        kind: 'video',
+        sdp: 'v=0',
+      })
+    );
+
+    expect(JSON.parse(wsA.sent[0])).toMatchObject({
+      type: 'offer_response',
+      sdp: 'v=answer',
+      trackName: 'video0',
+      mid: '5',
+    });
+    const stored = state.storage.map.get('participant:u1|d1') as {
+      tracks: Record<string, { mid: string; kind: string; enabled: boolean }>;
+    };
+    expect(stored.tracks.video0).toEqual({ mid: '5', kind: 'video', enabled: true });
+
+    const published = wsB.sent.map((s: string) => JSON.parse(s)).find(
+      (m: { type: string }) => m.type === 'track_published'
+    );
+    expect(published).toMatchObject({
+      type: 'track_published',
+      oderId: 'u1',
+      deviceId: 'd1',
+      trackName: 'video0',
+      kind: 'video',
+      sessionId: 'session-u1',
+    });
+  });
+
+  it('answer path calls renegotiate when joined', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'answer', sdp: 'v=answer' })
+    );
+
+    expect(renegotiateMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'session-u1',
+      { sessionDescription: { sdp: 'v=answer', type: 'answer' } }
+    );
+    expect(ws.sent).toHaveLength(0);
+  });
+
+  it('surfaces INTERNAL_ERROR when createSession throws during join', async () => {
+    createSessionMock.mockRejectedValueOnce(new Error('sfu unavailable'));
+    const state = new FakeState();
+    const ws = new FakeWebSocket();
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+    );
+
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'INTERNAL_ERROR',
+      message: 'sfu unavailable',
+    });
+    expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+  });
+
+  it('handleGetState includes joinedAt from storage after rehydration', async () => {
+    const state = new FakeState();
+    await state.storage.put(
+      'participant:u1|d1',
+      storedParticipant('u1', 'd1', { audio0: TRACK })
+    );
+    const room = makeRoom(state) as any;
+    const body = await (await room.handleGetState()).json();
+    expect(body.participants[0].joinedAt).toBe(1752900000000);
   });
 });
