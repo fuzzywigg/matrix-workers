@@ -39,4 +39,14 @@ describe('isModernRoomVersion', () => {
     expect(isModernRoomVersion('100')).toBe(true);
     expect(isModernRoomVersion('9999')).toBe(true);
   });
+
+  it('treats leading-plus numeric strings via parseInt', () => {
+    expect(isModernRoomVersion('+3')).toBe(true);
+    expect(isModernRoomVersion('+2')).toBe(false);
+  });
+
+  it('treats negative numeric prefixes as modern when parseInt yields negative', () => {
+    // parseInt('-1', 10) === -1 → Number.isFinite → n >= 3 is false
+    expect(isModernRoomVersion('-1')).toBe(false);
+  });
 });

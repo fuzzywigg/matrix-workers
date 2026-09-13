@@ -173,3 +173,21 @@ describe('getClientId edge cases', () => {
     ).toBe('ip:unknown');
   });
 });
+
+describe('getRateLimitType method / path failure edges', () => {
+  it('does not classify register GET or createRoom GET as write buckets', () => {
+    expect(getRateLimitType('/_matrix/client/v3/register', 'GET')).toBe('default');
+    expect(getRateLimitType('/_matrix/client/v3/createRoom', 'GET')).toBe('default');
+  });
+
+  it('requires PUT for send_message classification', () => {
+    const path = '/_matrix/client/v3/rooms/!r:s/send/m.room.message/1';
+    expect(getRateLimitType(path, 'PUT')).toBe('send_message');
+    expect(getRateLimitType(path, 'POST')).toBe('default');
+  });
+
+  it('classifies media PUT uploads and DELETE downloads path as download bucket', () => {
+    expect(getRateLimitType('/_matrix/media/v3/upload', 'PUT')).toBe('media_upload');
+    expect(getRateLimitType('/_matrix/media/v3/download/x/y', 'DELETE')).toBe('media_download');
+  });
+});

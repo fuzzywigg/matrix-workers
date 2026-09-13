@@ -115,3 +115,30 @@ describe('sha256 bytes input', () => {
     expect(fromBytes).toBe(fromString);
   });
 });
+
+describe('crypto failure / boundary edges', () => {
+  it('treats empty strings as equal under timingSafeEqual', () => {
+    expect(timingSafeEqual('', '')).toBe(true);
+    expect(timingSafeEqual('', 'a')).toBe(false);
+  });
+
+  it('rejects passwords that are only symbols without letters', () => {
+    expect(validatePasswordStrength('!!!!!!!!')).toMatch(/letter/);
+  });
+
+  it('rejects content hash when signatures differ but body matches after strip', async () => {
+    const a = {
+      type: 'm.room.message',
+      content: { body: 'hi' },
+      signatures: { 'a.example.com': { 'ed25519:1': 'sig-a' } },
+    };
+    const hash = await calculateContentHash(a);
+    const b = {
+      ...a,
+      signatures: { 'b.example.com': { 'ed25519:1': 'sig-b' } },
+    };
+    // signatures are ignored for content hash — should still verify
+    expect(await verifyContentHash(b, hash)).toBe(true);
+    expect(await verifyContentHash({ ...a, type: 'm.room.member' }, hash)).toBe(false);
+  });
+});

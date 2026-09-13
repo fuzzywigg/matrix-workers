@@ -137,3 +137,36 @@ describe('buildSignedRequest', () => {
     expect(req.destination).toBe('dest.example.com');
   });
 });
+
+describe('parseAuthHeader failure edges', () => {
+  it('returns null when only destination is present among optional fields', () => {
+    expect(
+      parseAuthHeader('X-Matrix destination="b.example.com",key="ed25519:k",sig="s"')
+    ).toBeNull();
+  });
+
+  it('returns null for empty header and whitespace-only after scheme', () => {
+    expect(parseAuthHeader('')).toBeNull();
+    expect(parseAuthHeader('X-Matrix')).toBeNull();
+    expect(parseAuthHeader('X-Matrix   ')).toBeNull();
+  });
+
+  it('does not treat Authorization Bearer as X-Matrix', () => {
+    expect(parseAuthHeader('Authorization: X-Matrix origin="a",key="k",sig="s"')).toBeNull();
+  });
+
+  it('parses destination with spaces stripped by unquoted regex boundaries', () => {
+    const parsed = parseAuthHeader(
+      'X-Matrix origin="a.example.com", destination="b.example.com",key="ed25519:k",sig="s"'
+    );
+    expect(parsed?.destination).toBe('b.example.com');
+  });
+});
+
+describe('buildSignedRequest nested content', () => {
+  it('preserves nested PDU-shaped content objects by reference identity', () => {
+    const content = { pdus: [{ type: 'm.room.message' }], edus: [] };
+    const req = buildSignedRequest('PUT', '/send/t1', 'a', 'b', content);
+    expect(req.content).toBe(content);
+  });
+});

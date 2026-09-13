@@ -98,3 +98,28 @@ describe('buildServerUrl', () => {
     );
   });
 });
+
+describe('isIPLiteral / buildServerUrl edges', () => {
+  it('requires non-empty contents inside brackets for IPv6 literals', () => {
+    // Regex is /^\[.+\]$/ — empty [] does not match
+    expect(isIPLiteral('[]')).toBe(false);
+    expect(isIPLiteral('[::]')).toBe(true);
+  });
+
+  it('rejects bare IPv6 without brackets', () => {
+    expect(isIPLiteral('2001:db8::1')).toBe(false);
+  });
+
+  it('includes non-443 ports including 80 and 8448', () => {
+    expect(buildServerUrl({ host: 'example.com', port: 80, tlsHostname: 'example.com' })).toBe(
+      'https://example.com:80'
+    );
+  });
+});
+
+describe('selectSRVRecord single zero-weight peer', () => {
+  it('returns the sole zero-weight record without random selection', () => {
+    const only: SRVRecord = { priority: 0, weight: 0, port: 8448, target: 'solo.example.com' };
+    expect(selectSRVRecord([only]).target).toBe('solo.example.com');
+  });
+});

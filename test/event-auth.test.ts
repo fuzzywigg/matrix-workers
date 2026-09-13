@@ -622,4 +622,193 @@ describe('checkEventAuth', () => {
       ).allowed
     ).toBe(true);
   });
+
+  it('rejects create events missing both creator and room_version', () => {
+    const bad = createEvent();
+    bad.content = {};
+    expect(checkEventAuth(bad, [], '10').allowed).toBe(false);
+  });
+
+  it('rejects member events with missing membership', () => {
+    const state = [createEvent()];
+    const bad = memberEvent('@bob:example.com', 'join');
+    bad.content = {};
+    expect(checkEventAuth(bad, state, '10').error).toMatch(/Missing membership/);
+  });
+
+  it('rejects invite when sender is not joined', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'invite')];
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'invite', '@alice:example.com'),
+        state,
+        '10'
+      ).error
+    ).toMatch(/joined to invite/);
+  });
+
+  it('rejects self-leave when not a member', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'leave'), state, '10').error).toMatch(
+      /Not a member/
+    );
+  });
+
+  it('rejects kicks of equal-power users', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50, '@bob:example.com': 50 }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'leave', '@alice:example.com'), state, '10')
+        .error
+    ).toMatch(/equal or higher power/);
+  });
+
+  it('rejects ban when sender is not joined', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'leave')];
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'ban', '@alice:example.com'), state, '10')
+        .error
+    ).toMatch(/joined to ban/);
+  });
+
+  it('rejects knocking when banned', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@bob:example.com', 'ban', '@alice:example.com'),
+      memberEvent('@alice:example.com', 'join'),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'knock' },
+      }),
+    ];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'knock'), state, '10').error).toMatch(
+      /Banned users cannot knock/
+    );
+  });
+
+  it('allows third_party_invite for joined inviters and rejects others', () => {
+    const base = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const invite = pdu({
+      type: 'm.room.third_party_invite',
+      event_id: '$tpi',
+      sender: '@alice:example.com',
+      state_key: 'token',
+      content: { display_name: 'Bob' },
+    });
+    expect(checkEventAuth(invite, base, '10').allowed).toBe(true);
+
+    const notJoined = pdu({
+      type: 'm.room.third_party_invite',
+      event_id: '$tpi2',
+      sender: '@eve:example.com',
+      state_key: 'token2',
+      content: { display_name: 'Eve' },
+    });
+    // Non-joined senders are rejected by Rule 4 before third_party_invite checks
+    expect(checkEventAuth(notJoined, base, '10').error).toMatch(/not joined/i);
+  });
+
+  it('rejects changing power of an equal-power user', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50, '@bob:example.com': 50 }),
+    ];
+    const change = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl2',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50, '@bob:example.com': 40 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(change, state, '10').error).toMatch(/equal or higher power/);
+  });
+
+  it('rejects restricted joins without a joined authorizing user', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'restricted' },
+      }),
+    ];
+    const join = memberEvent('@bob:example.com', 'join');
+    join.content = {
+      membership: 'join',
+      join_authorised_via_users_server: '@missing:example.com',
+    };
+    expect(checkEventAuth(join, state, '10').error).toMatch(/Not authorized to join/);
+  });
+
+  it('allows rescinding a knock via self-leave on v7+', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@bob:example.com', 'knock'),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'knock' },
+      }),
+    ];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'leave'), state, '10').allowed).toBe(
+      true
+    );
+  });
+
+  it('rejects insufficient-power unban attempts', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      memberEvent('@carol:example.com', 'ban', '@alice:example.com'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100, '@bob:example.com': 40 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@carol:example.com', 'leave', '@bob:example.com'), state, '10')
+        .error
+    ).toMatch(/unban/);
+  });
 });

@@ -109,4 +109,14 @@ describe('getRedactionAllowedKeys', () => {
     expect(getRoomVersion('12')?.integerPowerLevels).toBe(true);
     expect(getRoomVersion('12')?.updatedRedactionRules).toBe(true);
   });
+
+  it('returns envelope-only keys for unknown event types on both redaction algorithms', () => {
+    const v10 = getRoomVersion('10')!;
+    const v11 = getRoomVersion('11')!;
+    for (const behavior of [v10, v11]) {
+      const keys = getRedactionAllowedKeys('m.room.message', behavior);
+      expect(keys).toContain('event_id');
+      expect(keys).not.toContain('body');
+    }
+  });
 });

@@ -32,4 +32,10 @@ describe('federation room-version module alignment', () => {
     expect(isModernRoomVersion('1')).toBe(false);
     expect(isModernRoomVersion('2')).toBe(false);
   });
+
+  it('rejects unknown versions from both registries and still fail-closes modern-hash', () => {
+    expect(JOIN_SUPPORTED.has('13')).toBe(false);
+    expect(isRoomVersionSupported('13')).toBe(false);
+    expect(isModernRoomVersion('13')).toBe(true);
+  });
 });
