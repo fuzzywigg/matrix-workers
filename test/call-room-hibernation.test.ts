@@ -807,3 +807,213 @@ describe('CallRoom TOKENMAXX clock + signaling after #62', () => {
     expect(body.participants[0].joinedAt).toBe(1752900000000);
   });
 });
+
+describe('CallRoom SFU/end/send leftovers TOKENMAXX after #76', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    createSessionMock.mockResolvedValue({ sessionId: 'sess-new' });
+    renegotiateMock.mockResolvedValue(undefined);
+  });
+
+  it('returns 426 when Upgrade is present but not exactly "websocket"', async () => {
+    const room = makeRoom(new FakeState()) as any;
+    const res = await room.fetch(
+      new Request('https://do/ws', { headers: { Upgrade: 'Websocket' } })
+    );
+    expect(res.status).toBe(426);
+    expect(await res.text()).toBe('Expected WebSocket');
+  });
+
+  it('welcome includes callId from /init and empty string when unset', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state) as any;
+    await room.fetch(
+      new Request('https://do/init', {
+        method: 'POST',
+        body: JSON.stringify({ callId: 'call-abc', roomId: '!m:example.com' }),
+      })
+    );
+    const ws = new FakeWebSocket();
+    state.sockets = [ws];
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'welcome',
+      callId: 'call-abc',
+    });
+
+    const cold = new FakeState();
+    const coldRoom = makeRoom(cold) as any;
+    const ws2 = new FakeWebSocket();
+    cold.sockets = [ws2];
+    await coldRoom.webSocketMessage(
+      ws2,
+      JSON.stringify({ type: 'join', userId: 'u2', deviceId: 'd2' })
+    );
+    expect(JSON.parse(ws2.sent[0])).toMatchObject({ type: 'welcome', callId: '' });
+  });
+
+  it('surfaces INTERNAL_ERROR when addTracks throws during offer', async () => {
+    addTracksMock.mockRejectedValueOnce(new Error('track fail'));
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({
+        type: 'offer',
+        trackName: 'audio0',
+        kind: 'audio',
+        sessionDescription: { type: 'offer', sdp: 'v=0' },
+      })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'INTERNAL_ERROR',
+      message: 'track fail',
+    });
+  });
+
+  it('surfaces INTERNAL_ERROR when renegotiate throws during answer', async () => {
+    renegotiateMock.mockRejectedValueOnce(new Error('renegotiate boom'));
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({
+        type: 'answer',
+        sessionDescription: { type: 'answer', sdp: 'v=answer' },
+      })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'INTERNAL_ERROR',
+      message: 'renegotiate boom',
+    });
+  });
+
+  it('handleEndCall closes tracks, swallows closeTracks failures, closes attached sockets only', async () => {
+    closeTracksMock.mockRejectedValueOnce(new Error('sfu down'));
+    const state = new FakeState();
+    await state.storage.put(
+      'participant:u1|d1',
+      storedParticipant('u1', 'd1', { audio0: TRACK })
+    );
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const attached = new FakeWebSocket();
+    attached.serializeAttachment({ participantKey: 'u1|d1' });
+    const bare = new FakeWebSocket();
+    const peer = new FakeWebSocket();
+    peer.serializeAttachment({ participantKey: 'u2|d2' });
+    state.sockets = [attached, bare, peer];
+    const room = makeRoom(state) as any;
+
+    const res = await room.handleEndCall();
+    expect(await res.json()).toEqual({ success: true });
+    expect(closeTracksMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'session-u1',
+      ['0'],
+      true
+    );
+    // only participants with tracks invoke closeTracks
+    expect(closeTracksMock).toHaveBeenCalledTimes(1);
+    expect(attached.closed).toEqual({ code: 1000, reason: 'Call ended' });
+    expect(peer.closed).toEqual({ code: 1000, reason: 'Call ended' });
+    expect(bare.closed).toBeNull();
+    expect(state.storage.map.size).toBe(0);
+  });
+
+  it('handleEndCall swallows ws.close throw on already-closed sockets', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    ws.close = () => {
+      throw new Error('already closed');
+    };
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+    await expect(room.handleEndCall()).resolves.toBeInstanceOf(Response);
+    expect(state.storage.map.size).toBe(0);
+  });
+
+  it('send/sendError swallows WebSocket send failures without throwing', async () => {
+    const state = new FakeState();
+    const ws = new FakeWebSocket();
+    ws.send = () => {
+      throw new Error('broken pipe');
+    };
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+    await expect(
+      room.webSocketMessage(ws, new ArrayBuffer(4))
+    ).resolves.toBeUndefined();
+  });
+
+  it('broadcast swallows send failures to peers during mute_changed', async () => {
+    const state = new FakeState();
+    await state.storage.put(
+      'participant:u1|d1',
+      storedParticipant('u1', 'd1', { audio0: TRACK })
+    );
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const self = new FakeWebSocket();
+    self.serializeAttachment({ participantKey: 'u1|d1' });
+    const peer = new FakeWebSocket();
+    peer.serializeAttachment({ participantKey: 'u2|d2' });
+    peer.send = () => {
+      throw new Error('peer gone');
+    };
+    state.sockets = [self, peer];
+    const room = makeRoom(state) as any;
+
+    await expect(
+      room.webSocketMessage(
+        self,
+        JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })
+      )
+    ).resolves.toBeUndefined();
+  });
+
+  it('surfaces INTERNAL_ERROR with non-Error throw message Unknown error', async () => {
+    createSessionMock.mockRejectedValueOnce('string-fail');
+    const state = new FakeState();
+    const ws = new FakeWebSocket();
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'INTERNAL_ERROR',
+      message: 'Unknown error',
+    });
+  });
+
+  it('handleEndCall with no participants still clears storage and succeeds', async () => {
+    const state = new FakeState();
+    await state.storage.put('meta:callId', 'x');
+    const room = makeRoom(state) as any;
+    const res = await room.handleEndCall();
+    expect(await res.json()).toEqual({ success: true });
+    expect(state.storage.map.size).toBe(0);
+    expect(closeTracksMock).not.toHaveBeenCalled();
+  });
+});

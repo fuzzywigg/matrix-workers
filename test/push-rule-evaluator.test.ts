@@ -299,3 +299,145 @@ describe('countNotificationsWithRules', () => {
     expect(evalMock.mock.calls[0][4]).toBe('A');
   });
 });
+
+describe('countNotificationsWithRules TOKENMAXX leftovers after #76', () => {
+  beforeEach(() => {
+    evalMock.mockReset();
+    evalMock.mockResolvedValue({ notify: false, highlight: false, sound: undefined });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('uses the no-since DESC branch when m.fully_read row is missing', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async first<T>() {
+                if (sql.includes("event_type = 'm.fully_read'")) {
+                  return null;
+                }
+                if (sql.includes('FROM room_memberships')) {
+                  return { count: 2 } as T;
+                }
+                if (sql.includes('FROM users')) {
+                  return { display_name: 'Alice' } as T;
+                }
+                return null;
+              },
+              async all<T>() {
+                binds.push(args);
+                expect(sql.includes('stream_ordering >')).toBe(false);
+                expect(sql.includes('ORDER BY stream_ordering DESC')).toBe(true);
+                return {
+                  results: [
+                    {
+                      event_id: '$e',
+                      type: 'm.room.message',
+                      content: '{}',
+                      sender: '@b:example.com',
+                      room_id: ROOM,
+                    },
+                  ] as T[],
+                };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    evalMock.mockResolvedValueOnce({ notify: true, highlight: false, sound: undefined });
+    await expect(countNotificationsWithRules(db, USER, ROOM)).resolves.toEqual({
+      notification_count: 1,
+      highlight_count: 0,
+    });
+    // no-since bind: roomId, userId only
+    expect(binds[0]).toEqual([ROOM, USER]);
+  });
+
+  it('treats sinceStreamOrdering === 0 as falsy and uses the no-since branch', async () => {
+    const sqlSeen: string[] = [];
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async first() {
+                if (sql.includes('m.fully_read')) throw new Error('should not look up marker');
+                if (sql.includes('COUNT')) return { count: 1 };
+                if (sql.includes('FROM users')) return { display_name: null };
+                return null;
+              },
+              async all() {
+                sqlSeen.push(sql);
+                void args;
+                return { results: [] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    await expect(countNotificationsWithRules(db, USER, ROOM, 0)).resolves.toEqual({
+      notification_count: 0,
+      highlight_count: 0,
+    });
+    expect(sqlSeen.some((s) => s.includes('stream_ordering >'))).toBe(false);
+    expect(sqlSeen.some((s) => s.includes('ORDER BY stream_ordering DESC'))).toBe(true);
+  });
+
+  it('falls back to no-since when fully_read JSON lacks event_id', async () => {
+    const db = createCountDb({
+      fullyReadContent: JSON.stringify({ other: true }),
+      // bind(undefined) still hits the stream lookup; null stream → falsy → no-since
+      readEventStream: null,
+      unread: [
+        {
+          event_id: '$n',
+          type: 'm.room.message',
+          content: '{}',
+          sender: '@b:example.com',
+          room_id: ROOM,
+        },
+      ],
+    });
+    evalMock.mockResolvedValueOnce({ notify: false, highlight: false, sound: undefined });
+    await countNotificationsWithRules(db, USER, ROOM);
+    expect(evalMock).toHaveBeenCalledOnce();
+  });
+
+  it('passes empty-string display_name as undefined via || undefined', async () => {
+    const db = createCountDb({
+      unread: [
+        {
+          event_id: '$1',
+          type: 'm.room.message',
+          content: '{}',
+          sender: '@b:example.com',
+          room_id: ROOM,
+        },
+      ],
+      displayName: '',
+      memberCount: 4,
+    });
+    evalMock.mockResolvedValueOnce({ notify: true, highlight: false, sound: undefined });
+    await countNotificationsWithRules(db, USER, ROOM, 3);
+    expect(evalMock.mock.calls[0][3]).toBe(4);
+    expect(evalMock.mock.calls[0][4]).toBeUndefined();
+  });
+
+  it('does not query stream_ordering when fully_read content is nullish after a present row', async () => {
+    // fullyReadContent undefined → createCountDb returns null for marker → no-since
+    const db = createCountDb({
+      unread: [],
+    });
+    await expect(countNotificationsWithRules(db, USER, ROOM)).resolves.toEqual({
+      notification_count: 0,
+      highlight_count: 0,
+    });
+    expect(evalMock).not.toHaveBeenCalled();
+  });
+});

@@ -908,3 +908,548 @@ describe('push-rules TOKENMAXX edge paths after #57', () => {
     ).toBe(false);
   });
 });
+
+describe('evaluatePushRules default underrides/overrides TOKENMAXX after #76', () => {
+  function pushDb(rows: Array<Record<string, unknown>> = []) {
+    return {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async all<T>() {
+                return { results: rows as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  const roomId = '!r:example.com';
+  const bob = '@bob:example.com';
+
+  it('rings on m.call.invite via .m.rule.call underride', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      { type: 'm.call.invite', sender: bob, room_id: roomId, content: { call_id: 'c1' } },
+      5
+    );
+    expect(result).toMatchObject({
+      notify: true,
+      highlight: false,
+      actions: ['notify', { set_tweak: 'sound', value: 'ring' }],
+    });
+  });
+
+  it('notifies 1:1 encrypted with default sound via .m.rule.encrypted_room_one_to_one', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      { type: 'm.room.encrypted', sender: bob, room_id: roomId, content: {} },
+      2
+    );
+    expect(result).toMatchObject({
+      notify: true,
+      highlight: false,
+      actions: ['notify', { set_tweak: 'sound', value: 'default' }],
+    });
+  });
+
+  it('notifies 1:1 plaintext with sound via .m.rule.room_one_to_one (beats bare .m.rule.message)', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: bob,
+        room_id: roomId,
+        content: { body: 'dm hi', msgtype: 'm.text' },
+      },
+      2
+    );
+    expect(result).toMatchObject({
+      notify: true,
+      highlight: false,
+      actions: ['notify', { set_tweak: 'sound', value: 'default' }],
+    });
+  });
+
+  it('notifies encrypted in >2-member rooms via .m.rule.encrypted without 1:1 sound', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      { type: 'm.room.encrypted', sender: bob, room_id: roomId, content: {} },
+      5
+    );
+    expect(result).toEqual({ notify: true, actions: ['notify'], highlight: false });
+  });
+
+  it('highlights is_user_mention when nested content.m.mentions.user_ids contains the user', async () => {
+    // Default key is `content.m\\.mentions.user_ids`; after unescaping, getNestedValue
+    // walks content → m → mentions → user_ids (not Matrix `content["m.mentions"]`).
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: bob,
+        room_id: roomId,
+        content: {
+          body: 'ping',
+          msgtype: 'm.text',
+          m: { mentions: { user_ids: [userId] } },
+        },
+      },
+      5
+    );
+    expect(result).toMatchObject({
+      notify: true,
+      highlight: true,
+      actions: [
+        'notify',
+        { set_tweak: 'sound', value: 'default' },
+        { set_tweak: 'highlight', value: true },
+      ],
+    });
+  });
+
+  it('does not fire is_user_mention for Matrix-shaped content["m.mentions"] keys', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: bob,
+        room_id: roomId,
+        content: {
+          body: 'no localpart match here',
+          msgtype: 'm.text',
+          'm.mentions': { user_ids: [userId] },
+        },
+      },
+      5
+    );
+    // Falls through to .m.rule.message underride (notify, no highlight)
+    expect(result).toMatchObject({ notify: true, highlight: false, actions: ['notify'] });
+  });
+
+  it('highlights is_room_mention when nested content.m.mentions.room is true', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: bob,
+        room_id: roomId,
+        content: {
+          body: 'attention all',
+          msgtype: 'm.text',
+          m: { mentions: { room: true } },
+        },
+      },
+      5
+    );
+    expect(result).toMatchObject({
+      notify: true,
+      highlight: true,
+      actions: ['notify', { set_tweak: 'highlight', value: true }],
+    });
+  });
+
+  it('documents that default tombstone/server_acl never match (empty state_key pattern is falsy)', async () => {
+    // event_match guards `!condition.pattern`, so pattern:'' never reaches the
+    // user_id-placeholder branch. Defaults therefore fall through with no match.
+    const tomb = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.tombstone',
+        sender: bob,
+        room_id: roomId,
+        state_key: '',
+        content: { body: 'room upgraded' },
+      },
+      5
+    );
+    expect(tomb).toEqual({ notify: false, actions: [], highlight: false });
+
+    const acl = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.server_acl',
+        sender: bob,
+        room_id: roomId,
+        state_key: '',
+        content: { allow: ['*'] },
+      },
+      5
+    );
+    expect(acl).toEqual({ notify: false, actions: [], highlight: false });
+  });
+
+  it('fires custom tombstone override (type-only) with notify+highlight', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.m.rule.tombstone',
+          conditions: JSON.stringify([
+            { kind: 'event_match', key: 'type', pattern: 'm.room.tombstone' },
+          ]),
+          actions: JSON.stringify([
+            'notify',
+            { set_tweak: 'highlight', value: true },
+          ]),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.tombstone',
+        sender: bob,
+        room_id: roomId,
+        state_key: '',
+        content: {},
+      },
+      5
+    );
+    expect(result).toMatchObject({ notify: true, highlight: true });
+  });
+
+  it('matches custom server_acl override with empty actions → notify:false', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.m.rule.room.server_acl',
+          conditions: JSON.stringify([
+            { kind: 'event_match', key: 'type', pattern: 'm.room.server_acl' },
+          ]),
+          actions: JSON.stringify([]),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.server_acl',
+        sender: bob,
+        room_id: roomId,
+        state_key: '',
+        content: {},
+      },
+      5
+    );
+    expect(result).toEqual({ notify: false, actions: [], highlight: false });
+  });
+
+  it('returns notify:false for unknown event types that match no default rule', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'org.example.custom',
+        sender: bob,
+        room_id: roomId,
+        content: { body: 'noop' },
+      },
+      5
+    );
+    expect(result).toEqual({ notify: false, actions: [], highlight: false });
+  });
+
+  it('bare room_member_count is:"2" equals ==2 for 1:1 underrides', () => {
+    expect(matchesCondition({ kind: 'room_member_count', is: '2' }, message, userId, 2)).toBe(
+      true
+    );
+    expect(matchesCondition({ kind: 'room_member_count', is: '2' }, message, userId, 3)).toBe(
+      false
+    );
+  });
+});
+
+describe('getUserPushRules merge via evaluatePushRules TOKENMAXX after #76', () => {
+  function pushDb(rows: Array<Record<string, unknown>> = []) {
+    return {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async all<T>() {
+                return { results: rows as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  const roomId = '!merge:example.com';
+  const bob = '@bob:example.com';
+  const baseMsg = {
+    type: 'm.room.message',
+    sender: bob,
+    room_id: roomId,
+    content: { body: 'hello world', msgtype: 'm.text' },
+  };
+
+  it('treats malformed conditions JSON as undefined (vacuous match when no pattern)', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.bad-cond',
+          conditions: '{not-json',
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    // No conditions + no pattern → matchesRule returns true → quiet
+    expect(result.notify).toBe(false);
+  });
+
+  it('treats malformed actions JSON as [] → notify:false even when the rule matches', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.bad-act',
+          conditions: null,
+          actions: 'not-json-array',
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result).toEqual({ notify: false, actions: [], highlight: false });
+  });
+
+  it('overrides an existing default rule_id in place (disables .m.rule.message)', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'underride',
+          rule_id: '.m.rule.message',
+          conditions: JSON.stringify([
+            { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+          ]),
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result.notify).toBe(false);
+  });
+
+  it('unshifts a new custom override ahead of defaults', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: 'custom.quiet-all',
+          conditions: null,
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result.notify).toBe(false);
+  });
+
+  it('honors kind:room custom rules between content and sender priority', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'room',
+          rule_id: 'room.!merge:example.com',
+          conditions: JSON.stringify([
+            { kind: 'event_match', key: 'room_id', pattern: roomId },
+          ]),
+          actions: JSON.stringify([
+            'notify',
+            { set_tweak: 'highlight', value: true },
+          ]),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result).toMatchObject({ notify: true, highlight: true });
+  });
+
+  it('honors kind:sender custom rules before underride', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'sender',
+          rule_id: 'sender.@bob:example.com',
+          conditions: JSON.stringify([
+            { kind: 'event_match', key: 'sender', pattern: bob },
+          ]),
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result.notify).toBe(false);
+  });
+
+  it('ignores unknown kind rows without throwing', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'not-a-real-kind',
+          rule_id: 'orphan',
+          conditions: null,
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    // Defaults still apply → .m.rule.message notifies
+    expect(result).toMatchObject({ notify: true, highlight: false });
+  });
+
+  it('treats enabled:2 as disabled (strict === 1)', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.enabled-two',
+          conditions: null,
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 2,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result.notify).toBe(true);
+  });
+
+  it('marks .m.rule.* overrides as default:true while custom ids stay default:false', async () => {
+    // Observable via merge: overriding .m.rule.message keeps rule_id and still matches
+    const overridden = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'underride',
+          rule_id: '.m.rule.message',
+          conditions: JSON.stringify([
+            { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+          ]),
+          actions: JSON.stringify(['notify', { set_tweak: 'sound', value: 'custom' }]),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(overridden.actions).toEqual([
+      'notify',
+      { set_tweak: 'sound', value: 'custom' },
+    ]);
+
+    const custom = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'content',
+          rule_id: 'im.vector.custom.keyword',
+          conditions: null,
+          actions: JSON.stringify([
+            'notify',
+            { set_tweak: 'highlight', value: true },
+          ]),
+          enabled: 1,
+          // content rules need pattern — without pattern+conditions matchesRule → true
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(custom).toMatchObject({ notify: true, highlight: true });
+  });
+
+  it('null conditions column stays undefined and merges with preserved default fields on override', async () => {
+    // Override .m.rule.master enabled:false → enabled:true dont_notify (blanket quiet)
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.m.rule.master',
+          conditions: null,
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result.notify).toBe(false);
+  });
+
+  it('room rule that misses falls through to underride message', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'room',
+          rule_id: 'room.!other:example.com',
+          conditions: JSON.stringify([
+            { kind: 'event_match', key: 'room_id', pattern: '!other:example.com' },
+          ]),
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result).toMatchObject({ notify: true, highlight: false, actions: ['notify'] });
+  });
+
+  it('conditions:null string parse path — empty string conditions → undefined', async () => {
+    // row.conditions is truthy empty string? '' is falsy → undefined without parse
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.empty-cond-str',
+          conditions: '',
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      baseMsg,
+      5
+    );
+    expect(result.notify).toBe(false);
+  });
+});
