@@ -1,36 +1,29 @@
 import { describe, it, expect } from 'vitest';
 import { getSupportedRoomVersions, getDefaultRoomVersion } from '../src/services/room-versions';
+import versions from '../src/api/versions';
+import type { Env } from '../src/types';
 
 /**
- * Shape checks for discovery/version payloads the Worker advertises.
- * These mirror src/api/versions.ts without spinning up a Worker runtime.
+ * Health / discovery shape checks after #83 — exercises real versions routes
+ * (replacing the prior mirrored hard-coded version list stub).
  */
+function env(partial: Partial<Env> = {}): Env {
+  return {
+    SERVER_NAME: 'matrix.fuzzywigg.com',
+    SERVER_VERSION: '0.1.0',
+    ...partial,
+  } as Env;
+}
+
 describe('Client versions payload shape', () => {
-  it('advertises Matrix CS API versions expected by modern clients', () => {
-    const versions = [
-      'r0.0.1',
-      'r0.1.0',
-      'r0.2.0',
-      'r0.3.0',
-      'r0.4.0',
-      'r0.5.0',
-      'r0.6.0',
-      'r0.6.1',
-      'v1.1',
-      'v1.2',
-      'v1.3',
-      'v1.4',
-      'v1.5',
-      'v1.6',
-      'v1.7',
-      'v1.8',
-      'v1.9',
-      'v1.10',
-      'v1.11',
-      'v1.12',
-    ];
-    expect(versions).toContain('v1.11');
-    expect(versions[versions.length - 1]).toMatch(/^v1\./);
+  it('advertises Matrix CS API versions expected by modern clients via the route', async () => {
+    const res = await versions.request('/_matrix/client/versions', {}, env());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { versions: string[] };
+    expect(body.versions).toContain('v1.11');
+    expect(body.versions).toContain('v1.12');
+    expect(body.versions[body.versions.length - 1]).toMatch(/^v1\./);
+    expect(body.versions).toHaveLength(20);
   });
 
   it('exposes supported room versions with a stable default', () => {
@@ -52,5 +45,15 @@ describe('SERVER_NAME hostname hygiene', () => {
 
   it('rejects empty server names', () => {
     expect(''.length).toBe(0);
+  });
+
+  it('embeds the live fork domain into well-known client discovery', async () => {
+    const res = await versions.request('/.well-known/matrix/client', {}, env());
+    const body = (await res.json()) as {
+      'm.homeserver': { base_url: string };
+      'm.server'?: string;
+    };
+    expect(body['m.homeserver'].base_url).toBe('https://matrix.fuzzywigg.com');
+    expect(body['m.homeserver'].base_url).toMatch(/^https:\/\/[a-z0-9.-]+\.[a-z]{2,}$/);
   });
 });
