@@ -109,4 +109,14 @@ describe('isKeyTooStale / resolveMaxStalenessMs boundary edges', () => {
       DEFAULT_KEY_MAX_STALENESS_MS
     );
   });
+
+  it('treats zero maxStalenessMs as any past expiry being stale', () => {
+    // Env resolver rejects "0", but the helper still accepts an explicit 0
+    expect(isKeyTooStale(1000, 1001, 0)).toBe(true);
+    expect(isKeyTooStale(1000, 1000, 0)).toBe(false);
+  });
+
+  it('parses leading-whitespace env overrides via parseInt', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: ' 5000' })).toBe(5000);
+  });
 });

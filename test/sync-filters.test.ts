@@ -188,4 +188,16 @@ describe('sync token failure edges', () => {
     expect(buildSyncToken(1, 999)).toBe('s1_td999');
     expect(parseSyncToken(buildSyncToken(7, 0))).toEqual({ events: 7, toDevice: 0 });
   });
+
+  it('legacy-parses leading-plus numeric tokens via parseInt', () => {
+    expect(parseSyncToken('+7')).toEqual({ events: 7, toDevice: 7 });
+  });
+});
+
+describe('applyEventFilter mid-string wildcard edges', () => {
+  it('does not treat mid-string * as a glob (only suffix * is special)', () => {
+    expect(
+      applyEventFilter(events, { types: ['m.*.message'] }).map((e) => e.type)
+    ).toEqual([]);
+  });
 });

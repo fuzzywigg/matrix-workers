@@ -170,3 +170,17 @@ describe('buildSignedRequest nested content', () => {
     expect(req.content).toBe(content);
   });
 });
+
+describe('parseAuthHeader duplicate quoted params', () => {
+  it('lets the last quoted value win when the same key appears twice', () => {
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin="first",origin="second",key="ed25519:k",sig="s"'
+      )
+    ).toEqual({
+      origin: 'second',
+      key: 'ed25519:k',
+      sig: 's',
+    });
+  });
+});

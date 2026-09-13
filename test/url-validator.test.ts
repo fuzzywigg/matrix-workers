@@ -148,3 +148,15 @@ describe('validateUrlForPreview port edges', () => {
     expect(validateUrlForPreview('http://metadata:443').valid).toBe(false);
   });
 });
+
+describe('validateUrl blocked hostname list edges', () => {
+  it('rejects ip6-localhost / ip6-loopback and kubernetes.default.svc', () => {
+    expect(validateUrl('http://ip6-localhost/').valid).toBe(false);
+    expect(validateUrl('http://ip6-loopback/').valid).toBe(false);
+    expect(validateUrl('http://kubernetes.default.svc/').valid).toBe(false);
+  });
+
+  it('rejects subdomains of localhost', () => {
+    expect(validateUrl('http://evil.localhost/').valid).toBe(false);
+  });
+});

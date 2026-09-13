@@ -190,4 +190,14 @@ describe('getRateLimitType method / path failure edges', () => {
     expect(getRateLimitType('/_matrix/media/v3/upload', 'PUT')).toBe('media_upload');
     expect(getRateLimitType('/_matrix/media/v3/download/x/y', 'DELETE')).toBe('media_download');
   });
+
+  it('classifies federation media paths as media_download before federation', () => {
+    // `/media` is checked before `/_matrix/federation`
+    expect(getRateLimitType('/_matrix/federation/v1/media/download/server/mediaid', 'GET')).toBe(
+      'media_download'
+    );
+    expect(getRateLimitType('/_matrix/federation/v1/media/download/server/mediaid', 'POST')).toBe(
+      'media_upload'
+    );
+  });
 });
