@@ -69,6 +69,33 @@ describe('parseAuthHeader', () => {
       sig: 's',
     });
   });
+
+  it('parses unquoted destination', () => {
+    expect(
+      parseAuthHeader(
+        'X-Matrix origin=a.example.com,destination=b.example.com,key=ed25519:k,sig=abc'
+      )
+    ).toEqual({
+      origin: 'a.example.com',
+      destination: 'b.example.com',
+      key: 'ed25519:k',
+      sig: 'abc',
+    });
+  });
+
+  it('parses empty quotes via the unquoted fallback as literal quote chars', () => {
+    // Quoted regex requires [^"]+ so "" is skipped; unquoted then captures ""
+    expect(parseAuthHeader('X-Matrix origin="",key="ed25519:k",sig="s"')).toEqual({
+      origin: '""',
+      key: 'ed25519:k',
+      sig: 's',
+    });
+  });
+
+  it('is scheme-prefix sensitive (exact X-Matrix )', () => {
+    expect(parseAuthHeader('x-matrix origin="a",key="k",sig="s"')).toBeNull();
+    expect(parseAuthHeader('X-Matrixorigin="a",key="k",sig="s"')).toBeNull();
+  });
 });
 
 describe('buildSignedRequest', () => {
@@ -93,5 +120,20 @@ describe('buildSignedRequest', () => {
     expect(buildSignedRequest('PUT', '/path', 'a', 'b', 0).content).toBe(0);
     expect(buildSignedRequest('PUT', '/path', 'a', 'b', false).content).toBe(false);
     expect(buildSignedRequest('PUT', '/path', 'a', 'b', []).content).toEqual([]);
+    expect(buildSignedRequest('PUT', '/path', 'a', 'b', '').content).toBe('');
+  });
+
+  it('preserves method and uri verbatim', () => {
+    const req = buildSignedRequest(
+      'PUT',
+      '/_matrix/federation/v1/send/txn1?foo=1',
+      'origin.example.com',
+      'dest.example.com',
+      { pdus: [] }
+    );
+    expect(req.method).toBe('PUT');
+    expect(req.uri).toBe('/_matrix/federation/v1/send/txn1?foo=1');
+    expect(req.origin).toBe('origin.example.com');
+    expect(req.destination).toBe('dest.example.com');
   });
 });

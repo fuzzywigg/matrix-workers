@@ -212,4 +212,12 @@ describe('resolveState routing', () => {
     const name = resolved.find((e) => e.type === 'm.room.name');
     expect(name?.event_id).toBe('$name-alice');
   });
+
+  it('routes room versions 2–12 to the v2 algorithm path', () => {
+    const create = createEvent();
+    const join = member('@alice:example.com', 'join');
+    for (const v of ['2', '5', '10', '12']) {
+      expect(resolveState(v, [[create, join]])).toEqual([create, join]);
+    }
+  });
 });

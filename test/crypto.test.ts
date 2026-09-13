@@ -91,4 +91,27 @@ describe('generateRandomString', () => {
     expect(s).toHaveLength(48);
     expect(s).toMatch(/^[A-Za-z0-9]+$/);
   });
+
+  it('returns empty string for zero length', () => {
+    expect(generateRandomString(0)).toBe('');
+  });
+});
+
+describe('canonicalJson arrays and nested sorting', () => {
+  it('does not sort array element order', () => {
+    expect(canonicalJson([{ b: 1, a: 2 }, { d: 3, c: 4 }])).toBe('[{"a":2,"b":1},{"c":4,"d":3}]');
+  });
+
+  it('encodes empty objects and arrays', () => {
+    expect(canonicalJson({})).toBe('{}');
+    expect(canonicalJson([])).toBe('[]');
+  });
+});
+
+describe('sha256 bytes input', () => {
+  it('hashes Uint8Array input', async () => {
+    const fromString = await sha256('abc');
+    const fromBytes = await sha256(new TextEncoder().encode('abc'));
+    expect(fromBytes).toBe(fromString);
+  });
 });

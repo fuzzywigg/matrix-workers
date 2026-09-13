@@ -72,4 +72,21 @@ describe('resolveMaxStalenessMs', () => {
       86_400_000_000
     );
   });
+
+  it('rejects whitespace-only and hex-looking non-decimal strings', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '   ' })).toBe(
+      DEFAULT_KEY_MAX_STALENESS_MS
+    );
+    // parseInt('0x10') === 0 → rejected by > 0 check
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '0x10' })).toBe(
+      DEFAULT_KEY_MAX_STALENESS_MS
+    );
+  });
+});
+
+describe('isKeyTooStale future-dated keys', () => {
+  it('never treats a future valid_until as stale', () => {
+    const now = 1_700_000_000_000;
+    expect(isKeyTooStale(now + 365 * 24 * 60 * 60 * 1000, now, 1)).toBe(false);
+  });
 });

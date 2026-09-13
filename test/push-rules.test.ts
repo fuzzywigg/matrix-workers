@@ -96,6 +96,45 @@ describe('matchesCondition', () => {
       )
     ).toBe(true);
   });
+
+  it('evaluates <= and >= room_member_count operators', () => {
+    expect(matchesCondition({ kind: 'room_member_count', is: '<=2' }, message, userId, 2)).toBe(
+      true
+    );
+    expect(matchesCondition({ kind: 'room_member_count', is: '>=2' }, message, userId, 2)).toBe(
+      true
+    );
+    expect(matchesCondition({ kind: 'room_member_count', is: '<=1' }, message, userId, 2)).toBe(
+      false
+    );
+    expect(matchesCondition({ kind: 'room_member_count', is: '>=3' }, message, userId, 2)).toBe(
+      false
+    );
+  });
+
+  it('rejects malformed room_member_count specs and missing is', () => {
+    expect(matchesCondition({ kind: 'room_member_count' }, message, userId, 2)).toBe(false);
+    expect(matchesCondition({ kind: 'room_member_count', is: '~~2' }, message, userId, 2)).toBe(
+      false
+    );
+  });
+
+  it('treats sender_notification_permission as always true (simplified)', () => {
+    expect(
+      matchesCondition({ kind: 'sender_notification_permission' }, message, userId, 2)
+    ).toBe(true);
+  });
+
+  it('rejects event_property_contains when the value is not an array', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.body', value: 'Hello' },
+        message,
+        userId,
+        2
+      )
+    ).toBe(false);
+  });
 });
 
 describe('matchesRule', () => {
@@ -124,5 +163,33 @@ describe('matchesRule', () => {
     };
     expect(matchesRule(rule, message, userId, 2)).toBe(true);
     expect(matchesRule(rule, message, userId, 9)).toBe(false);
+  });
+
+  it('matches rules with neither pattern nor conditions', () => {
+    const rule: PushRule = {
+      rule_id: '.m.rule.master',
+      default: true,
+      enabled: true,
+      actions: ['dont_notify'],
+    };
+    expect(matchesRule(rule, message, userId, 2)).toBe(true);
+  });
+
+  it('matches glob content patterns case-insensitively', () => {
+    const rule: PushRule = {
+      rule_id: 'custom-glob',
+      default: false,
+      enabled: true,
+      pattern: 'HELLO*',
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, message, userId, 2)).toBe(true);
+  });
+});
+
+describe('getNestedValue deeper paths', () => {
+  it('walks multi-level paths and stops on null', () => {
+    expect(getNestedValue({ a: { b: { c: 1 } } }, 'a.b.c')).toBe(1);
+    expect(getNestedValue({ a: null }, 'a.b')).toBeUndefined();
   });
 });

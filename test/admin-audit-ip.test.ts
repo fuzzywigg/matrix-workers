@@ -48,4 +48,17 @@ describe('getActorIp', () => {
   it('returns null when no trusted IP source is available', () => {
     expect(getActorIp(makeContext({}, { TRUST_FORWARDED_FOR: 'true' }))).toBeNull();
   });
+
+  it('ignores blank CF-Connecting-IP and falls through', () => {
+    // Empty string is falsy → treated as absent
+    expect(getActorIp(makeContext({ 'CF-Connecting-IP': '' }))).toBeNull();
+  });
+
+  it('returns null for blank XFF first hop when opted in', () => {
+    expect(
+      getActorIp(
+        makeContext({ 'X-Forwarded-For': '  , 10.0.0.1' }, { TRUST_FORWARDED_FOR: 'true' })
+      )
+    ).toBeNull();
+  });
 });

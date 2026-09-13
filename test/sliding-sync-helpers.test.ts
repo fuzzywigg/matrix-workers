@@ -41,6 +41,18 @@ describe('matchesSlidingRoomFilters', () => {
     expect(matchesSlidingRoomFilters('Named', false, { is_dm: false })).toBe(true);
     expect(matchesSlidingRoomFilters(null, true, { is_dm: false })).toBe(false);
   });
+
+  it('requires both name and is_dm filters when both are set', () => {
+    expect(
+      matchesSlidingRoomFilters('Matrix HQ', true, { room_name_like: 'hq', is_dm: true })
+    ).toBe(true);
+    expect(
+      matchesSlidingRoomFilters('Matrix HQ', false, { room_name_like: 'hq', is_dm: true })
+    ).toBe(false);
+    expect(
+      matchesSlidingRoomFilters('Matrix HQ', true, { room_name_like: 'zzz', is_dm: true })
+    ).toBe(false);
+  });
 });
 
 describe('resolveListRange', () => {
@@ -74,6 +86,20 @@ describe('resolveListRange', () => {
     expect(resolveListRange({ ranges: [[0, 2]] }, 5, false)).toEqual({
       startIndex: 0,
       endIndex: 2,
+    });
+  });
+
+  it('clamps endIndex to roomCount - 1 when the requested end overshoots', () => {
+    expect(resolveListRange({ range: [0, 999] }, 3)).toEqual({
+      startIndex: 0,
+      endIndex: 2,
+    });
+  });
+
+  it('uses the first MSC3575 range only', () => {
+    expect(resolveListRange({ ranges: [[5, 7], [0, 1]] }, 20, true)).toEqual({
+      startIndex: 5,
+      endIndex: 7,
     });
   });
 });
@@ -150,6 +176,16 @@ describe('detectNSERequest', () => {
     });
     expect(result.indicators.length).toBeGreaterThanOrEqual(2);
     expect(result.isLikelyNSE).toBe(true);
+  });
+
+  it('does not flag small-timeline-limit when any subscription exceeds 5', () => {
+    const result = detectNSERequest(undefined, {
+      room_subscriptions: {
+        '!a:example.com': { timeline_limit: 3 },
+        '!b:example.com': { timeline_limit: 20 },
+      },
+    });
+    expect(result.indicators).not.toContain('small-timeline-limit');
   });
 
   it('returns empty indicators for a normal Element X request', () => {

@@ -140,4 +140,36 @@ describe('RATE_LIMITS', () => {
     expect(RATE_LIMITS.login.requests).toBeLessThan(RATE_LIMITS.default.requests);
     expect(RATE_LIMITS.register.requests).toBeLessThan(RATE_LIMITS.login.requests);
   });
+
+  it('gives sync and federation higher throughput than default', () => {
+    expect(RATE_LIMITS.sync.requests).toBeGreaterThan(RATE_LIMITS.default.requests);
+    expect(RATE_LIMITS.federation.requests).toBeGreaterThan(RATE_LIMITS.default.requests);
+  });
+});
+
+describe('getRateLimitType sliding sync and keys query', () => {
+  it('classifies sliding sync under the sync bucket', () => {
+    expect(getRateLimitType('/_matrix/client/unstable/org.matrix.msc3575/sync', 'POST')).toBe(
+      'sync'
+    );
+    expect(getRateLimitType('/_matrix/client/v3/sync', 'POST')).toBe('sync');
+  });
+
+  it('classifies keys claim/query as e2ee', () => {
+    expect(getRateLimitType('/_matrix/client/v3/keys/claim', 'POST')).toBe('e2ee');
+    expect(getRateLimitType('/_matrix/client/v3/keys/query', 'POST')).toBe('e2ee');
+  });
+});
+
+describe('getClientId edge cases', () => {
+  it('falls back to unknown when opted-in XFF is empty', () => {
+    expect(
+      getClientId(
+        makeContext({
+          headers: { 'X-Forwarded-For': '  , 10.0.0.1' },
+          env: { TRUST_FORWARDED_FOR: 'true' },
+        })
+      )
+    ).toBe('ip:unknown');
+  });
 });

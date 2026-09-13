@@ -45,4 +45,24 @@ describe('extractAccessToken', () => {
     expect(extractAccessToken(basic)).toBeNull();
     expect(extractAccessToken(emptyBearer)).toBeNull();
   });
+
+  it('returns null when Authorization is only Bearer with trailing spaces', () => {
+    // Fetch Headers typically trim, leaving a bare "Bearer" that fails the regex
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Authorization: 'Bearer   ' },
+    });
+    expect(extractAccessToken(req)).toBeNull();
+  });
+
+  it('treats empty access_token query values as missing (falsy)', () => {
+    const req = new Request('https://matrix.example.com/?access_token=');
+    expect(extractAccessToken(req)).toBeNull();
+  });
+
+  it('allows tokens that contain spaces after the first non-space', () => {
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Authorization: 'Bearer tok with spaces' },
+    });
+    expect(extractAccessToken(req)).toBe('tok with spaces');
+  });
 });

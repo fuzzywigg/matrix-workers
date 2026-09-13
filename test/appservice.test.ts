@@ -116,4 +116,41 @@ describe('getInterestedAppServices', () => {
       })
     ).toEqual([]);
   });
+
+  it('does not match membership state_key against room namespaces', () => {
+    expect(
+      getInterestedAppServices([bridge], {
+        room_id: '!plain:example.com',
+        sender: '@admin:example.com',
+        state_key: '!bridge_portal:example.com',
+        type: 'm.room.member',
+      })
+    ).toEqual([]);
+  });
+});
+
+describe('isExclusiveAppServiceAlias excludeAsId', () => {
+  it('honors excludeAsId for exclusive aliases', () => {
+    expect(
+      isExclusiveAppServiceAlias([bridge], '#_bridge_room:example.com', 'bridge')
+    ).toBeNull();
+    expect(
+      isExclusiveAppServiceAlias([bridge], '#_bridge_room:example.com', 'other')
+    ).toBe(bridge);
+  });
+});
+
+describe('appservice empty namespaces', () => {
+  it('handles registrations with empty namespace lists', () => {
+    const empty = registration('empty', { users: [], rooms: [], aliases: [] });
+    expect(isExclusiveAppServiceUser([empty], '@anyone:example.com')).toBeNull();
+    expect(isExclusiveAppServiceAlias([empty], '#anyone:example.com')).toBeNull();
+    expect(
+      getInterestedAppServices([empty], {
+        room_id: '!r:example.com',
+        sender: '@a:example.com',
+        type: 'm.room.message',
+      })
+    ).toEqual([]);
+  });
 });

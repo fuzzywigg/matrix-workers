@@ -43,4 +43,10 @@ describe('generateLiveKitToken', () => {
     const claims = decodePart(token.split('.')[1]) as { name: string };
     expect(claims.name).toBe('id-only');
   });
+
+  it('defaults TTL to 3600 seconds when omitted', async () => {
+    const token = await generateLiveKitToken('k', 's', 'room', 'id', 'Name');
+    const claims = decodePart(token.split('.')[1]) as { nbf: number; exp: number };
+    expect(claims.exp - claims.nbf).toBe(3600);
+  });
 });

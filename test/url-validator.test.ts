@@ -79,4 +79,37 @@ describe('validateUrlForPreview', () => {
   it('still rejects SSRF targets', () => {
     expect(validateUrlForPreview('http://127.0.0.1').valid).toBe(false);
   });
+
+  it('allows http/https default ports and rejects ftp even for preview', () => {
+    expect(validateUrlForPreview('http://example.com:80').valid).toBe(true);
+    expect(validateUrlForPreview('https://example.com:443').valid).toBe(true);
+    expect(validateUrlForPreview('ftp://example.com').valid).toBe(false);
+  });
+});
+
+describe('validateUrl additional ranges', () => {
+  it('rejects 0.0.0.0 and broadcast', () => {
+    expect(validateUrl('http://0.0.0.0/').valid).toBe(false);
+    expect(validateUrl('http://255.255.255.255/').valid).toBe(false);
+  });
+
+  it('rejects documentation IPv6 and multicast', () => {
+    expect(validateUrl('http://[2001:db8::1]/').valid).toBe(false);
+    expect(validateUrl('http://[ff02::1]/').valid).toBe(false);
+  });
+
+  it('allows public 172.32.x (outside RFC1918 172.16/12)', () => {
+    expect(validateUrl('http://172.32.0.1/').valid).toBe(true);
+  });
+
+  it('rejects kubernetes.default and localhost.localdomain', () => {
+    expect(validateUrl('http://kubernetes.default/').valid).toBe(false);
+    expect(validateUrl('http://localhost.localdomain/').valid).toBe(false);
+  });
+
+  it('rejects blocked ports used by redis/mysql/ssh', () => {
+    expect(validateUrl('https://example.com:22').error).toMatch(/port/i);
+    expect(validateUrl('https://example.com:3306').valid).toBe(false);
+    expect(validateUrl('https://example.com:6379').valid).toBe(false);
+  });
 });

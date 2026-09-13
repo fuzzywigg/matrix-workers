@@ -126,4 +126,27 @@ describe('sync tokens', () => {
     expect(token).toBe('s10_td20');
     expect(parseSyncToken(token)).toEqual({ events: 10, toDevice: 20 });
   });
+
+  it('builds zero positions', () => {
+    expect(buildSyncToken(0, 0)).toBe('s0_td0');
+  });
+
+  it('treats empty composite leftovers as garbage', () => {
+    expect(parseSyncToken('s_td1')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s1_td')).toEqual({ events: 0, toDevice: 0 });
+  });
+});
+
+describe('applyEventFilter sender whitelist empty', () => {
+  it('treats empty senders whitelist as unrestricted', () => {
+    expect(applyEventFilter(events, { senders: [] })).toEqual(events);
+  });
+
+  it('applies not_senders with empty types', () => {
+    expect(
+      applyEventFilter(events, { types: [], not_senders: ['@alice:example.com'] }).map(
+        (e) => e.sender
+      )
+    ).toEqual(['@bob:example.com']);
+  });
 });

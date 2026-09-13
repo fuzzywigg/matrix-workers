@@ -66,4 +66,33 @@ describe('validateStateEvent', () => {
       validateStateEvent({ type: 'm.room.name', content: ['not', 'an', 'object'] }, 0).valid
     ).toBe(false);
   });
+
+  it('accepts guest_access, history_visibility, and avatar events', () => {
+    expect(
+      validateStateEvent(
+        { type: 'm.room.guest_access', state_key: '', content: { guest_access: 'can_join' } },
+        0
+      ).valid
+    ).toBe(true);
+    expect(
+      validateStateEvent(
+        {
+          type: 'm.room.history_visibility',
+          state_key: '',
+          content: { history_visibility: 'shared' },
+        },
+        0
+      ).valid
+    ).toBe(true);
+    expect(
+      validateStateEvent(
+        { type: 'm.room.avatar', state_key: '', content: { url: 'mxc://example.com/abc' } },
+        3
+      ).valid
+    ).toBe(true);
+  });
+
+  it('includes the index in error messages', () => {
+    expect(validateStateEvent(null, 7).error).toMatch(/initial_state\[7\]/);
+  });
 });

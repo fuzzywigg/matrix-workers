@@ -96,4 +96,17 @@ describe('getRedactionAllowedKeys', () => {
     expect(getRoomVersion('11')?.redactionAlgorithm).toBe('v11');
     expect(getRoomVersion('12')?.redactionAlgorithm).toBe('v11');
   });
+
+  it('returns only envelope keys for ordinary message types', () => {
+    const v10 = getRoomVersion('10')!;
+    const keys = getRedactionAllowedKeys('m.room.message', v10);
+    expect(keys).not.toContain('body');
+    expect(keys).not.toContain('msgtype');
+  });
+
+  it('marks v12 knock_restricted capability like v10+', () => {
+    expect(getRoomVersion('12')?.knockRestrictedSupported).toBe(true);
+    expect(getRoomVersion('12')?.integerPowerLevels).toBe(true);
+    expect(getRoomVersion('12')?.updatedRedactionRules).toBe(true);
+  });
 });
