@@ -151,3 +151,17 @@ describe('errors TOKENMAXX edge paths after #50', () => {
     await expect(res.json()).resolves.toEqual({ ok: true });
   });
 });
+
+
+describe('errors TOKENMAXX edge paths after #55', () => {
+  it('maps non-Error throws to M_UNKNOWN 500', async () => {
+    const res = await withErrorHandler(async () => {
+      throw 'boom';
+    });
+    expect(res).toBeInstanceOf(Response);
+    expect((res as Response).status).toBe(500);
+    await expect((res as Response).json()).resolves.toMatchObject({
+      errcode: 'M_UNKNOWN',
+    });
+  });
+});

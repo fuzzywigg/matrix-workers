@@ -4,6 +4,7 @@ import {
   isExclusiveAppServiceAlias,
   getInterestedAppServices,
   getAppServiceByToken,
+  getAppServices,
   type AppServiceRegistration,
 } from '../src/services/appservice';
 
@@ -394,5 +395,90 @@ describe('getAppServiceByToken / interest TOKENMAXX edge paths after #54', () =>
         type: 'm.room.message',
       })
     ).toEqual([dual]);
+  });
+});
+
+
+describe('appservice TOKENMAXX edge paths after #55', () => {
+  function createAsDb(row: Record<string, unknown> | null) {
+    return {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async first<T>() {
+                return (row as T) ?? null;
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  function createAsListDb(rows: Array<Record<string, unknown>>) {
+    return {
+      prepare() {
+        return {
+          async all<T>() {
+            return { results: rows as T[] };
+          },
+          bind() {
+            return {
+              async all<T>() {
+                return { results: rows as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  it('maps rate_limited values other than 1 to false', async () => {
+    const reg = await getAppServiceByToken(
+      createAsDb({
+        id: 'a',
+        url: 'https://a.example.com',
+        as_token: 'tok',
+        hs_token: 'hs',
+        sender_localpart: 'bot',
+        rate_limited: 2,
+        protocols: null,
+        namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+      }),
+      'tok'
+    );
+    expect(reg?.rate_limited).toBe(false);
+  });
+
+  it('maps getAppServices list rows with null protocols and rate_limited 0/1', async () => {
+    const list = await getAppServices(
+      createAsListDb([
+        {
+          id: 'a',
+          url: 'https://a.example.com',
+          as_token: 'as',
+          hs_token: 'hs',
+          sender_localpart: 'bot',
+          rate_limited: 0,
+          protocols: null,
+          namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+        },
+        {
+          id: 'b',
+          url: 'https://b.example.com',
+          as_token: 'as2',
+          hs_token: 'hs2',
+          sender_localpart: 'bot2',
+          rate_limited: 1,
+          protocols: JSON.stringify(['m.login.sso']),
+          namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+        },
+      ])
+    );
+    expect(list).toHaveLength(2);
+    expect(list[0]).toMatchObject({ id: 'a', rate_limited: false, protocols: [] });
+    expect(list[1]).toMatchObject({ id: 'b', rate_limited: true, protocols: ['m.login.sso'] });
   });
 });

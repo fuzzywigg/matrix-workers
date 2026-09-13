@@ -691,3 +691,160 @@ describe('evaluatePushRules TOKENMAXX edge paths after #54', () => {
   });
 });
 
+
+
+describe('evaluatePushRules TOKENMAXX edge paths after #55', () => {
+  function pushDb(rows: Array<Record<string, unknown>> = []) {
+    return {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async all<T>() {
+                return { results: rows as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  const roomId = '!room:example.com';
+
+  it('treats contradictory notify+dont_notify actions as notify:false', async () => {
+    const result = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.both',
+          conditions: null,
+          actions: JSON.stringify(['notify', 'dont_notify']),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(result.notify).toBe(false);
+  });
+
+  it('highlights when set_tweak highlight omits value; value:false clears highlight', async () => {
+    const highlighted = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.hl',
+          conditions: null,
+          actions: JSON.stringify(['notify', { set_tweak: 'highlight' }]),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(highlighted).toMatchObject({ notify: true, highlight: true });
+
+    const quiet = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.nohl',
+          conditions: null,
+          actions: JSON.stringify([
+            'notify',
+            { set_tweak: 'highlight', value: false },
+          ]),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(quiet).toMatchObject({ notify: true, highlight: false });
+  });
+
+  it('fires default contains_display_name when displayName is provided', async () => {
+    const result = await evaluatePushRules(
+      pushDb(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'hey Display Name here', msgtype: 'm.text' },
+      },
+      5,
+      'Display Name'
+    );
+    expect(result).toMatchObject({ notify: true, highlight: true });
+  });
+
+  it('does not highlight for sound-only tweaks; does for highlight value:true', async () => {
+    const soundOnly = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.sound',
+          conditions: null,
+          actions: JSON.stringify([
+            'notify',
+            { set_tweak: 'sound', value: 'default' },
+          ]),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(soundOnly).toMatchObject({ notify: true, highlight: false });
+
+    const explicit = await evaluatePushRules(
+      pushDb([
+        {
+          kind: 'override',
+          rule_id: '.custom.hltrue',
+          conditions: null,
+          actions: JSON.stringify([
+            'notify',
+            { set_tweak: 'highlight', value: true },
+          ]),
+          enabled: 1,
+        },
+      ]),
+      userId,
+      {
+        type: 'm.room.message',
+        sender: '@bob:example.com',
+        room_id: roomId,
+        content: { body: 'x', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(explicit).toMatchObject({ notify: true, highlight: true });
+  });
+});

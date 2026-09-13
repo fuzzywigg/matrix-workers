@@ -1613,3 +1613,125 @@ describe('event-auth TOKENMAXX edge paths after #54', () => {
     expect(checkEventAuth(pl, state, '10').allowed).toBe(true);
   });
 });
+
+
+describe('checkEventAuth TOKENMAXX edge paths after #55', () => {
+  it('rejects unknown membership values via the default arm', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    for (const membership of ['joined', 'foo'] as const) {
+      const ev = pdu({
+        type: 'm.room.member',
+        event_id: `$bad-${membership}`,
+        sender: '@alice:example.com',
+        state_key: '@bob:example.com',
+        content: { membership },
+      });
+      expect(checkEventAuth(ev, state, '10').error).toBe(`Unknown membership: ${membership}`);
+    }
+  });
+
+  it('rejects restricted joins when the authorizer is invited but not joined', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'invite', '@alice:example.com'),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'restricted' },
+      }),
+      powerLevels({ '@alice:example.com': 100, '@bob:example.com': 50 }),
+    ];
+    const join = pdu({
+      type: 'm.room.member',
+      event_id: '$join',
+      sender: '@carol:example.com',
+      state_key: '@carol:example.com',
+      content: {
+        membership: 'join',
+        join_authorised_via_users_server: '@bob:example.com',
+      },
+    });
+    expect(checkEventAuth(join, state, '10').error).toMatch(/Not authorized to join/);
+  });
+
+  it('rejects self-ban when sender power equals target power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@alice:example.com', 'ban', '@alice:example.com'), state, '10')
+        .error
+    ).toMatch(/Cannot ban user with equal or higher power/);
+  });
+
+  it('rejects message sends from invited (non-joined) senders', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'invite', '@alice:example.com'),
+    ];
+    expect(
+      checkEventAuth(
+        pdu({
+          type: 'm.room.message',
+          event_id: '$msg',
+          sender: '@bob:example.com',
+          content: { msgtype: 'm.text', body: 'hi' },
+        }),
+        state,
+        '10'
+      ).error
+    ).toMatch(/not joined/i);
+  });
+
+  it('allows restricted joins when authorizer invite PL equals the invite threshold', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'restricted' },
+      }),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100, '@bob:example.com': 50 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 50,
+        },
+      }),
+    ];
+    const join = pdu({
+      type: 'm.room.member',
+      event_id: '$join',
+      sender: '@carol:example.com',
+      state_key: '@carol:example.com',
+      content: {
+        membership: 'join',
+        join_authorised_via_users_server: '@bob:example.com',
+      },
+    });
+    expect(checkEventAuth(join, state, '10').allowed).toBe(true);
+  });
+});

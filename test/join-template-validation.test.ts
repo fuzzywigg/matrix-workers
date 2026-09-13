@@ -351,3 +351,19 @@ describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #54', () => {
     ).not.toThrow();
   });
 });
+
+
+describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #55', () => {
+  it('rejects event IDs whose domain segment contains a port colon', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({
+          auth_events: ['$opaque:matrix.example.com:8448'],
+          prev_events: ['$prev1'],
+        }),
+        roomId,
+        userId
+      )
+    ).toThrow(/event ID/);
+  });
+});

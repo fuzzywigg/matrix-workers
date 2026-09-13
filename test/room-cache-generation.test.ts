@@ -2,9 +2,14 @@ import { describe, it, expect } from 'vitest';
 import {
   bumpRoomCacheGeneration,
   getRoomCacheGeneration,
+  invalidateRoomCache,
+  invalidateBatchRoomCache,
 } from '../src/services/room-cache';
 
-function mockKv(data: Record<string, string> = {}, opts: { getThrows?: boolean; putThrows?: boolean } = {}) {
+function mockKv(
+  data: Record<string, string> = {},
+  opts: { getThrows?: boolean; putThrows?: boolean; deleteThrows?: boolean } = {}
+) {
   return {
     get: async (key: string) => {
       if (opts.getThrows) throw new Error('kv get failed');
@@ -15,6 +20,7 @@ function mockKv(data: Record<string, string> = {}, opts: { getThrows?: boolean; 
       data[key] = value;
     },
     delete: async (key: string) => {
+      if (opts.deleteThrows) throw new Error('kv delete failed');
       delete data[key];
     },
     list: async () => ({ keys: [], list_complete: true, cacheStatus: null }),
@@ -52,5 +58,40 @@ describe('room-cache generation TOKENMAXX edge paths after #54', () => {
     await expect(
       bumpRoomCacheGeneration(mockKv({}, { putThrows: true }), '!r:ex.com')
     ).rejects.toThrow(/kv put failed/);
+  });
+});
+
+
+describe('room-cache TOKENMAXX edge paths after #55', () => {
+  it('treats Infinity / empty-string stored generations as zero', async () => {
+    expect(await getRoomCacheGeneration(mockKv({ 'room-meta-gen:!r:ex.com': 'Infinity' }), '!r:ex.com')).toBe(0);
+    expect(await bumpRoomCacheGeneration(mockKv({ 'room-meta-gen:!r:ex.com': 'Infinity' }), '!r:ex.com')).toBe(1);
+    expect(await getRoomCacheGeneration(mockKv({ 'room-meta-gen:!r:ex.com': '' }), '!r:ex.com')).toBe(0);
+    expect(await bumpRoomCacheGeneration(mockKv({ 'room-meta-gen:!r:ex.com': '' }), '!r:ex.com')).toBe(1);
+  });
+
+  it('documents parseInt scientific notation: 1e3 → 1 then bump to 2', async () => {
+    const data: Record<string, string> = { 'room-meta-gen:!r:ex.com': '1e3' };
+    expect(await getRoomCacheGeneration(mockKv(data), '!r:ex.com')).toBe(1);
+    expect(await bumpRoomCacheGeneration(mockKv(data), '!r:ex.com')).toBe(2);
+  });
+
+  it('invalidates single and batch room-meta keys; swallows delete failures', async () => {
+    const data: Record<string, string> = {
+      'room-meta:!a:ex.com': '{}',
+      'room-meta:!b:ex.com': '{}',
+      'room-meta-gen:!a:ex.com': '1',
+    };
+    const kv = mockKv(data);
+    await invalidateRoomCache(kv, '!a:ex.com');
+    expect(data['room-meta:!a:ex.com']).toBeUndefined();
+    expect(data['room-meta-gen:!a:ex.com']).toBe('1');
+
+    await invalidateBatchRoomCache(kv, ['!b:ex.com', '!missing:ex.com']);
+    expect(data['room-meta:!b:ex.com']).toBeUndefined();
+
+    await expect(
+      invalidateRoomCache(mockKv({}, { deleteThrows: true }), '!x:ex.com')
+    ).resolves.toBeUndefined();
   });
 });

@@ -225,3 +225,24 @@ describe('transactions TOKENMAXX edge paths after #54', () => {
     expect(db.store.has(recentKey)).toBe(true);
   });
 });
+
+
+describe('transactions TOKENMAXX edge paths after #55', () => {
+  it('stores null for empty-string response via truthy stringify guard', async () => {
+    const db = createTxnDb();
+    await storeTransaction(db, '@u:ex.com', 'tempty', '$ev', '');
+    expect(await getTransaction(db, '@u:ex.com', 'tempty')).toEqual({
+      eventId: '$ev',
+      response: undefined,
+    });
+  });
+
+  it('round-trips truthy array responses through JSON stringify/parse', async () => {
+    const db = createTxnDb();
+    await storeTransaction(db, '@u:ex.com', 'tarr', '$ev', []);
+    expect(await getTransaction(db, '@u:ex.com', 'tarr')).toEqual({
+      eventId: '$ev',
+      response: [],
+    });
+  });
+});
