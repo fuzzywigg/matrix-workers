@@ -162,3 +162,85 @@ describe('room-versions TOKENMAXX edge paths after #50', () => {
     expect(getRoomVersion('3')?.eventIdFormat).toBe('v3');
   });
 });
+
+describe('room-versions TOKENMAXX redaction matrix after #69', () => {
+  const ENVELOPE = [
+    'event_id',
+    'type',
+    'room_id',
+    'sender',
+    'state_key',
+    'hashes',
+    'signatures',
+    'depth',
+    'prev_events',
+    'auth_events',
+    'origin_server_ts',
+  ];
+
+  it('v10 member/create/power_levels/join_rules/history_visibility matrix', () => {
+    const v10 = getRoomVersion('10')!;
+    expect(getRedactionAllowedKeys('m.room.member', v10)).toEqual([
+      ...ENVELOPE,
+      'membership',
+      'join_authorised_via_users_server',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.create', v10)).toEqual([...ENVELOPE, 'creator']);
+    expect(getRedactionAllowedKeys('m.room.power_levels', v10)).toEqual([
+      ...ENVELOPE,
+      'ban',
+      'events',
+      'events_default',
+      'invite',
+      'kick',
+      'redact',
+      'state_default',
+      'users',
+      'users_default',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.join_rules', v10)).toEqual([
+      ...ENVELOPE,
+      'join_rule',
+      'allow',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.history_visibility', v10)).toEqual([
+      ...ENVELOPE,
+      'history_visibility',
+    ]);
+    expect(getRedactionAllowedKeys('m.room.redaction', v10)).toEqual([...ENVELOPE]);
+  });
+
+  it('v11/v12 expand member/create/power_levels/redaction content keys exactly once', () => {
+    for (const ver of ['11', '12'] as const) {
+      const behavior = getRoomVersion(ver)!;
+      const member = getRedactionAllowedKeys('m.room.member', behavior);
+      expect(member.filter((k) => k === 'third_party_invite')).toHaveLength(1);
+      expect(member).toContain('third_party_invite');
+
+      const create = getRedactionAllowedKeys('m.room.create', behavior);
+      expect(create.filter((k) => k === 'room_version')).toHaveLength(1);
+
+      const pl = getRedactionAllowedKeys('m.room.power_levels', behavior);
+      expect(pl.filter((k) => k === 'notifications')).toHaveLength(1);
+
+      const redaction = getRedactionAllowedKeys('m.room.redaction', behavior);
+      expect(redaction.filter((k) => k === 'redacts')).toHaveLength(1);
+    }
+  });
+
+  it('unknown event types stay envelope-only on v10 and v11', () => {
+    for (const ver of ['10', '11'] as const) {
+      const behavior = getRoomVersion(ver)!;
+      expect(getRedactionAllowedKeys('org.example.custom', behavior)).toEqual([...ENVELOPE]);
+      expect(getRedactionAllowedKeys('m.room.message', behavior)).toEqual([...ENVELOPE]);
+    }
+  });
+
+  it('v1–v10 share redactionAlgorithm v1 content key sets for create', () => {
+    for (const ver of ['1', '5', '10'] as const) {
+      const behavior = getRoomVersion(ver)!;
+      expect(behavior.redactionAlgorithm).toBe('v1');
+      expect(getRedactionAllowedKeys('m.room.create', behavior)).not.toContain('room_version');
+    }
+  });
+});

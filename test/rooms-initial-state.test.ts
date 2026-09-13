@@ -162,3 +162,34 @@ describe('validateStateEvent TOKENMAXX edge paths after #50', () => {
     ).toBe(true);
   });
 });
+
+describe('validateStateEvent TOKENMAXX edge paths after #69', () => {
+  it('uses exact error strings for disallowed auto-created types', () => {
+    expect(validateStateEvent({ type: 'm.room.create', content: {} }, 2).error).toMatch(
+      /initial_state\[2\].*cannot be set/
+    );
+    expect(validateStateEvent({ type: 'm.room.member', content: {} }, 0).error).toMatch(
+      /cannot be set/
+    );
+    expect(validateStateEvent({ type: 'm.room.power_levels', content: {} }, 1).error).toMatch(
+      /cannot be set/
+    );
+  });
+
+  it('rejects encryption algorithm that is an empty string', () => {
+    expect(
+      validateStateEvent({ type: 'm.room.encryption', content: { algorithm: '' } }, 0).error
+    ).toMatch(/unsupported algorithm|algorithm/);
+  });
+
+  it('interpolates large indexes into error messages', () => {
+    expect(validateStateEvent(undefined, 99).error).toMatch(/initial_state\[99\]/);
+  });
+
+  it('treats empty-string state_key as valid string', () => {
+    expect(
+      validateStateEvent({ type: 'm.room.topic', state_key: '', content: { topic: 't' } }, 0)
+        .valid
+    ).toBe(true);
+  });
+});
