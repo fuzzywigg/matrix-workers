@@ -105,3 +105,17 @@ describe('isValidServerName TOKENMAXX edge paths after #49', () => {
     expect(isValidServerName('evil.example.com:5900')).toBe(false);
   });
 });
+
+describe('isValidServerName TOKENMAXX edge paths after #50', () => {
+  it('accepts public 172.32.0.1 outside RFC1918 172.16/12', () => {
+    expect(isValidServerName('172.32.0.1')).toBe(true);
+  });
+
+  it('rejects exact hostname internal', () => {
+    expect(isValidServerName('internal')).toBe(false);
+  });
+
+  it('rejects PostgreSQL port 5432 on public hosts', () => {
+    expect(isValidServerName('matrix.org:5432')).toBe(false);
+  });
+});

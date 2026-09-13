@@ -358,3 +358,30 @@ describe('media helpers TOKENMAXX edge paths after #49', () => {
     expect(extractOpenGraphPreview(html)['og:description']).toBe('OG');
   });
 });
+
+describe('media helpers TOKENMAXX edge paths after #50', () => {
+  it('accepts remaining whitelist MIME entries audio/webm and image/gif', () => {
+    expect(SUPPORTED_TYPES).toContain('audio/webm');
+    expect(SUPPORTED_TYPES).toContain('image/gif');
+    expect(isSupportedContentType('audio/webm')).toBe(true);
+    expect(isSupportedContentType('image/gif; charset=binary')).toBe(true);
+  });
+
+  it('preserves internal dots in sanitized filenames', () => {
+    expect(sanitizeFilename('a.b.c.png')).toBe('a.b.c.png');
+  });
+
+  it('skips title fallback when the closing title tag is missing', () => {
+    expect(extractOpenGraphPreview('<title>Broken')).toEqual({});
+  });
+
+  it('leaves numeric HTML entities undecoded', () => {
+    expect(decodeHtmlEntities('&#65;')).toBe('&#65;');
+  });
+
+  it('clamps 1921 down to 1920 and uses fallback for -0', () => {
+    expect(clampThumbnailDimension('1921')).toBe(1920);
+    // parseInt('-0') === 0 → falsy → fallback
+    expect(clampThumbnailDimension('-0')).toBe(96);
+  });
+});

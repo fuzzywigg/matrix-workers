@@ -212,3 +212,20 @@ describe('sync filters TOKENMAXX edge paths after #49', () => {
     expect(parseSyncToken('3.14')).toEqual({ events: 3, toDevice: 3 });
   });
 });
+
+describe('sync filters TOKENMAXX edge paths after #50', () => {
+  it('excludes exact not_types without wildcards', () => {
+    expect(
+      applyEventFilter(events, { not_types: ['m.room.member'] }).map((e) => e.type)
+    ).toEqual(['m.room.message', 'm.reaction']);
+  });
+
+  it('preserves filtered order when applying a limit', () => {
+    const limited = applyEventFilter(events, { types: ['m.room.*'], limit: 1 });
+    expect(limited).toEqual([{ type: 'm.room.message', sender: '@alice:example.com' }]);
+  });
+
+  it('interpolates negative positions into sync tokens verbatim', () => {
+    expect(buildSyncToken(-1, -2)).toBe('s-1_td-2');
+  });
+});

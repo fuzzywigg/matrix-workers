@@ -97,3 +97,19 @@ describe('extractAccessToken TOKENMAXX edge paths after #49', () => {
     expect(extractAccessToken(req)).toBe('syt_abc');
   });
 });
+
+describe('extractAccessToken TOKENMAXX edge paths after #50', () => {
+  it('accepts an all-caps BEARER scheme', () => {
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Authorization: 'BEARER tok' },
+    });
+    expect(extractAccessToken(req)).toBe('tok');
+  });
+
+  it('uses the first access_token when the query param is duplicated', () => {
+    const req = new Request(
+      'https://matrix.example.com/?access_token=first&access_token=second'
+    );
+    expect(extractAccessToken(req)).toBe('first');
+  });
+});

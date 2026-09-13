@@ -133,3 +133,32 @@ describe('validateStateEvent TOKENMAXX edge paths after #49', () => {
     expect(validateStateEvent({ type: 'm.room.name', content: null }, 1).error).toMatch(/content/);
   });
 });
+
+describe('validateStateEvent TOKENMAXX edge paths after #50', () => {
+  it('accepts events that omit state_key', () => {
+    expect(
+      validateStateEvent({ type: 'm.room.name', content: { name: 'General' } }, 0).valid
+    ).toBe(true);
+  });
+
+  it('rejects boolean state_key values', () => {
+    expect(
+      validateStateEvent(
+        { type: 'm.room.name', state_key: true, content: { name: 'x' } },
+        0
+      ).valid
+    ).toBe(false);
+  });
+
+  it('accepts encryption events with extra rotation fields', () => {
+    expect(
+      validateStateEvent(
+        {
+          type: 'm.room.encryption',
+          content: { algorithm: 'm.megolm.v1.aes-sha2', rotation_period_ms: 1 },
+        },
+        0
+      ).valid
+    ).toBe(true);
+  });
+});

@@ -201,3 +201,44 @@ describe('validateUrl TOKENMAXX edge paths after #49', () => {
     expect(validateUrl('   ').valid).toBe(false);
   });
 });
+
+describe('validateUrl TOKENMAXX edge paths after #50', () => {
+  it('rejects PostgreSQL port 5432 on public hosts', () => {
+    const result = validateUrl('https://example.com:5432');
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/port 5432/i);
+  });
+
+  it('rejects remaining site-local IPv6 fee/fef prefixes', () => {
+    expect(validateUrl('http://[fee0::1]/').valid).toBe(false);
+    expect(validateUrl('http://[fef0::1]/').valid).toBe(false);
+  });
+
+  it('rejects documentation IPv6 with explicit 0db8 nibble spelling', () => {
+    expect(validateUrl('http://[2001:0db8::1]/').valid).toBe(false);
+  });
+
+  it('rejects expanded IPv6 loopback and unspecified forms', () => {
+    expect(validateUrl('http://[0:0:0:0:0:0:0:1]/').valid).toBe(false);
+    expect(validateUrl('http://[0:0:0:0:0:0:0:0]/').valid).toBe(false);
+  });
+
+  it('rejects exact hostname internal and its subdomains of metadata.google.internal', () => {
+    expect(validateUrl('http://internal/').valid).toBe(false);
+    expect(validateUrl('http://x.metadata.google.internal/').valid).toBe(false);
+  });
+
+  it('rejects invalid IPv4 octets rejected by the WHATWG URL parser', () => {
+    // Browsers/Workers reject 999 as an IPv4 octet before SSRF range checks run
+    expect(validateUrl('http://1.2.3.999/')).toEqual({
+      valid: false,
+      error: 'Invalid URL format',
+    });
+  });
+
+  it('returns the preview-specific port error message for unusual ports', () => {
+    expect(validateUrlForPreview('https://example.com:9000').error).toBe(
+      'Only standard HTTP ports (80, 443, 8080, 8443) are allowed for URL preview'
+    );
+  });
+});

@@ -243,3 +243,45 @@ describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #49', () => {
     ).not.toThrow();
   });
 });
+
+describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #50', () => {
+  it('rejects undefined depth', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: undefined }), roomId, userId)
+    ).toThrow(/depth/);
+  });
+
+  it('rejects empty-string sender', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ sender: '' }), roomId, userId)
+    ).toThrow(/sender mismatch/);
+  });
+
+  it('rejects event IDs with empty domains', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ auth_events: ['$id:'], prev_events: ['$prev1'] }),
+        roomId,
+        userId
+      )
+    ).toThrow(/event ID/);
+  });
+
+  it('rejects non-string prev_events entries', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ prev_events: [123] }), roomId, userId)
+    ).toThrow(/event ID/);
+  });
+
+  it('rejects null content', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ content: null }), roomId, userId)
+    ).toThrow(/membership/);
+  });
+
+  it('rejects undefined root templates', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(undefined as unknown as Record<string, unknown>, roomId, userId)
+    ).toThrow(/not an object/);
+  });
+});

@@ -155,3 +155,18 @@ describe('crypto TOKENMAXX edge paths after #49', () => {
     expect(canonicalJson(undefined)).toBe('null');
   });
 });
+
+describe('crypto TOKENMAXX edge paths after #50', () => {
+  it('rejects verifyPassword when iterations exceed 2000000', async () => {
+    // Format: $pbkdf2-sha256$iterations$salt$hash — iterations parse before crypto work
+    expect(await verifyPassword('password1', '$pbkdf2-sha256$2000001$c2FsdA$hash')).toBe(false);
+  });
+
+  it('rejects malformed hashes with the wrong number of $-separated parts', async () => {
+    expect(await verifyPassword('password1', '$pbkdf2-sha256$100000$onlythree')).toBe(false);
+  });
+
+  it('encodes nested null values in canonicalJson', () => {
+    expect(canonicalJson({ a: null })).toBe('{"a":null}');
+  });
+});

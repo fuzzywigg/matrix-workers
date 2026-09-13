@@ -301,3 +301,37 @@ describe('sliding-sync TOKENMAXX edge paths after #49', () => {
     expect(result.indicators).not.toContain('single-room-subscription');
   });
 });
+
+describe('sliding-sync TOKENMAXX edge paths after #50', () => {
+  it('flags single-room-subscription when lists is an empty object', () => {
+    const result = detectNSERequest(undefined, {
+      lists: {},
+      room_subscriptions: { '!a:example.com': { timeline_limit: 10 } },
+    });
+    expect(result.indicators).toContain('single-room-subscription');
+  });
+
+  it('rejects named one-member rooms as DMs', () => {
+    expect(isDmRoom(1, 'Named')).toBe(false);
+  });
+
+  it('treats undefined filters like an empty filter object', () => {
+    expect(matchesSlidingRoomFilters('Room', false, undefined)).toBe(true);
+  });
+
+  it('falls through empty ranges to the full list when preferRangesFirst is true', () => {
+    expect(resolveListRange({ ranges: [] }, 5, true)).toEqual({
+      startIndex: 0,
+      endIndex: 4,
+    });
+  });
+
+  it('marks NotificationService + single-room as likely NSE', () => {
+    const result = detectNSERequest('NotificationService/1.0', {
+      room_subscriptions: { '!a:example.com': { timeline_limit: 10 } },
+    });
+    expect(result.indicators).toContain('user-agent-nse');
+    expect(result.indicators).toContain('single-room-subscription');
+    expect(result.isLikelyNSE).toBe(true);
+  });
+});

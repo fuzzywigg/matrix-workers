@@ -1172,3 +1172,246 @@ describe('checkEventAuth TOKENMAXX edge paths after #49', () => {
     expect(checkEventAuth(msg, state, '10').allowed).toBe(true);
   });
 });
+
+describe('checkEventAuth TOKENMAXX edge paths after #50', () => {
+  it('defaults to room version 10 when roomVersion is omitted', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    const msg = pdu({
+      type: 'm.room.message',
+      event_id: '$msg',
+      sender: '@alice:example.com',
+      content: { body: 'hi', msgtype: 'm.text' },
+    });
+    expect(checkEventAuth(msg, state).allowed).toBe(true);
+  });
+
+  it('allows create events that only include creator (no room_version)', () => {
+    const create = pdu({
+      type: 'm.room.create',
+      event_id: '$create-only-creator',
+      sender: '@alice:example.com',
+      state_key: '',
+      prev_events: [],
+      depth: 0,
+      content: { creator: '@alice:example.com' },
+    });
+    expect(checkEventAuth(create, []).allowed).toBe(true);
+  });
+
+  it('allows create events that only include room_version (no creator)', () => {
+    const create = pdu({
+      type: 'm.room.create',
+      event_id: '$create-only-rv',
+      sender: '@alice:example.com',
+      state_key: '',
+      prev_events: [],
+      depth: 0,
+      content: { room_version: '10' },
+    });
+    expect(checkEventAuth(create, []).allowed).toBe(true);
+  });
+
+  it('rejects create events missing both creator and room_version with exact error', () => {
+    const create = pdu({
+      type: 'm.room.create',
+      event_id: '$create-empty',
+      sender: '@alice:example.com',
+      state_key: '',
+      prev_events: [],
+      depth: 0,
+      content: {},
+    });
+    expect(checkEventAuth(create, []).error).toBe(
+      'm.room.create must have creator or room_version'
+    );
+  });
+
+  it('rejects restricted joins on v7 even when an authorizer is present', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'restricted' },
+      }),
+    ];
+    const join = pdu({
+      type: 'm.room.member',
+      event_id: '$bob-join',
+      sender: '@bob:example.com',
+      state_key: '@bob:example.com',
+      content: {
+        membership: 'join',
+        join_authorised_via_users_server: '@alice:example.com',
+      },
+    });
+    expect(checkEventAuth(join, state, '7').error).toMatch(/Not authorized to join/);
+  });
+
+  it('allows knock_restricted joins on v10 when the authorizer is joined with invite power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'knock_restricted' },
+      }),
+    ];
+    const join = pdu({
+      type: 'm.room.member',
+      event_id: '$bob-join',
+      sender: '@bob:example.com',
+      state_key: '@bob:example.com',
+      content: {
+        membership: 'join',
+        join_authorised_via_users_server: '@alice:example.com',
+      },
+    });
+    expect(checkEventAuth(join, state, '10').allowed).toBe(true);
+  });
+
+  it('rejects empty-string membership as missing', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    const bad = pdu({
+      type: 'm.room.member',
+      event_id: '$empty-mem',
+      sender: '@alice:example.com',
+      state_key: '@alice:example.com',
+      content: { membership: '' },
+    });
+    expect(checkEventAuth(bad, state, '10').error).toMatch(/Missing membership/);
+  });
+
+  it('allows non-integer user power levels on v9 (integerPowerLevels false)', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const change = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl2',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100, '@bob:example.com': 50.5 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(change, state, '9').allowed).toBe(true);
+  });
+
+  it('allows self power level changes that stay equal to sender power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50 }),
+    ];
+    const change = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl2',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(change, state, '10').allowed).toBe(true);
+  });
+
+  it('does not gate notifications.room via checkLevel (documents current gap)', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50 }),
+    ];
+    const change = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl2',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+        notifications: { room: 80 },
+      },
+    });
+    expect(checkEventAuth(change, state, '10').allowed).toBe(true);
+  });
+
+  it('allows invites when power levels are absent (invite defaults to 0)', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    const invite = memberEvent('@bob:example.com', 'invite', '@alice:example.com');
+    expect(checkEventAuth(invite, state, '10').allowed).toBe(true);
+  });
+
+  it('rejects state events when events override exceeds sender power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+          events: { 'm.room.name': 80 },
+        },
+      }),
+    ];
+    const name = pdu({
+      type: 'm.room.name',
+      event_id: '$name',
+      sender: '@bob:example.com',
+      state_key: '',
+      content: { name: 'Nope' },
+    });
+    expect(checkEventAuth(name, state, '10').error).toMatch(/Insufficient power level/);
+  });
+
+  it('rejects self-leave from knock on v6 where knocking is unsupported', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'knock'),
+    ];
+    const leave = memberEvent('@bob:example.com', 'leave');
+    expect(checkEventAuth(leave, state, '6').error).toMatch(/Not a member of the room/);
+  });
+});

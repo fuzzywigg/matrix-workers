@@ -234,3 +234,34 @@ describe('ids TOKENMAXX edge paths after #49', () => {
     });
   });
 });
+
+describe('ids TOKENMAXX edge paths after #50', () => {
+  it('returns null from getServerName for modern opaque event IDs', () => {
+    expect(getServerName('$opaqueOnly')).toBeNull();
+  });
+
+  it('uses bare deterministic IDs for unsupported room versions (v4 fallback)', async () => {
+    const id = await generateDeterministicEventId(
+      'matrix.example.com',
+      '!room:matrix.example.com',
+      '@alice:matrix.example.com',
+      'join',
+      1_700_000_000_000,
+      1,
+      '99'
+    );
+    expect(id).toMatch(/^\$[^:]+$/);
+  });
+
+  it('allows = and / in localparts', () => {
+    expect(isValidLocalpart('alice=bob')).toBe(true);
+    expect(isValidLocalpart('alice/bob')).toBe(true);
+  });
+
+  it('parses room IDs whose server name includes a port', () => {
+    expect(parseRoomId('!opaque:host:8448' as '!opaque:host')).toEqual({
+      opaque: 'opaque',
+      serverName: 'host:8448',
+    });
+  });
+});

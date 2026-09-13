@@ -136,3 +136,18 @@ describe('errors TOKENMAXX edge paths after #49', () => {
     await expect(res.json()).resolves.toEqual({});
   });
 });
+
+describe('errors TOKENMAXX edge paths after #50', () => {
+  it('omits retry_after_ms when Errors.limitExceeded is called without retry', () => {
+    expect(Errors.limitExceeded('x').toJSON()).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'x',
+    });
+  });
+
+  it('defaults jsonResponse status to 200', async () => {
+    const res = jsonResponse({ ok: true });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ ok: true });
+  });
+});

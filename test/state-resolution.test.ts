@@ -228,3 +228,150 @@ describe('resolveState TOKENMAXX edge paths after #49', () => {
     expect(resolveState('10', [])).toEqual([]);
   });
 });
+
+describe('resolveState TOKENMAXX edge paths after #50', () => {
+  it('returns empty for a single empty v2 state set', () => {
+    expect(resolveState('10', [[]])).toEqual([]);
+  });
+
+  it('prefers the higher-power sender when resolving conflicted room names (v2)', () => {
+    const create = createEvent();
+    const aliceJoin = member('@alice:example.com', 'join', { depth: 1 });
+    const bobJoin = member('@bob:example.com', 'join', { depth: 1 });
+    const powerLevels = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl',
+      sender: '@alice:example.com',
+      state_key: '',
+      depth: 2,
+      content: {
+        users: { '@alice:example.com': 100, '@bob:example.com': 0 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    // Give bob temporary PL so their name event can be authored into a set;
+    // resolution power order still uses the conflicted auth/power context.
+    const nameAlice = nameEvent('alice-name', '$name-alice', 3, '@alice:example.com');
+    const nameBob = nameEvent('bob-name', '$name-bob', 3, '@bob:example.com');
+    // Bob cannot win auth against state_default 50 with PL 0 — alice wins.
+    const resolved = resolveState('10', [
+      [create, aliceJoin, bobJoin, powerLevels, nameAlice],
+      [create, aliceJoin, bobJoin, powerLevels, nameBob],
+    ]);
+    expect(resolved.find((e) => e.type === 'm.room.name')?.event_id).toBe('$name-alice');
+  });
+
+  it('tie-breaks equal-power conflicted names by earlier origin_server_ts then event_id', () => {
+    const create = createEvent();
+    const aliceJoin = member('@alice:example.com', 'join', { depth: 1 });
+    const powerLevels = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl',
+      sender: '@alice:example.com',
+      state_key: '',
+      depth: 2,
+      content: {
+        users: { '@alice:example.com': 100 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    const earlier = pdu({
+      type: 'm.room.name',
+      event_id: '$name-zzz',
+      sender: '@alice:example.com',
+      state_key: '',
+      depth: 3,
+      origin_server_ts: 10,
+      content: { name: 'earlier' },
+    });
+    const later = pdu({
+      type: 'm.room.name',
+      event_id: '$name-aaa',
+      sender: '@alice:example.com',
+      state_key: '',
+      depth: 3,
+      origin_server_ts: 20,
+      content: { name: 'later' },
+    });
+    // reverseTopologicalPowerOrder: earlier ts first → applied first, later overwrites
+    const resolved = resolveState('10', [
+      [create, aliceJoin, powerLevels, earlier],
+      [create, aliceJoin, powerLevels, later],
+    ]);
+    const name = resolved.find((e) => e.type === 'm.room.name');
+    expect(name?.event_id).toBe('$name-aaa');
+  });
+
+  it('deduplicates the same conflicted event_id across v2 state sets', () => {
+    const create = createEvent();
+    const join = member('@alice:example.com', 'join');
+    const name = nameEvent('once', '$name-once', 3);
+    const resolved = resolveState('10', [
+      [create, join, name],
+      [create, join, name],
+    ]);
+    // Identical event in both sets → unconflicted, single copy
+    expect(resolved.filter((e) => e.event_id === '$name-once')).toHaveLength(1);
+  });
+
+  it('drops unauthorized conflicted join_rules in v2', () => {
+    const create = createEvent();
+    const aliceJoin = member('@alice:example.com', 'join');
+    const powerLevels = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    const legit = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr-legit',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    const hacked = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr-hack',
+      sender: '@eve:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    const resolved = resolveState('10', [
+      [create, aliceJoin, powerLevels, legit],
+      [create, aliceJoin, powerLevels, hacked],
+    ]);
+    expect(resolved.find((e) => e.type === 'm.room.join_rules')?.event_id).toBe('$jr-legit');
+  });
+
+  it('uses lexicographic event_id at equal depth for v1 conflicts', () => {
+    const a = nameEvent('A', '$name-aaa', 4);
+    const b = nameEvent('B', '$name-bbb', 4);
+    expect(resolveStateV1([[a], [b]])[0].event_id).toBe('$name-aaa');
+    // Equal depth + equal event_id comparator path still yields one winner
+    const dup = nameEvent('same', '$name-same', 4);
+    expect(resolveStateV1([[dup], [dup]])).toEqual([dup]);
+  });
+});
