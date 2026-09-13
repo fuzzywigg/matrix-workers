@@ -1,9 +1,10 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import {
   isIPLiteral,
   selectSRVRecord,
   buildServerUrl,
   clearDiscoveryCache,
+  discoverServer,
   type SRVRecord,
 } from '../src/services/server-discovery';
 
@@ -233,5 +234,241 @@ describe('server-discovery TOKENMAXX edge paths after #57', () => {
     expect(buildServerUrl({ host: 'example.com', port: 0, tlsHostname: 'example.com' })).toBe(
       'https://example.com:0'
     );
+  });
+});
+
+
+describe('discoverServer TOKENMAXX algorithm + cache TTL after #63', () => {
+  const DISCOVERY_TTL = 3600;
+
+  function mockKv(data: Record<string, string> = {}) {
+    const puts: Array<{ key: string; value: string; options?: { expirationTtl?: number } }> = [];
+    const kv = {
+      puts,
+      data,
+      get: async (key: string) => data[key] ?? null,
+      put: async (key: string, value: string, options?: { expirationTtl?: number }) => {
+        data[key] = value;
+        puts.push({ key, value, options });
+      },
+      delete: async (key: string) => {
+        delete data[key];
+      },
+      list: async () => ({ keys: [], list_complete: true, cacheStatus: null }),
+      getWithMetadata: async () => ({ value: null, metadata: null, cacheStatus: null }),
+    };
+    return kv as unknown as KVNamespace & { puts: typeof puts; data: typeof data };
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('returns KV-cached discovery without hitting the network and preserves TTL on put for misses', async () => {
+    const cached = { host: 'cached.example.com', port: 443, tlsHostname: 'cached.example.com' };
+    const kv = mockKv({
+      'discovery:matrix.example.com': JSON.stringify(cached),
+    });
+
+    await expect(discoverServer('matrix.example.com', kv)).resolves.toEqual(cached);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(kv.puts).toEqual([]);
+  });
+
+  it('resolves IPv4 and bracketed IPv6 literals to port 8448 without network', async () => {
+    await expect(discoverServer('203.0.113.10')).resolves.toEqual({
+      host: '203.0.113.10',
+      port: 8448,
+      tlsHostname: '203.0.113.10',
+    });
+    await expect(discoverServer('[2001:db8::9]')).resolves.toEqual({
+      host: '[2001:db8::9]',
+      port: 8448,
+      tlsHostname: '[2001:db8::9]',
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('honors an explicit host:port without network', async () => {
+    await expect(discoverServer('homeserver.example.com:8449')).resolves.toEqual({
+      host: 'homeserver.example.com',
+      port: 8449,
+      tlsHostname: 'homeserver.example.com',
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('uses .well-known m.server with an explicit port and caches with expirationTtl 3600', async () => {
+    const kv = mockKv();
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      if (String(url).includes('/.well-known/matrix/server')) {
+        return new Response(JSON.stringify({ 'm.server': 'delegated.example.com:8443' }), {
+          status: 200,
+        });
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    const result = await discoverServer('origin.example.com', kv);
+    expect(result).toEqual({
+      host: 'delegated.example.com',
+      port: 8443,
+      tlsHostname: 'delegated.example.com',
+    });
+    expect(kv.puts).toEqual([
+      {
+        key: 'discovery:origin.example.com',
+        value: JSON.stringify(result),
+        options: { expirationTtl: DISCOVERY_TTL },
+      },
+    ]);
+  });
+
+  it('rejects malicious well-known delegates and falls through to default 8448', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      if (String(url).includes('/.well-known/matrix/server')) {
+        return new Response(JSON.stringify({ 'm.server': '127.0.0.1:8448' }), { status: 200 });
+      }
+      // SRV lookups
+      return new Response(JSON.stringify({ Status: 2 }), { status: 200 });
+    });
+
+    await expect(discoverServer('public.example.com')).resolves.toEqual({
+      host: 'public.example.com',
+      port: 8448,
+      tlsHostname: 'public.example.com',
+    });
+  });
+
+  it('ignores well-known without m.server and uses _matrix-fed._tcp SRV', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/.well-known/matrix/server')) {
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      if (u.includes('_matrix-fed._tcp')) {
+        return new Response(
+          JSON.stringify({
+            Status: 0,
+            Answer: [
+              {
+                name: '_matrix-fed._tcp.srv.example.com',
+                type: 33,
+                TTL: 300,
+                data: '10 5 8448 fed.example.com.',
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ Status: 2 }), { status: 200 });
+    });
+
+    await expect(discoverServer('srv.example.com')).resolves.toEqual({
+      host: 'fed.example.com',
+      port: 8448,
+      tlsHostname: 'srv.example.com',
+    });
+  });
+
+  it('falls back to legacy _matrix._tcp when _matrix-fed is empty', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/.well-known/matrix/server')) {
+        return new Response('missing', { status: 404 });
+      }
+      if (u.includes('_matrix-fed._tcp')) {
+        return new Response(JSON.stringify({ Status: 0, Answer: [] }), { status: 200 });
+      }
+      if (u.includes('_matrix._tcp')) {
+        return new Response(
+          JSON.stringify({
+            Status: 0,
+            Answer: [
+              {
+                name: '_matrix._tcp.legacy.example.com',
+                type: 33,
+                TTL: 300,
+                data: '0 0 443 legacy-hs.example.com',
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ Status: 2 }), { status: 200 });
+    });
+
+    await expect(discoverServer('legacy.example.com')).resolves.toEqual({
+      host: 'legacy-hs.example.com',
+      port: 443,
+      tlsHostname: 'legacy.example.com',
+    });
+  });
+
+  it('defaults to host:8448 when well-known and SRV both fail', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('offline'));
+
+    await expect(discoverServer('alone.example.com')).resolves.toEqual({
+      host: 'alone.example.com',
+      port: 8448,
+      tlsHostname: 'alone.example.com',
+    });
+  });
+
+  it('follows well-known delegate without port via SRV then default 8448', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes('origin2.example.com/.well-known/matrix/server')) {
+        return new Response(JSON.stringify({ 'm.server': 'delegated2.example.com' }), {
+          status: 200,
+        });
+      }
+      // SRV for delegated name fails
+      return new Response(JSON.stringify({ Status: 2 }), { status: 200 });
+    });
+
+    await expect(discoverServer('origin2.example.com')).resolves.toEqual({
+      host: 'delegated2.example.com',
+      port: 8448,
+      tlsHostname: 'delegated2.example.com',
+    });
+  });
+
+  it('skips SRV answers with private targets, "." target, or non-SRV types', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/.well-known/matrix/server')) {
+        return new Response('{}', { status: 404 });
+      }
+      if (u.includes('_matrix-fed._tcp')) {
+        return new Response(
+          JSON.stringify({
+            Status: 0,
+            Answer: [
+              { name: 'x', type: 1, TTL: 1, data: '1.2.3.4' },
+              { name: 'x', type: 33, TTL: 1, data: '0 0 8448 .' },
+              { name: 'x', type: 33, TTL: 1, data: '0 0 8448 127.0.0.1' },
+              { name: 'x', type: 33, TTL: 1, data: 'bad' },
+              { name: 'x', type: 33, TTL: 1, data: '5 1 8448 good.example.com.' },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ Status: 2 }), { status: 200 });
+    });
+
+    await expect(discoverServer('filter-srv.example.com')).resolves.toEqual({
+      host: 'good.example.com',
+      port: 8448,
+      tlsHostname: 'filter-srv.example.com',
+    });
   });
 });
