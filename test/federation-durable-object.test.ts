@@ -737,3 +737,361 @@ describe('FederationDurableObject !ok maxedOut / signed send TOKENMAXX after #64
     }
   });
 });
+
+describe('FederationDurableObject queue/keys/discovery edges after #71', () => {
+  const NOW = 1_700_000_000_000;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  function nullKeyEnv(extra: Partial<Env> = {}): Partial<Env> {
+    return {
+      DB: {
+        prepare() {
+          return {
+            bind() {
+              return this;
+            },
+            async first() {
+              return null;
+            },
+          };
+        },
+      } as unknown as Env['DB'],
+      SERVER_NAME: 'local.example.com',
+      CACHE: {
+        get: async () => {
+          throw new Error('no cache');
+        },
+        put: async () => {},
+      } as unknown as Env['CACHE'],
+      ...extra,
+    };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('treats HTTP 200 non-JSON body as all-accepted and clears PDUs + EDUs', async () => {
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), nullKeyEnv());
+    await state.storage.put('queue:nonjson.example.com:$n1', {
+      event_id: '$n1',
+      room_id: '!r:ex.com',
+      destination: 'nonjson.example.com',
+      pdu: { event_id: '$n1' },
+      created_at: NOW,
+      retry_count: 0,
+    });
+    await state.storage.put('edu:nonjson.example.com:1:abc', {
+      edu_type: 'm.typing',
+      destination: 'nonjson.example.com',
+      content: { room_id: '!r:ex.com' },
+      created_at: NOW,
+    });
+    await state.storage.put('server:nonjson.example.com', {
+      serverName: 'nonjson.example.com',
+      lastContact: 0,
+      retryCount: 3,
+      nextRetry: NOW,
+    });
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not-json', { status: 200 })));
+
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(state.storage.map.has('queue:nonjson.example.com:$n1')).toBe(false);
+    expect(
+      [...state.storage.map.keys()].filter((k) => k.startsWith('edu:nonjson.example.com:'))
+    ).toEqual([]);
+    expect(state.storage.map.get('server:nonjson.example.com')).toEqual({
+      serverName: 'nonjson.example.com',
+      lastContact: NOW,
+      retryCount: 0,
+      nextRetry: null,
+    });
+  });
+
+  it('on HTTP 200 keeps soft-rejected PDUs under cap, drops >=32, still deletes EDUs', async () => {
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), nullKeyEnv());
+    await state.storage.put('queue:mix.example.com:$ok', {
+      event_id: '$ok',
+      room_id: '!r:ex.com',
+      destination: 'mix.example.com',
+      pdu: { event_id: '$ok' },
+      created_at: NOW,
+      retry_count: 0,
+    });
+    await state.storage.put('queue:mix.example.com:$soft', {
+      event_id: '$soft',
+      room_id: '!r:ex.com',
+      destination: 'mix.example.com',
+      pdu: { event_id: '$soft' },
+      created_at: NOW + 1,
+      retry_count: 2,
+    });
+    await state.storage.put('queue:mix.example.com:$hard', {
+      event_id: '$hard',
+      room_id: '!r:ex.com',
+      destination: 'mix.example.com',
+      pdu: { event_id: '$hard' },
+      created_at: NOW + 2,
+      retry_count: 32,
+    });
+    await state.storage.put('edu:mix.example.com:1:x', {
+      edu_type: 'm.typing',
+      destination: 'mix.example.com',
+      content: {},
+      created_at: NOW,
+    });
+    await state.storage.put('server:mix.example.com', {
+      serverName: 'mix.example.com',
+      lastContact: 0,
+      retryCount: 1,
+      nextRetry: NOW,
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              pdus: {
+                $soft: { error: 'soft' },
+                $hard: { error: 'hard' },
+              },
+            }),
+            { status: 200 }
+          )
+      )
+    );
+
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(state.storage.map.has('queue:mix.example.com:$ok')).toBe(false);
+    expect(state.storage.map.has('queue:mix.example.com:$soft')).toBe(true);
+    expect(state.storage.map.has('queue:mix.example.com:$hard')).toBe(false);
+    expect(
+      [...state.storage.map.keys()].filter((k) => k.startsWith('edu:mix.example.com:'))
+    ).toEqual([]);
+    expect(state.storage.map.get('server:mix.example.com')).toMatchObject({
+      retryCount: 0,
+      lastContact: NOW,
+      nextRetry: null,
+    });
+  });
+
+  it('on HTTP !ok when all events are maxedOut drops all and does not scheduleRetry', async () => {
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), nullKeyEnv());
+    await state.storage.put('queue:allmax.example.com:$a', {
+      event_id: '$a',
+      room_id: '!r:ex.com',
+      destination: 'allmax.example.com',
+      pdu: { event_id: '$a' },
+      created_at: NOW,
+      retry_count: 32,
+    });
+    await state.storage.put('queue:allmax.example.com:$b', {
+      event_id: '$b',
+      room_id: '!r:ex.com',
+      destination: 'allmax.example.com',
+      pdu: { event_id: '$b' },
+      created_at: NOW,
+      retry_count: 40,
+    });
+    await state.storage.put('server:allmax.example.com', {
+      serverName: 'allmax.example.com',
+      lastContact: 0,
+      retryCount: 5,
+      nextRetry: NOW,
+    });
+    state.storage.alarm = null;
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 503 })));
+
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(state.storage.map.has('queue:allmax.example.com:$a')).toBe(false);
+    expect(state.storage.map.has('queue:allmax.example.com:$b')).toBe(false);
+    // No scheduleRetry → server record and alarm unchanged
+    expect(state.storage.map.get('server:allmax.example.com')).toEqual({
+      serverName: 'allmax.example.com',
+      lastContact: 0,
+      retryCount: 5,
+      nextRetry: NOW,
+    });
+    expect(state.storage.alarm).toBeNull();
+  });
+
+  it('uses discoverServer CACHE hit host/port via buildServerUrl', async () => {
+    const discovery = JSON.stringify({
+      host: 'fed.cdn.example.com',
+      port: 8448,
+      tlsHostname: 'cdn.example.com',
+    });
+    const { state, do: fed } = makeFed(
+      new FakeDurableObjectState(),
+      nullKeyEnv({
+        CACHE: {
+          get: async () => discovery,
+          put: async () => {},
+        } as unknown as Env['CACHE'],
+      })
+    );
+
+    await state.storage.put('queue:cdn.example.com:$d1', {
+      event_id: '$d1',
+      room_id: '!r:ex.com',
+      destination: 'cdn.example.com',
+      pdu: { event_id: '$d1' },
+      created_at: NOW,
+      retry_count: 0,
+    });
+    await state.storage.put('server:cdn.example.com', {
+      serverName: 'cdn.example.com',
+      lastContact: 0,
+      retryCount: 0,
+      nextRetry: NOW,
+    });
+
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      `https://fed.cdn.example.com:8448/_matrix/federation/v1/send/${NOW}`
+    );
+    expect(state.storage.map.has('queue:cdn.example.com:$d1')).toBe(false);
+  });
+
+  it('caches remote keys for 24h on ok and returns 404 when remote fetch throws', async () => {
+    const { state, do: fed } = makeFed();
+    const remote = { server_name: 'throw.example.com', verify_keys: {} };
+
+    // First: expired cache → remote ok → cache NOW+24h
+    await state.storage.put('keys:throw.example.com', {
+      data: { stale: true },
+      expires: NOW - 1,
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify(remote), { status: 200 }))
+    );
+    const ok = await fed.fetch(new Request('https://do/keys?server=throw.example.com'));
+    expect(await ok.json()).toEqual(remote);
+    expect(state.storage.map.get('keys:throw.example.com')).toEqual({
+      data: remote,
+      expires: NOW + DAY_MS,
+    });
+
+    // Force miss again and throw
+    await state.storage.put('keys:throw.example.com', {
+      data: remote,
+      expires: NOW,
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('dns');
+      })
+    );
+    const miss = await fed.fetch(new Request('https://do/keys?server=throw.example.com'));
+    expect(miss.status).toBe(404);
+    expect(await miss.json()).toMatchObject({ errcode: 'M_NOT_FOUND' });
+  });
+
+  it('accepts /send when queue size is 9999 (under hard cap)', async () => {
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), nullKeyEnv());
+    for (let i = 0; i < 9999; i++) {
+      state.storage.map.set(`queue:near.example.com:$e${i}`, {
+        event_id: `$e${i}`,
+        destination: 'near.example.com',
+        retry_count: 0,
+      });
+    }
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 200 })));
+
+    const res = await fed.fetch(
+      new Request('https://do/send', {
+        method: 'POST',
+        body: JSON.stringify({
+          destination: 'near.example.com',
+          event_id: '$under',
+          room_id: '!r:ex.com',
+          pdu: { event_id: '$under' },
+        }),
+      })
+    );
+    expect(await res.text()).toBe('Queued');
+    // processFederationQueue runs immediately; on 200 the new event is deleted
+    expect(state.storage.map.has('queue:near.example.com:$under')).toBe(false);
+  });
+
+  it('alarm with due destination and empty queues is a no-op (no fetch)', async () => {
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), nullKeyEnv());
+    await state.storage.put('server:emptyq.example.com', {
+      serverName: 'emptyq.example.com',
+      lastContact: 1,
+      retryCount: 2,
+      nextRetry: NOW,
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(state.storage.map.get('server:emptyq.example.com')).toEqual({
+      serverName: 'emptyq.example.com',
+      lastContact: 1,
+      retryCount: 2,
+      nextRetry: NOW,
+    });
+  });
+
+  it('batches PDU+EDU into one PUT and clears both queues on success', async () => {
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), nullKeyEnv());
+    await state.storage.put('queue:both.example.com:$p', {
+      event_id: '$p',
+      room_id: '!r:ex.com',
+      destination: 'both.example.com',
+      pdu: { event_id: '$p', type: 'm.room.message' },
+      created_at: NOW,
+      retry_count: 0,
+    });
+    await state.storage.put('edu:both.example.com:1:z', {
+      edu_type: 'm.typing',
+      destination: 'both.example.com',
+      content: { room_id: '!r:ex.com' },
+      created_at: NOW,
+    });
+    await state.storage.put('server:both.example.com', {
+      serverName: 'both.example.com',
+      lastContact: 0,
+      retryCount: 0,
+      nextRetry: NOW,
+    });
+
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body).toEqual({
+      pdus: [{ event_id: '$p', type: 'm.room.message' }],
+      edus: [{ edu_type: 'm.typing', content: { room_id: '!r:ex.com' } }],
+    });
+    expect(state.storage.map.has('queue:both.example.com:$p')).toBe(false);
+    expect(
+      [...state.storage.map.keys()].filter((k) => k.startsWith('edu:both.example.com:'))
+    ).toEqual([]);
+  });
+});

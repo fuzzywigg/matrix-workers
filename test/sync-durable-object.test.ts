@@ -669,3 +669,173 @@ describe('SyncDurableObject websocket / notify fan-out TOKENMAXX after #64', () 
     expect(body.events).toHaveLength(1000);
   });
 });
+
+describe('SyncDurableObject wait/state/session edges after #71', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('treats timeout:0 as falsy and waits the full 25s default', async () => {
+    const { do: sync } = makeSync();
+    const pending = sync.fetch(
+      new Request('https://do/wait-for-events', {
+        method: 'POST',
+        body: JSON.stringify({ timeout: 0 }),
+      })
+    );
+
+    await vi.advanceTimersByTimeAsync(WAIT_CAP_MS - 1);
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await (await pending).json()).toEqual({ hasEvents: false });
+  });
+
+  it('loads sliding-sync state from storage on a cold DO instance (cache miss)', async () => {
+    const shared = new FakeDurableObjectState();
+    const payload = {
+      pos: 11,
+      lastAccess: 55,
+      roomStates: {},
+      listStates: { all: { roomIds: ['!r:ex.com'], count: 1 } },
+    };
+    await shared.storage.put('sliding_sync:cold1', payload);
+
+    // New DO instance → empty in-memory cache; must hit storage
+    const cold = new SyncDurableObject(shared as unknown as DurableObjectState, {} as Env);
+    const get = await cold.fetch(
+      new Request('https://do/sliding-sync/state?conn_id=cold1')
+    );
+    expect(await get.json()).toMatchObject({ pos: 11, lastAccess: 55 });
+
+    // Wipe storage; warm cache on same instance still serves
+    shared.storage.map.delete('sliding_sync:cold1');
+    const cached = await cold.fetch(
+      new Request('https://do/sliding-sync/state?conn_id=cold1')
+    );
+    expect(await cached.json()).toMatchObject({ pos: 11 });
+  });
+
+  it('returns empty pending when since is non-numeric (parseInt → NaN)', async () => {
+    const { do: sync } = makeSync();
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$nan',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 100,
+        }),
+      })
+    );
+
+    const body = (await (
+      await sync.fetch(new Request('https://do/pending?since=abc'))
+    ).json()) as { events: unknown[] };
+    // timestamp > NaN is always false
+    expect(body.events).toEqual([]);
+  });
+
+  it('ignores notify after waiter already timed out (no double-resolve throw)', async () => {
+    const { do: sync } = makeSync();
+    const wait = sync.fetch(
+      new Request('https://do/wait-for-events', {
+        method: 'POST',
+        body: JSON.stringify({ timeout: 1_000 }),
+      })
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await (await wait).json()).toEqual({ hasEvents: false });
+
+    // Late notify must not throw; no waiters remain
+    const res = await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$late',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 1,
+        }),
+      })
+    );
+    expect(await res.text()).toBe('OK');
+  });
+
+  it('websocket upgrade without device_id stores null and defaults since to 0', async () => {
+    const { state, do: sync } = makeSync();
+    const client = new FakeWebSocket();
+    const server = new FakeWebSocket();
+    vi.stubGlobal(
+      'WebSocketPair',
+      class {
+        0 = client;
+        1 = server;
+      }
+    );
+
+    await expect(
+      sync.fetch(
+        new Request('https://do/websocket?user_id=@a:ex.com', {
+          headers: { Upgrade: 'websocket' },
+        })
+      )
+    ).rejects.toThrow();
+
+    expect(server.deserializeAttachment()).toEqual({
+      userId: '@a:ex.com',
+      deviceId: null,
+      lastSyncToken: '0',
+    });
+    expect(state.sockets).toContain(server);
+  });
+
+  it('webSocketClose / webSocketError without attachment leave sessions untouched', async () => {
+    const { do: sync } = makeSync();
+    const kept = new FakeWebSocket();
+    kept.serializeAttachment({
+      userId: '@keep:ex.com',
+      deviceId: null,
+      lastSyncToken: '0',
+    });
+    const sessions = (
+      sync as unknown as {
+        sessions: Map<FakeWebSocket, { userId: string }>;
+      }
+    ).sessions;
+    sessions.set(kept, { userId: '@keep:ex.com' });
+
+    const bare = new FakeWebSocket();
+    await (
+      sync as unknown as {
+        webSocketClose: (
+          ws: FakeWebSocket,
+          code: number,
+          reason: string,
+          clean: boolean
+        ) => Promise<void>;
+      }
+    ).webSocketClose(bare, 1001, 'gone', false);
+    expect(sessions.has(kept)).toBe(true);
+    expect(bare.closed).toEqual({ code: 1001, reason: 'gone' });
+
+    await (
+      sync as unknown as {
+        webSocketError: (ws: FakeWebSocket, err: unknown) => Promise<void>;
+      }
+    ).webSocketError(bare, new Error('x'));
+    expect(sessions.has(kept)).toBe(true);
+  });
+});

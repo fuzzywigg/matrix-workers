@@ -259,3 +259,189 @@ describe('handleFederationQueue TOKENMAXX clock/backoff after #64', () => {
     expect(String(fetchMock.mock.calls[0][0])).toContain(`send/${NOW + 5_000}_`);
   });
 });
+
+describe('handleFederationQueue ack/retry/sign edges after #71', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.stubGlobal('fetch', vi.fn());
+    vi.spyOn(Math, 'random').mockReturnValue(0.123456789);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('no-ops on empty messages without calling fetch', async () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    await handleFederationQueue(
+      { messages: [] } as unknown as MessageBatch<QueueBody>,
+      { DB: makeDb(null), SERVER_NAME: 'local.example.com' } as Env
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('still PUTs empty pdus/edus when message has neither pdu nor edu', async () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const msg = makeMessage({
+      destination: 'empty.example.com',
+      timestamp: NOW,
+    });
+
+    await handleFederationQueue(
+      { messages: [msg] } as unknown as MessageBatch<QueueBody>,
+      { DB: makeDb(null), SERVER_NAME: 'local.example.com' } as Env
+    );
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body).toMatchObject({
+      pdus: [],
+      edus: [],
+      origin: 'local.example.com',
+      origin_server_ts: NOW,
+    });
+    expect(msg.ack).toHaveBeenCalledOnce();
+  });
+
+  it('sends EDU-only batches with empty pdus', async () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const msg = makeMessage({
+      destination: 'edu.example.com',
+      edu: { edu_type: 'm.typing', content: { room_id: '!r:ex.com' } },
+      timestamp: NOW,
+    });
+
+    await handleFederationQueue(
+      { messages: [msg] } as unknown as MessageBatch<QueueBody>,
+      { DB: makeDb(null), SERVER_NAME: 'local.example.com' } as Env
+    );
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({
+      pdus: [],
+      edus: [{ edu_type: 'm.typing', content: { room_id: '!r:ex.com' } }],
+    });
+    expect(msg.ack).toHaveBeenCalledOnce();
+  });
+
+  it('skips signing when private_key_jwk is null', async () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const msg = makeMessage({
+      destination: 'unsigned.example.com',
+      pdu: { event_id: '$u' },
+      timestamp: NOW,
+    });
+
+    await handleFederationQueue(
+      { messages: [msg] } as unknown as MessageBatch<QueueBody>,
+      {
+        DB: makeDb({ key_id: 'ed25519:null', private_key_jwk: null }),
+        SERVER_NAME: 'local.example.com',
+      } as Env
+    );
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as {
+      signatures?: unknown;
+    };
+    expect(body.signatures).toBeUndefined();
+    expect(msg.ack).toHaveBeenCalledOnce();
+  });
+
+  it('retries when invalid private_key_jwk makes signJson reject (attempts < 5)', async () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const msg = makeMessage(
+      {
+        destination: 'badjwk.example.com',
+        pdu: { event_id: '$j' },
+        timestamp: NOW,
+      },
+      1
+    );
+
+    await handleFederationQueue(
+      { messages: [msg] } as unknown as MessageBatch<QueueBody>,
+      {
+        DB: makeDb({ key_id: 'ed25519:bad', private_key_jwk: 'not-json' }),
+        SERVER_NAME: 'local.example.com',
+      } as Env
+    );
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(msg.retry).toHaveBeenCalledWith({ delaySeconds: Math.pow(2, 1) * 60 });
+    expect(msg.ack).not.toHaveBeenCalled();
+  });
+
+  it('acks only successful destinations when multi-dest mixed OK/fail', async () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).includes('ok.example.com')) {
+        return new Response('{}', { status: 200 });
+      }
+      return new Response('down', { status: 503 });
+    });
+
+    const okMsg = makeMessage({
+      destination: 'ok.example.com',
+      pdu: { event_id: '$ok' },
+      timestamp: NOW,
+    });
+    const failMsg = makeMessage(
+      {
+        destination: 'fail.example.com',
+        pdu: { event_id: '$fail' },
+        timestamp: NOW,
+      },
+      0
+    );
+
+    await handleFederationQueue(
+      { messages: [okMsg, failMsg] } as unknown as MessageBatch<QueueBody>,
+      { DB: makeDb(null), SERVER_NAME: 'local.example.com' } as Env
+    );
+
+    expect(okMsg.ack).toHaveBeenCalledOnce();
+    expect(okMsg.retry).not.toHaveBeenCalled();
+    expect(failMsg.retry).toHaveBeenCalledWith({ delaySeconds: 60 }); // 2^0 * 60
+    expect(failMsg.ack).not.toHaveBeenCalled();
+  });
+
+  it('retries at attempts===4 with 16*60 and acks at attempts===5', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response('nope', { status: 500 })
+    );
+
+    const at4 = makeMessage(
+      {
+        destination: 'retry.example.com',
+        pdu: { event_id: '$4' },
+        timestamp: NOW,
+      },
+      4
+    );
+    await handleFederationQueue(
+      { messages: [at4] } as unknown as MessageBatch<QueueBody>,
+      { DB: makeDb(null), SERVER_NAME: 'local.example.com' } as Env
+    );
+    expect(at4.retry).toHaveBeenCalledWith({ delaySeconds: 16 * 60 });
+    expect(at4.ack).not.toHaveBeenCalled();
+
+    const at5 = makeMessage(
+      {
+        destination: 'retry.example.com',
+        pdu: { event_id: '$5' },
+        timestamp: NOW,
+      },
+      5
+    );
+    await handleFederationQueue(
+      { messages: [at5] } as unknown as MessageBatch<QueueBody>,
+      { DB: makeDb(null), SERVER_NAME: 'local.example.com' } as Env
+    );
+    expect(at5.ack).toHaveBeenCalledOnce();
+    expect(at5.retry).not.toHaveBeenCalled();
+  });
+});
