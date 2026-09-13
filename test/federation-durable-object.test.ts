@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { FakeDurableObjectState, durableObjectMockFactory } from './helpers/fake-durable-object';
 import type { Env } from '../src/types';
+import { generateSigningKeyPair } from '../src/utils/crypto';
 
 vi.mock('cloudflare:workers', () => durableObjectMockFactory());
 
@@ -572,5 +573,167 @@ describe('FederationDurableObject TOKENMAXX clock boundaries after #61', () => {
 
     expect(state.storage.map.has('queue:rej.example.com:$keep')).toBe(true);
     expect(state.storage.map.has('queue:rej.example.com:$drop')).toBe(false);
+  });
+});
+
+describe('FederationDurableObject !ok maxedOut / signed send TOKENMAXX after #64', () => {
+  const NOW = 1_700_000_000_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('on HTTP !ok drops retry_count>=32 and schedulesRetry only for remaining', async () => {
+    const nullKeyDb = {
+      prepare() {
+        return {
+          bind() {
+            return this;
+          },
+          async first() {
+            return null;
+          },
+        };
+      },
+    };
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), {
+      DB: nullKeyDb as unknown as Env['DB'],
+      SERVER_NAME: 'local.example.com',
+      CACHE: {
+        get: async () => {
+          throw new Error('no cache');
+        },
+        put: async () => {},
+      } as unknown as Env['CACHE'],
+    });
+
+    await state.storage.put('queue:httpfail.example.com:$keep', {
+      event_id: '$keep',
+      room_id: '!r:ex.com',
+      destination: 'httpfail.example.com',
+      pdu: { event_id: '$keep' },
+      created_at: NOW,
+      retry_count: 1,
+    });
+    await state.storage.put('queue:httpfail.example.com:$drop', {
+      event_id: '$drop',
+      room_id: '!r:ex.com',
+      destination: 'httpfail.example.com',
+      pdu: { event_id: '$drop' },
+      created_at: NOW,
+      retry_count: 32,
+    });
+    await state.storage.put('server:httpfail.example.com', {
+      serverName: 'httpfail.example.com',
+      lastContact: 0,
+      retryCount: 1,
+      nextRetry: NOW,
+    });
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 503 })));
+
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(state.storage.map.has('queue:httpfail.example.com:$drop')).toBe(false);
+    expect(state.storage.map.get('queue:httpfail.example.com:$keep')).toMatchObject({
+      event_id: '$keep',
+      retry_count: 2, // scheduleRetry increments from server.retryCount 1 → 2
+    });
+    expect(state.storage.map.get('server:httpfail.example.com')).toMatchObject({
+      retryCount: 2,
+      nextRetry: NOW + 120_000, // 60s * 2^(2-1)
+    });
+    expect(state.storage.alarm).toBe(NOW + 120_000);
+  });
+
+  it('attaches Authorization when a signing key is configured and clears queue on 200', async () => {
+    const subtle = crypto.subtle;
+    const origGenerateKey = subtle.generateKey.bind(subtle);
+    const origImportKey = subtle.importKey.bind(subtle);
+    const origSign = subtle.sign.bind(subtle);
+    const mapAlg = (alg: AlgorithmIdentifier | { name?: string }): AlgorithmIdentifier => {
+      if (typeof alg === 'string') return alg === 'NODE-ED25519' ? 'Ed25519' : alg;
+      if (alg && typeof alg === 'object' && alg.name === 'NODE-ED25519') return 'Ed25519';
+      return alg as AlgorithmIdentifier;
+    };
+    subtle.generateKey = ((a: AlgorithmIdentifier, e: boolean, u: KeyUsage[]) =>
+      origGenerateKey(mapAlg(a), e, u)) as typeof subtle.generateKey;
+    subtle.importKey = ((
+      f: KeyFormat,
+      d: BufferSource | JsonWebKey,
+      a: AlgorithmIdentifier,
+      e: boolean,
+      u: KeyUsage[]
+    ) => origImportKey(f, d, mapAlg(a), e, u)) as typeof subtle.importKey;
+    subtle.sign = ((a: AlgorithmIdentifier, k: CryptoKey, d: BufferSource) =>
+      origSign(mapAlg(a), k, d)) as typeof subtle.sign;
+
+    try {
+      const pair = await generateSigningKeyPair();
+      const signedKeyDb = {
+        prepare() {
+          return {
+            bind() {
+              return this;
+            },
+            async first() {
+              return {
+                key_id: pair.keyId,
+                private_key_jwk: JSON.stringify(pair.privateKeyJwk),
+              };
+            },
+          };
+        },
+      };
+
+      const { state, do: fed } = makeFed(new FakeDurableObjectState(), {
+        DB: signedKeyDb as unknown as Env['DB'],
+        SERVER_NAME: 'local.example.com',
+        CACHE: {
+          get: async () => {
+            throw new Error('no cache');
+          },
+          put: async () => {},
+        } as unknown as Env['CACHE'],
+      });
+
+      await state.storage.put('queue:signed.example.com:$s1', {
+        event_id: '$s1',
+        room_id: '!r:ex.com',
+        destination: 'signed.example.com',
+        pdu: { event_id: '$s1' },
+        created_at: NOW,
+        retry_count: 0,
+      });
+      await state.storage.put('server:signed.example.com', {
+        serverName: 'signed.example.com',
+        lastContact: 0,
+        retryCount: 0,
+        nextRetry: NOW,
+      });
+
+      const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+
+      expect(state.storage.map.has('queue:signed.example.com:$s1')).toBe(false);
+      expect(fetchMock).toHaveBeenCalled();
+      const headers = fetchMock.mock.calls[0][1]?.headers as Record<string, string>;
+      expect(headers.Authorization).toMatch(/^X-Matrix /);
+      expect(headers.Authorization).toContain('origin="local.example.com"');
+      expect(headers.Authorization).toContain(`key="${pair.keyId}"`);
+    } finally {
+      subtle.generateKey = origGenerateKey;
+      subtle.importKey = origImportKey;
+      subtle.sign = origSign;
+    }
   });
 });

@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { FakeDurableObjectState, durableObjectMockFactory } from './helpers/fake-durable-object';
+import {
+  FakeDurableObjectState,
+  FakeWebSocket,
+  durableObjectMockFactory,
+} from './helpers/fake-durable-object';
 import type { Env } from '../src/types';
 
 vi.mock('cloudflare:workers', () => durableObjectMockFactory());
@@ -466,5 +470,202 @@ describe('SyncDurableObject wait/pending TOKENMAXX clock boundaries after #62', 
     ).json()) as { events: Array<{ event_id: string; timestamp: number }> };
     expect(body.events.map((e) => e.event_id)).toEqual(['$early', '$late']);
     expect(body.events.map((e) => e.timestamp)).toEqual([100, 300]);
+  });
+});
+
+describe('SyncDurableObject websocket / notify fan-out TOKENMAXX after #64', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('requires user_id on /websocket upgrade', async () => {
+    const { do: sync } = makeSync();
+    const res = await sync.fetch(
+      new Request('https://do/websocket?since=0', {
+        headers: { Upgrade: 'websocket' },
+      })
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe('Missing user_id');
+  });
+
+  it('accepts websocket upgrade, tags session, and pushes pending sync events', async () => {
+    const { state, do: sync } = makeSync();
+    await state.storage.put('event:$e1', {
+      event_id: '$e1',
+      room_id: '!r:ex.com',
+      type: 'm.room.message',
+      timestamp: 50,
+    });
+    await state.storage.put('event:$e2', {
+      event_id: '$e2',
+      room_id: '!r:ex.com',
+      type: 'm.room.message',
+      timestamp: 150,
+    });
+
+    const client = new FakeWebSocket();
+    const server = new FakeWebSocket();
+    vi.stubGlobal(
+      'WebSocketPair',
+      class {
+        0 = client;
+        1 = server;
+      }
+    );
+
+    // Node's Response rejects status 101; exercise accept + pending send first.
+    await expect(
+      sync.fetch(
+        new Request('https://do/websocket?user_id=@a:ex.com&device_id=D1&since=100', {
+          headers: { Upgrade: 'websocket' },
+        })
+      )
+    ).rejects.toThrow();
+
+    expect(state.sockets).toContain(server);
+    expect(server.tags).toEqual(['@a:ex.com']);
+    expect(server.deserializeAttachment()).toEqual({
+      userId: '@a:ex.com',
+      deviceId: 'D1',
+      lastSyncToken: '100',
+    });
+    expect(server.sent).toHaveLength(1);
+    const pushed = JSON.parse(server.sent[0]) as {
+      type: string;
+      events: Array<{ event_id: string }>;
+    };
+    expect(pushed.type).toBe('sync');
+    expect(pushed.events.map((e) => e.event_id)).toEqual(['$e2']);
+  });
+
+  it('fans out /notify to hibernated sockets and swallows closed-socket send errors', async () => {
+    const { state, do: sync } = makeSync();
+    const open = new FakeWebSocket();
+    const closed = new FakeWebSocket();
+    closed.send = () => {
+      throw new Error('socket closed');
+    };
+    state.sockets.push(open, closed);
+
+    const res = await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$n1',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 42,
+        }),
+      })
+    );
+    expect(await res.text()).toBe('OK');
+    expect(open.sent).toEqual([
+      JSON.stringify({
+        type: 'event',
+        event: {
+          event_id: '$n1',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 42,
+        },
+      }),
+    ]);
+    expect(state.storage.map.get('event:$n1')).toMatchObject({ event_id: '$n1' });
+  });
+
+  it('webSocketMessage handles ping/ack and no-ops without session or bad payloads', async () => {
+    const { do: sync } = makeSync();
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({
+      userId: '@a:ex.com',
+      deviceId: 'D1',
+      lastSyncToken: '0',
+    });
+    (
+      sync as unknown as {
+        sessions: Map<FakeWebSocket, { userId: string; lastSyncToken: string }>;
+      }
+    ).sessions.set(ws, { userId: '@a:ex.com', lastSyncToken: '0' });
+
+    const msg = (
+      sync as unknown as {
+        webSocketMessage: (ws: FakeWebSocket, m: string | ArrayBuffer) => Promise<void>;
+      }
+    ).webSocketMessage.bind(sync);
+
+    await msg(ws, JSON.stringify({ type: 'ping' }));
+    expect(ws.sent).toContain(JSON.stringify({ type: 'pong' }));
+
+    await msg(ws, JSON.stringify({ type: 'ack', token: '99' }));
+    expect(ws.deserializeAttachment()).toMatchObject({ lastSyncToken: '99' });
+
+    const before = ws.sent.length;
+    await msg(ws, new ArrayBuffer(0));
+    await msg(ws, '{bad');
+    await msg(ws, JSON.stringify({ type: 'unknown' }));
+    expect(ws.sent.length).toBe(before);
+
+    const bare = new FakeWebSocket();
+    await msg(bare, JSON.stringify({ type: 'ping' }));
+    expect(bare.sent).toEqual([]);
+  });
+
+  it('webSocketClose / webSocketError remove sessions', async () => {
+    const { do: sync } = makeSync();
+    const leaving = new FakeWebSocket();
+    leaving.serializeAttachment({
+      userId: '@a:ex.com',
+      deviceId: null,
+      lastSyncToken: '0',
+    });
+    const sessions = (
+      sync as unknown as {
+        sessions: Map<FakeWebSocket, { userId: string }>;
+      }
+    ).sessions;
+    sessions.set(leaving, { userId: '@a:ex.com' });
+
+    await (
+      sync as unknown as {
+        webSocketClose: (
+          ws: FakeWebSocket,
+          code: number,
+          reason: string,
+          clean: boolean
+        ) => Promise<void>;
+      }
+    ).webSocketClose(leaving, 1000, 'bye', true);
+    expect(sessions.has(leaving)).toBe(false);
+    expect(leaving.closed).toEqual({ code: 1000, reason: 'bye' });
+
+    const errWs = new FakeWebSocket();
+    errWs.serializeAttachment({ userId: '@b:ex.com', deviceId: null, lastSyncToken: '0' });
+    sessions.set(errWs, { userId: '@b:ex.com' });
+    await (
+      sync as unknown as {
+        webSocketError: (ws: FakeWebSocket, err: unknown) => Promise<void>;
+      }
+    ).webSocketError(errWs, new Error('boom'));
+    expect(sessions.has(errWs)).toBe(false);
+  });
+
+  it('caps getPendingEvents storage scan at 1000 keys', async () => {
+    const { state, do: sync } = makeSync();
+    for (let i = 0; i < 1005; i++) {
+      const id = `$e${String(i).padStart(4, '0')}`;
+      await state.storage.put(`event:${id}`, {
+        event_id: id,
+        room_id: '!r:ex.com',
+        type: 'm.room.message',
+        timestamp: i + 1,
+      });
+    }
+
+    const body = (await (
+      await sync.fetch(new Request('https://do/pending?since=0'))
+    ).json()) as { events: unknown[] };
+    expect(body.events).toHaveLength(1000);
   });
 });

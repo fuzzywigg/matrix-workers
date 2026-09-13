@@ -504,6 +504,56 @@ describe('fetchRemoteServerKeys TOKENMAXX clock boundaries after #63', () => {
     expect(old?.valid_until).toBe(NOW);
     expect(old?.valid_from).toBe(0);
   });
+
+  it('keeps verified:false when self-signature is present but fails verify', async () => {
+    const kv = mockKv();
+    seedDiscovery(kv, 'badsig.example.com');
+    const other = await generateSigningKeyPair();
+    const unsigned = {
+      server_name: 'badsig.example.com',
+      valid_until_ts: NOW + 50_000,
+      verify_keys: { [remotePair.keyId]: { key: remotePair.publicKey } },
+    };
+    // Sign with a different key so verify against remotePair.publicKey fails
+    const wronglySigned = await signJson(
+      unsigned,
+      'badsig.example.com',
+      remotePair.keyId,
+      other.privateKeyJwk
+    );
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(wronglySigned), { status: 200 })
+    );
+
+    const keys = await fetchRemoteServerKeys('badsig.example.com', mockKeysDb([]), kv);
+    expect(keys).toHaveLength(1);
+    expect(keys[0].verified).toBe(false);
+    expect(keys[0].public_key).toBe(remotePair.publicKey);
+    expect(kv.puts.some((p) => p.key === 'federation:keys:badsig.example.com')).toBe(true);
+    expect(
+      kv.puts.find((p) => p.key === 'federation:keys:badsig.example.com')?.options
+    ).toEqual({ expirationTtl: KEY_CACHE_TTL });
+  });
+
+  it('stores valid_until as null when remote omits valid_until_ts', async () => {
+    const kv = mockKv();
+    seedDiscovery(kv, 'novalid.example.com');
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          server_name: 'novalid.example.com',
+          verify_keys: { [remotePair.keyId]: { key: remotePair.publicKey } },
+        }),
+        { status: 200 }
+      )
+    );
+
+    const keys = await fetchRemoteServerKeys('novalid.example.com', mockKeysDb([]), kv);
+    expect(keys).toHaveLength(1);
+    expect(keys[0].valid_until).toBeNull();
+    expect(keys[0].valid_from).toBe(NOW);
+    expect(keys[0].fetched_at).toBe(NOW);
+  });
 });
 
 describe('fetchRawServerKeyResponse TOKENMAXX edge paths after #63', () => {
@@ -1188,5 +1238,37 @@ describe('getRemoteKeysWithNotarySignature self-signature path after #63', () =>
         notary.privateKeyJwk
       )
     ).rejects.toThrow('Cannot fetch signing keys from void.example.com');
+  });
+
+  it('still notary-signs when remote has verify_keys but no valid self-signature', async () => {
+    const kv = mockKv();
+    seedDiscovery(kv, 'noself.example.com');
+    const unsigned = {
+      server_name: 'noself.example.com',
+      valid_until_ts: NOW + 9_000,
+      verify_keys: { [remote.keyId]: { key: remote.publicKey } },
+      // no signatures
+    };
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(unsigned), { status: 200 })
+    );
+
+    const result = await getRemoteKeysWithNotarySignature(
+      'noself.example.com',
+      null,
+      NOW + 1,
+      mockKeysDb(),
+      kv,
+      'notary.example.com',
+      notary.keyId,
+      notary.privateKeyJwk
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].signatures?.['notary.example.com']?.[notary.keyId]).toEqual(
+      expect.any(String)
+    );
+    expect(result[0].signatures?.['noself.example.com']).toBeUndefined();
+    expect(kv.puts.some((p) => p.options?.expirationTtl === KEY_CACHE_TTL)).toBe(true);
   });
 });
