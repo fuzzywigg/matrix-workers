@@ -68,6 +68,62 @@ interface SlidingRoomFilter {
   not_tags?: string[];
 }
 
+/** A DM is typically a room with ≤2 members and no explicit name. Exported for unit tests. */
+export function isDmRoom(memberCount: number, name?: string | null): boolean {
+  return memberCount <= 2 && !name;
+}
+
+/** Apply in-memory sliding-sync list filters. Exported for unit tests. */
+export function matchesSlidingRoomFilters(
+  name: string | null | undefined,
+  isDm: boolean,
+  filters?: SlidingRoomFilter
+): boolean {
+  if (filters?.room_name_like && name) {
+    if (!name.toLowerCase().includes(filters.room_name_like.toLowerCase())) {
+      return false;
+    }
+  }
+
+  if (filters?.is_dm !== undefined) {
+    if (filters.is_dm && !isDm) return false;
+    if (!filters.is_dm && isDm) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Resolve MSC3575 `ranges` / MSC4186 `range` into inclusive start/end indices.
+ * Exported for unit tests.
+ */
+export function resolveListRange(
+  listConfig: { ranges?: [number, number][]; range?: [number, number] },
+  roomCount: number,
+  preferRangesFirst = true
+): { startIndex: number; endIndex: number } {
+  let startIndex = 0;
+  let endIndex = roomCount - 1;
+
+  if (preferRangesFirst) {
+    if (listConfig.ranges && listConfig.ranges.length > 0) {
+      startIndex = listConfig.ranges[0][0];
+      endIndex = Math.min(listConfig.ranges[0][1], roomCount - 1);
+    } else if (listConfig.range) {
+      startIndex = listConfig.range[0];
+      endIndex = Math.min(listConfig.range[1], roomCount - 1);
+    }
+  } else if (listConfig.range) {
+    startIndex = listConfig.range[0];
+    endIndex = Math.min(listConfig.range[1], roomCount - 1);
+  } else if (listConfig.ranges && listConfig.ranges.length > 0) {
+    startIndex = listConfig.ranges[0][0];
+    endIndex = Math.min(listConfig.ranges[0][1], roomCount - 1);
+  }
+
+  return { startIndex, endIndex };
+}
+
 interface ExtensionsRequest {
   to_device?: {
     enabled?: boolean;
@@ -338,18 +394,11 @@ async function getUserRooms(
     const memberCount = row.member_count as number;
 
     // A DM is typically a room with 2 members and no explicit name
-    const isDm = memberCount <= 2 && !name;
+    const isDm = isDmRoom(memberCount, name);
 
     // Apply filters in memory (already have all data)
-    if (filters?.room_name_like && name) {
-      if (!name.toLowerCase().includes(filters.room_name_like.toLowerCase())) {
-        continue;
-      }
-    }
-
-    if (filters?.is_dm !== undefined) {
-      if (filters.is_dm && !isDm) continue;
-      if (!filters.is_dm && isDm) continue;
+    if (!matchesSlidingRoomFilters(name, isDm, filters)) {
+      continue;
     }
 
     rooms.push({
@@ -842,20 +891,8 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     for (const [listKey, listConfig] of Object.entries(body.lists)) {
       const rooms = await getUserRooms(db, userId, listConfig.filters, listConfig.sort);
 
-      // Determine range to return
-      let startIndex = 0;
-      let endIndex = rooms.length - 1;
-
-      // MSC3575 uses ranges array
-      if (listConfig.ranges && listConfig.ranges.length > 0) {
-        startIndex = listConfig.ranges[0][0];
-        endIndex = Math.min(listConfig.ranges[0][1], rooms.length - 1);
-      }
-      // MSC4186 uses single range
-      else if (listConfig.range) {
-        startIndex = listConfig.range[0];
-        endIndex = Math.min(listConfig.range[1], rooms.length - 1);
-      }
+      // Determine range to return (MSC3575 ranges preferred over MSC4186 range)
+      const { startIndex, endIndex } = resolveListRange(listConfig, rooms.length, true);
 
       const roomsInRange = rooms.slice(startIndex, endIndex + 1);
       const roomIds = roomsInRange.map(r => r.roomId);
@@ -1330,7 +1367,8 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
 // - Minimal or no extensions
 // - User-agent may differ from main app
 // - Made shortly after push notification delivery
-function detectNSERequest(
+/** Exported for unit tests. */
+export function detectNSERequest(
   userAgent: string | undefined,
   body: SlidingSyncRequest
 ): { isLikelyNSE: boolean; indicators: string[] } {
@@ -1518,16 +1556,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     for (const [listKey, listConfig] of Object.entries(body.lists)) {
       const rooms = await getUserRooms(db, userId, listConfig.filters, listConfig.sort);
 
-      let startIndex = 0;
-      let endIndex = rooms.length - 1;
-
-      if (listConfig.range) {
-        startIndex = listConfig.range[0];
-        endIndex = Math.min(listConfig.range[1], rooms.length - 1);
-      } else if (listConfig.ranges && listConfig.ranges.length > 0) {
-        startIndex = listConfig.ranges[0][0];
-        endIndex = Math.min(listConfig.ranges[0][1], rooms.length - 1);
-      }
+      // MSC4186 prefers single range; fall back to MSC3575 ranges
+      const { startIndex, endIndex } = resolveListRange(listConfig, rooms.length, false);
 
       const roomsInRange = rooms.slice(startIndex, endIndex + 1);
       const roomIds = roomsInRange.map(r => r.roomId);

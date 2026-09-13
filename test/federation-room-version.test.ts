@@ -17,4 +17,15 @@ describe('isModernRoomVersion', () => {
     expect(isModernRoomVersion('org.example.custom')).toBe(true);
     expect(isModernRoomVersion('')).toBe(true);
   });
+
+  it('parses leading-zero numeric versions via parseInt', () => {
+    expect(isModernRoomVersion('03')).toBe(true);
+    expect(isModernRoomVersion('0')).toBe(false);
+  });
+
+  it('treats floats as their integer prefix', () => {
+    // parseInt('2.5', 10) === 2 → legacy
+    expect(isModernRoomVersion('2.5')).toBe(false);
+    expect(isModernRoomVersion('3.9')).toBe(true);
+  });
 });

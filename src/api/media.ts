@@ -46,11 +46,114 @@ export function safeContentDisposition(filename: string): string {
   return `inline; filename="${sanitized}"`;
 }
 
+/** Strip MIME parameters (e.g. charset) and normalize whitespace. Exported for unit tests. */
+export function parseBaseContentType(contentType: string): string {
+  return contentType.split(';')[0].trim();
+}
+
+/** Exported for unit tests. */
+export function isSupportedContentType(contentType: string): boolean {
+  return SUPPORTED_TYPES.includes(parseBaseContentType(contentType));
+}
+
+/** Clamp thumbnail width/height query values to [1, 1920]. Exported for unit tests. */
+export function clampThumbnailDimension(raw: string | undefined, fallback = 96): number {
+  return Math.max(1, Math.min(parseInt(raw || String(fallback), 10) || fallback, 1920));
+}
+
 // Add security headers to all media responses
-function addMediaSecurityHeaders(headers: Headers): void {
+/** Exported for unit tests. */
+export function addMediaSecurityHeaders(headers: Headers): void {
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
   headers.set('X-Frame-Options', 'DENY');
+}
+
+// Helper to decode HTML entities (only decode once to prevent double-decoding attacks)
+/** Exported for unit tests. */
+export function decodeHtmlEntities(text: string): string {
+  // Use a proper HTML entity decoder that handles all entities correctly
+  // and prevents double-decoding by checking if the text is already decoded
+  const decoded = text
+    .replace(/&amp;/g, '\x00AMP\x00')  // Temporarily replace to prevent double-decode
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\x00AMP\x00/g, '&');  // Restore ampersands last
+  return decoded;
+}
+
+/**
+ * Extract Open Graph / meta preview fields from HTML.
+ * `baseUrl` is used to absolutize relative og:image values.
+ * Exported for unit tests.
+ */
+export function extractOpenGraphPreview(
+  html: string,
+  baseUrl?: { protocol: string; host: string }
+): Record<string, string> {
+  const preview: Record<string, string> = {};
+
+  const ogTitle =
+    html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
+    html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:title["'][^>]*>/i);
+  if (ogTitle) {
+    preview['og:title'] = decodeHtmlEntities(ogTitle[1]);
+  } else {
+    const title = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+    if (title) {
+      preview['og:title'] = decodeHtmlEntities(title[1]);
+    }
+  }
+
+  const ogDesc =
+    html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
+    html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:description["'][^>]*>/i);
+  if (ogDesc) {
+    preview['og:description'] = decodeHtmlEntities(ogDesc[1]);
+  } else {
+    const metaDesc =
+      html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
+      html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*name=["']description["'][^>]*>/i);
+    if (metaDesc) {
+      preview['og:description'] = decodeHtmlEntities(metaDesc[1]);
+    }
+  }
+
+  const ogImage =
+    html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
+    html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:image["'][^>]*>/i);
+  if (ogImage) {
+    let imageUrl = ogImage[1];
+    if (baseUrl) {
+      if (imageUrl.startsWith('/')) {
+        imageUrl = `${baseUrl.protocol}//${baseUrl.host}${imageUrl}`;
+      } else if (!imageUrl.startsWith('http')) {
+        imageUrl = `${baseUrl.protocol}//${baseUrl.host}/${imageUrl}`;
+      }
+    }
+    preview['og:image'] = imageUrl;
+  }
+
+  const ogSiteName =
+    html.match(/<meta[^>]*property=["']og:site_name["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
+    html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:site_name["'][^>]*>/i);
+  if (ogSiteName) {
+    preview['og:site_name'] = decodeHtmlEntities(ogSiteName[1]);
+  }
+
+  const ogType =
+    html.match(/<meta[^>]*property=["']og:type["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
+    html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:type["'][^>]*>/i);
+  if (ogType) {
+    preview['og:type'] = ogType[1];
+  }
+
+  return preview;
 }
 
 // POST /_matrix/media/v3/upload - Upload media
@@ -62,8 +165,11 @@ app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   const filename = c.req.query('filename');
 
   // Validate MIME type against whitelist
-  if (!SUPPORTED_TYPES.includes(contentType.split(';')[0].trim())) {
-    return c.json({ errcode: 'M_FORBIDDEN', error: `Unsupported content type: ${contentType.split(';')[0].trim()}` }, 403);
+  if (!isSupportedContentType(contentType)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: `Unsupported content type: ${parseBaseContentType(contentType)}` },
+      403
+    );
   }
 
   // Early rejection based on Content-Length header (may be absent or falsified)
@@ -175,8 +281,8 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
 app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
-  const width = Math.max(1, Math.min(parseInt(c.req.query('width') || '96', 10) || 96, 1920));
-  const height = Math.max(1, Math.min(parseInt(c.req.query('height') || '96', 10) || 96, 1920));
+  const width = clampThumbnailDimension(c.req.query('width'));
+  const height = clampThumbnailDimension(c.req.query('height'));
   const method = c.req.query('method') || 'scale';
 
   // Only serve local media for now
@@ -356,62 +462,10 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
     }
 
     // Extract Open Graph and meta tags
-    const preview: Record<string, any> = {};
-
-    // Extract og:title
-    const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                   html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:title["'][^>]*>/i);
-    if (ogTitle) {
-      preview['og:title'] = decodeHtmlEntities(ogTitle[1]);
-    } else {
-      // Fallback to title tag
-      const title = html.match(/<title[^>]*>([^<]*)<\/title>/i);
-      if (title) {
-        preview['og:title'] = decodeHtmlEntities(title[1]);
-      }
-    }
-
-    // Extract og:description
-    const ogDesc = html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                  html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:description["'][^>]*>/i);
-    if (ogDesc) {
-      preview['og:description'] = decodeHtmlEntities(ogDesc[1]);
-    } else {
-      // Fallback to meta description
-      const metaDesc = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                      html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*name=["']description["'][^>]*>/i);
-      if (metaDesc) {
-        preview['og:description'] = decodeHtmlEntities(metaDesc[1]);
-      }
-    }
-
-    // Extract og:image
-    const ogImage = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                   html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:image["'][^>]*>/i);
-    if (ogImage) {
-      let imageUrl = ogImage[1];
-      // Convert relative URLs to absolute
-      if (imageUrl.startsWith('/')) {
-        imageUrl = `${parsedUrl.protocol}//${parsedUrl.host}${imageUrl}`;
-      } else if (!imageUrl.startsWith('http')) {
-        imageUrl = `${parsedUrl.protocol}//${parsedUrl.host}/${imageUrl}`;
-      }
-      preview['og:image'] = imageUrl;
-    }
-
-    // Extract og:site_name
-    const ogSiteName = html.match(/<meta[^>]*property=["']og:site_name["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                      html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:site_name["'][^>]*>/i);
-    if (ogSiteName) {
-      preview['og:site_name'] = decodeHtmlEntities(ogSiteName[1]);
-    }
-
-    // Extract og:type
-    const ogType = html.match(/<meta[^>]*property=["']og:type["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                  html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:type["'][^>]*>/i);
-    if (ogType) {
-      preview['og:type'] = ogType[1];
-    }
+    const preview = extractOpenGraphPreview(html, {
+      protocol: parsedUrl.protocol,
+      host: parsedUrl.host,
+    });
 
     // Cache for 1 hour
     if (Object.keys(preview).length > 0) {
@@ -424,24 +478,6 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
     return c.json({});
   }
 });
-
-// Helper to decode HTML entities (only decode once to prevent double-decoding attacks)
-/** Exported for unit tests. */
-export function decodeHtmlEntities(text: string): string {
-  // Use a proper HTML entity decoder that handles all entities correctly
-  // and prevents double-decoding by checking if the text is already decoded
-  const decoded = text
-    .replace(/&amp;/g, '\x00AMP\x00')  // Temporarily replace to prevent double-decode
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, '/')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\x00AMP\x00/g, '&');  // Restore ampersands last
-  return decoded;
-}
 
 // GET /_matrix/media/v3/config - Get media config
 app.get('/_matrix/media/v3/config', async (c) => {
@@ -463,8 +499,11 @@ app.post('/_matrix/client/v1/media/upload', requireAuth(), async (c) => {
   const filename = c.req.query('filename');
 
   // Validate MIME type against whitelist
-  if (!SUPPORTED_TYPES.includes(contentType.split(';')[0].trim())) {
-    return c.json({ errcode: 'M_FORBIDDEN', error: `Unsupported content type: ${contentType.split(';')[0].trim()}` }, 403);
+  if (!isSupportedContentType(contentType)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: `Unsupported content type: ${parseBaseContentType(contentType)}` },
+      403
+    );
   }
 
   const contentLength = parseInt(c.req.header('Content-Length') || '0');
@@ -630,8 +669,8 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
 app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth(), async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
-  const width = Math.max(1, Math.min(parseInt(c.req.query('width') || '96', 10) || 96, 1920));
-  const height = Math.max(1, Math.min(parseInt(c.req.query('height') || '96', 10) || 96, 1920));
+  const width = clampThumbnailDimension(c.req.query('width'));
+  const height = clampThumbnailDimension(c.req.query('height'));
   const method = c.req.query('method') || 'scale';
 
   if (serverName !== c.env.SERVER_NAME) {
@@ -773,36 +812,10 @@ app.get('/_matrix/client/v1/media/preview_url', requireAuth(), async (c) => {
     }
 
     const html = await response.text();
-    const preview: Record<string, any> = {};
-
-    const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                   html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:title["'][^>]*>/i);
-    if (ogTitle) {
-      preview['og:title'] = decodeHtmlEntities(ogTitle[1]);
-    } else {
-      const title = html.match(/<title[^>]*>([^<]*)<\/title>/i);
-      if (title) {
-        preview['og:title'] = decodeHtmlEntities(title[1]);
-      }
-    }
-
-    const ogDesc = html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                  html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:description["'][^>]*>/i);
-    if (ogDesc) {
-      preview['og:description'] = decodeHtmlEntities(ogDesc[1]);
-    }
-
-    const ogImage = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
-                   html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:image["'][^>]*>/i);
-    if (ogImage) {
-      let imageUrl = ogImage[1];
-      if (imageUrl.startsWith('/')) {
-        imageUrl = `${parsedUrl.protocol}//${parsedUrl.host}${imageUrl}`;
-      } else if (!imageUrl.startsWith('http')) {
-        imageUrl = `${parsedUrl.protocol}//${parsedUrl.host}/${imageUrl}`;
-      }
-      preview['og:image'] = imageUrl;
-    }
+    const preview = extractOpenGraphPreview(html, {
+      protocol: parsedUrl.protocol,
+      host: parsedUrl.host,
+    });
 
     if (Object.keys(preview).length > 0) {
       await c.env.CACHE.put(cacheKey, JSON.stringify(preview), { expirationTtl: 3600 });

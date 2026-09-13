@@ -44,4 +44,26 @@ describe('validateStateEvent', () => {
         .valid
     ).toBe(true);
   });
+
+  it('accepts topic and join_rules events', () => {
+    expect(
+      validateStateEvent(
+        { type: 'm.room.topic', state_key: '', content: { topic: 'hello' } },
+        0
+      ).valid
+    ).toBe(true);
+    expect(
+      validateStateEvent(
+        { type: 'm.room.join_rules', state_key: '', content: { join_rule: 'public' } },
+        0
+      ).valid
+    ).toBe(true);
+  });
+
+  it('rejects whitespace-only type and non-object content', () => {
+    expect(validateStateEvent({ type: '   ', content: {} }, 0).valid).toBe(false);
+    expect(
+      validateStateEvent({ type: 'm.room.name', content: ['not', 'an', 'object'] }, 0).valid
+    ).toBe(false);
+  });
 });

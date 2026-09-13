@@ -74,4 +74,37 @@ describe('validateRemoteJoinTemplate', () => {
       validateRemoteJoinTemplate(validTemplate({ depth: 0 }), roomId, userId)
     ).toThrow(/depth/);
   });
+
+  it('accepts domain-suffixed event IDs and optional omitted room_id/sender', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({
+          room_id: undefined,
+          sender: undefined,
+          auth_events: ['$auth1:example.com'],
+          prev_events: ['$prev1:example.com'],
+        }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+
+  it('rejects non-object root, float/NaN/Infinity depth, and empty strings', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(null as unknown as { room_version?: unknown }, roomId, userId)
+    ).toThrow(/not an object/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: 1.5 }), roomId, userId)
+    ).toThrow(/depth/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: NaN }), roomId, userId)
+    ).toThrow(/depth/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: Infinity }), roomId, userId)
+    ).toThrow(/depth/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ room_id: '' }), roomId, userId)
+    ).toThrow(/room_id mismatch/);
+  });
 });

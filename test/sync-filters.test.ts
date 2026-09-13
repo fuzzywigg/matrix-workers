@@ -24,6 +24,16 @@ describe('applyEventFilter', () => {
     ]);
   });
 
+  it('matches exact types without wildcards', () => {
+    expect(applyEventFilter(events, { types: ['m.reaction'] })).toEqual([
+      { type: 'm.reaction', sender: '@alice:example.com' },
+    ]);
+  });
+
+  it('treats empty types whitelist as no type restriction', () => {
+    expect(applyEventFilter(events, { types: [] })).toEqual(events);
+  });
+
   it('applies not_types and sender filters', () => {
     expect(
       applyEventFilter(events, {
@@ -33,10 +43,32 @@ describe('applyEventFilter', () => {
     ).toEqual([{ type: 'm.room.message', sender: '@alice:example.com' }]);
   });
 
+  it('applies not_types wildcards', () => {
+    expect(applyEventFilter(events, { not_types: ['m.room.*'] }).map((e) => e.type)).toEqual([
+      'm.reaction',
+    ]);
+  });
+
   it('applies not_senders and limit', () => {
     expect(
       applyEventFilter(events, { not_senders: ['@bob:example.com'], limit: 1 })
     ).toHaveLength(1);
+  });
+
+  it('ignores non-positive limits', () => {
+    expect(applyEventFilter(events, { limit: 0 })).toHaveLength(3);
+    expect(applyEventFilter(events, { limit: -1 })).toHaveLength(3);
+  });
+
+  it('combines whitelist and blacklist', () => {
+    expect(
+      applyEventFilter(events, {
+        types: ['m.room.*'],
+        not_types: ['m.room.member'],
+        senders: ['@alice:example.com', '@bob:example.com'],
+        not_senders: ['@bob:example.com'],
+      })
+    ).toEqual([{ type: 'm.room.message', sender: '@alice:example.com' }]);
   });
 });
 
@@ -50,6 +82,20 @@ describe('shouldIncludeRoom', () => {
     expect(shouldIncludeRoom('!a:example.com', { rooms: ['!a:example.com'] })).toBe(true);
     expect(shouldIncludeRoom('!a:example.com', { not_rooms: ['!a:example.com'] })).toBe(false);
   });
+
+  it('treats empty rooms lists as unrestricted', () => {
+    expect(shouldIncludeRoom('!a:example.com', { rooms: [] })).toBe(true);
+    expect(shouldIncludeRoom('!a:example.com', { not_rooms: [] })).toBe(true);
+  });
+
+  it('requires whitelist membership before applying blacklist', () => {
+    expect(
+      shouldIncludeRoom('!a:example.com', {
+        rooms: ['!a:example.com'],
+        not_rooms: ['!a:example.com'],
+      })
+    ).toBe(false);
+  });
 });
 
 describe('sync tokens', () => {
@@ -58,6 +104,21 @@ describe('sync tokens', () => {
     expect(parseSyncToken('s84_td119')).toEqual({ events: 84, toDevice: 119 });
     expect(parseSyncToken('42')).toEqual({ events: 42, toDevice: 42 });
     expect(parseSyncToken('garbage')).toEqual({ events: 0, toDevice: 0 });
+  });
+
+  it('parses s0_td0 and leading-zero composite tokens', () => {
+    expect(parseSyncToken('s0_td0')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s007_td008')).toEqual({ events: 7, toDevice: 8 });
+  });
+
+  it('rejects whitespace and negative composite tokens', () => {
+    expect(parseSyncToken(' s1_td2')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s-1_td2')).toEqual({ events: 0, toDevice: 0 });
+  });
+
+  it('parses negative legacy numbers as NaN fallback to zero', () => {
+    // parseInt('-5') is -5 which is finite; legacy path accepts it
+    expect(parseSyncToken('-5')).toEqual({ events: -5, toDevice: -5 });
   });
 
   it('round-trips build/parse', () => {
