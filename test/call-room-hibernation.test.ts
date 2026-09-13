@@ -269,3 +269,92 @@ describe('CallRoom hibernation: state endpoint', () => {
     expect(u1.tracks).toEqual([{ trackName: 'audio0', kind: 'audio', enabled: true }]);
   });
 });
+
+
+describe('CallRoom signaling TOKENMAXX edge paths after #54', () => {
+  it('rejects binary and invalid JSON websocket messages', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state) as any;
+    const ws = new FakeWebSocket();
+
+    await room.webSocketMessage(ws, new ArrayBuffer(4));
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'INVALID_MESSAGE',
+    });
+
+    ws.sent.length = 0;
+    await room.webSocketMessage(ws, '{not-json');
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'INVALID_JSON',
+    });
+  });
+
+  it('rejects unknown message types and mute/offer without join', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state) as any;
+    const ws = new FakeWebSocket();
+
+    await room.webSocketMessage(ws, JSON.stringify({ type: 'ping' }));
+    expect(JSON.parse(ws.sent[0])).toMatchObject({
+      type: 'error',
+      code: 'UNKNOWN_MESSAGE',
+    });
+
+    ws.sent.length = 0;
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({ type: 'error', code: 'NOT_JOINED' });
+
+    ws.sent.length = 0;
+    await room.webSocketMessage(
+      ws,
+      JSON.stringify({
+        type: 'offer',
+        trackName: 'audio0',
+        sessionDescription: { type: 'offer', sdp: 'v=0' },
+      })
+    );
+    expect(JSON.parse(ws.sent[0])).toMatchObject({ type: 'error', code: 'NOT_JOINED' });
+  });
+
+  it('persists /init and serves /state; unknown paths return 404', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state) as any;
+
+    const initRes = await room.fetch(
+      new Request('https://do/init', {
+        method: 'POST',
+        body: JSON.stringify({ roomId: '!r:ex.com', callId: 'call-42' }),
+      })
+    );
+    expect(initRes.status).toBe(200);
+    expect(await initRes.json()).toMatchObject({ callId: 'call-42', roomId: '!r:ex.com' });
+    expect(state.storage.map.get('callId')).toBe('call-42');
+    expect(state.storage.map.get('matrixRoomId')).toBe('!r:ex.com');
+
+    const stateRes = await room.fetch(new Request('https://do/state'));
+    expect(stateRes.status).toBe(200);
+    expect(await stateRes.json()).toMatchObject({ callId: 'call-42' });
+
+    const missing = await room.fetch(new Request('https://do/unknown'));
+    expect(missing.status).toBe(404);
+  });
+
+  it('double leave/close on a bare socket is a no-op that leaves storage intact', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    await state.storage.put('callId', 'call-1');
+    const room = makeRoom(state) as any;
+    const bare = new FakeWebSocket();
+
+    await room.handleLeave(bare);
+    await room.webSocketClose(bare, 1000, 'bye');
+
+    expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+    expect(state.storage.map.get('callId')).toBe('call-1');
+  });
+});

@@ -3,6 +3,7 @@ import {
   isExclusiveAppServiceUser,
   isExclusiveAppServiceAlias,
   getInterestedAppServices,
+  getAppServiceByToken,
   type AppServiceRegistration,
 } from '../src/services/appservice';
 
@@ -324,5 +325,74 @@ describe('appservice TOKENMAXX edge paths after #53', () => {
     });
     expect(isExclusiveAppServiceUser([multi], '@_multi_bot:example.com')).toBe(multi);
     expect(isExclusiveAppServiceUser([multi], '@_soft_bot:example.com')).toBeNull();
+  });
+});
+
+describe('getAppServiceByToken / interest TOKENMAXX edge paths after #54', () => {
+  function createAsDb(row: Record<string, unknown> | null) {
+    return {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async first<T>() {
+                return (row as T) ?? null;
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  it('returns null when the AS token is unknown', async () => {
+    expect(await getAppServiceByToken(createAsDb(null), 'missing')).toBeNull();
+  });
+
+  it('maps null protocols to [] and rate_limited 0/1 to boolean', async () => {
+    const off = await getAppServiceByToken(
+      createAsDb({
+        id: 'a',
+        url: 'https://a.example.com',
+        as_token: 'tok',
+        hs_token: 'hs',
+        sender_localpart: 'bot',
+        rate_limited: 0,
+        protocols: null,
+        namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+      }),
+      'tok'
+    );
+    expect(off).toMatchObject({ rate_limited: false, protocols: [] });
+
+    const on = await getAppServiceByToken(
+      createAsDb({
+        id: 'b',
+        url: 'https://b.example.com',
+        as_token: 'tok2',
+        hs_token: 'hs',
+        sender_localpart: 'bot',
+        rate_limited: 1,
+        protocols: JSON.stringify(['m.login.sso']),
+        namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+      }),
+      'tok2'
+    );
+    expect(on).toMatchObject({ rate_limited: true, protocols: ['m.login.sso'] });
+  });
+
+  it('includes a registration only once when both sender and room namespaces match', () => {
+    const dual = registration('dual', {
+      users: [{ exclusive: false, regex: '^@alice:example\\.com$' }],
+      rooms: [{ exclusive: false, regex: '^!bridge_.*:example\\.com$' }],
+      aliases: [],
+    });
+    expect(
+      getInterestedAppServices([dual], {
+        room_id: '!bridge_room:example.com',
+        sender: '@alice:example.com',
+        type: 'm.room.message',
+      })
+    ).toEqual([dual]);
   });
 });

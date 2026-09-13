@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { parseAuthHeader } from '../src/middleware/federation-auth';
 import {
   DEFAULT_KEY_MAX_STALENESS_MS,
+  getServerSigningKey,
   signFederationRequest,
   verifyRemoteSignature,
   type SigningKey,
@@ -303,3 +304,155 @@ describe('verifyRemoteSignature staleness gate', () => {
     ).toBe(true);
   });
 });
+
+describe('signFederationRequest / getServerSigningKey TOKENMAXX edge paths after #54', () => {
+  let restore: (() => void) | undefined;
+  let signingKey: SigningKey;
+  let publicKey: string;
+
+  beforeAll(async () => {
+    restore = installNodeEd25519Shim();
+    const pair = await generateSigningKeyPair();
+    signingKey = { keyId: pair.keyId, privateKeyJwk: pair.privateKeyJwk };
+    publicKey = pair.publicKey;
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('includes falsy content values 0 / false / empty string in the signed JSON', async () => {
+    for (const content of [0, false, ''] as const) {
+      const header = await signFederationRequest(
+        'PUT',
+        '/path',
+        'a.example.com',
+        'b.example.com',
+        signingKey,
+        content
+      );
+      const parsed = parseAuthHeader(header)!;
+      const withContent = {
+        method: 'PUT',
+        uri: '/path',
+        origin: 'a.example.com',
+        destination: 'b.example.com',
+        content,
+        signatures: { 'a.example.com': { [signingKey.keyId]: parsed.sig } },
+      };
+      const withoutContent = {
+        method: 'PUT',
+        uri: '/path',
+        origin: 'a.example.com',
+        destination: 'b.example.com',
+        signatures: { 'a.example.com': { [signingKey.keyId]: parsed.sig } },
+      };
+      expect(
+        await verifySignature(withContent, 'a.example.com', signingKey.keyId, publicKey)
+      ).toBe(true);
+      expect(
+        await verifySignature(withoutContent, 'a.example.com', signingKey.keyId, publicKey)
+      ).toBe(false);
+    }
+  });
+
+  it('returns null from getServerSigningKey when no row or private_key_jwk is null', async () => {
+    // getServerSigningKey calls prepare().first() without bind
+    const emptyDb = {
+      prepare: () => ({
+        first: async () => null,
+      }),
+    } as unknown as D1Database;
+    expect(await getServerSigningKey(emptyDb)).toBeNull();
+
+    const nullJwkDb = {
+      prepare: () => ({
+        first: async () => ({ key_id: 'ed25519:1', private_key_jwk: null }),
+      }),
+    } as unknown as D1Database;
+    expect(await getServerSigningKey(nullJwkDb)).toBeNull();
+  });
+
+  it('parses a valid private_key_jwk row from getServerSigningKey', async () => {
+    const db = {
+      prepare: () => ({
+        first: async () => ({
+          key_id: signingKey.keyId,
+          private_key_jwk: JSON.stringify(signingKey.privateKeyJwk),
+        }),
+      }),
+    } as unknown as D1Database;
+    await expect(getServerSigningKey(db)).resolves.toEqual({
+      keyId: signingKey.keyId,
+      privateKeyJwk: signingKey.privateKeyJwk,
+    });
+  });
+});
+
+describe('verifyRemoteSignature TOKENMAXX edge paths after #54', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('still verifies when valid_until is null or undefined (no expiry)', async () => {
+    const pair = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.test', content: { n: 1 } },
+      'open.example.com',
+      pair.keyId,
+      pair.privateKeyJwk
+    );
+    for (const valid_until of [null, undefined] as const) {
+      const kv = mockKv({
+        'federation:keys:open.example.com': JSON.stringify([
+          {
+            server_name: 'open.example.com',
+            key_id: pair.keyId,
+            public_key: pair.publicKey,
+            valid_from: 0,
+            valid_until,
+            fetched_at: Date.now(),
+            verified: 1,
+          },
+        ]),
+      });
+      expect(
+        await verifyRemoteSignature(signed, 'open.example.com', pair.keyId, mockDb(), kv)
+      ).toBe(true);
+    }
+  });
+
+  it('returns false when the cached public_key does not verify the signature', async () => {
+    const pair = await generateSigningKeyPair();
+    const other = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.test' },
+      'bad.example.com',
+      pair.keyId,
+      pair.privateKeyJwk
+    );
+    const kv = mockKv({
+      'federation:keys:bad.example.com': JSON.stringify([
+        {
+          server_name: 'bad.example.com',
+          key_id: pair.keyId,
+          public_key: other.publicKey,
+          valid_from: 0,
+          valid_until: Date.now() + 86_400_000,
+          fetched_at: Date.now(),
+          verified: 1,
+        },
+      ]),
+    });
+    expect(
+      await verifyRemoteSignature(signed, 'bad.example.com', pair.keyId, mockDb(), kv)
+    ).toBe(false);
+  });
+});
+

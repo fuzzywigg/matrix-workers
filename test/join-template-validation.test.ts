@@ -319,3 +319,35 @@ describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #53', () => {
     ).toThrow(/event ID/);
   });
 });
+
+
+describe('validateRemoteJoinTemplate TOKENMAXX edge paths after #54', () => {
+  it('accepts opaque event IDs without a domain suffix', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({
+          auth_events: ['$opaqueOnly'],
+          prev_events: ['$alsoOpaque'],
+        }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+
+  it('accepts provided room_id and sender when they equal the expected values', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({ room_id: roomId, sender: userId }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+
+  it('accepts large safe-integer depths', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: Number.MAX_SAFE_INTEGER }), roomId, userId)
+    ).not.toThrow();
+  });
+});

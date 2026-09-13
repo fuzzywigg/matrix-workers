@@ -451,3 +451,25 @@ describe('resolveThumbnailFit TOKENMAXX edge paths after #53', () => {
     expect(resolveThumbnailFit('CROP')).toBe('contain'); // case-sensitive
   });
 });
+
+
+describe('media helpers TOKENMAXX edge paths after #54', () => {
+  it('treats Crop / spaced crop as contain (case and exact-match sensitive)', () => {
+    expect(resolveThumbnailFit('Crop')).toBe('contain');
+    expect(resolveThumbnailFit(' crop')).toBe('contain');
+    expect(resolveThumbnailFit('crop ')).toBe('contain');
+  });
+
+  it('absolutizes empty og:image to host/ when baseUrl is provided', () => {
+    const preview = extractOpenGraphPreview(
+      '<meta property="og:image" content="" />',
+      { protocol: 'https:', host: 'example.com' }
+    );
+    expect(preview['og:image']).toBe('https://example.com/');
+  });
+
+  it('parses scientific-notation dimension strings via parseInt (1e3 → 1)', () => {
+    expect(clampThumbnailDimension('1e3')).toBe(1);
+    expect(clampThumbnailDimension('1e3', 32)).toBe(1);
+  });
+});

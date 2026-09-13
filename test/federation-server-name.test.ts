@@ -153,3 +153,21 @@ describe('isValidServerName TOKENMAXX edge paths after #53', () => {
     expect(isValidServerName('matrix.org:8443')).toBe(true);
   });
 });
+
+
+describe('isValidServerName TOKENMAXX edge paths after #54', () => {
+  it('rejects userinfo that makes WHATWG hostname a loopback (SSRF trap)', () => {
+    // URL("https://evil.com@127.0.0.1/") → hostname 127.0.0.1
+    expect(isValidServerName('evil.com@127.0.0.1')).toBe(false);
+  });
+
+  it('allows userinfo when the WHATWG hostname remains a public host', () => {
+    // URL("https://127.0.0.1@evil.com/") → hostname evil.com
+    expect(isValidServerName('127.0.0.1@evil.com')).toBe(true);
+    expect(isValidServerName('user:pass@matrix.org')).toBe(true);
+  });
+
+  it('documents trailing-dot hostnames are accepted by WHATWG+validateUrl', () => {
+    expect(isValidServerName('example.com.')).toBe(true);
+  });
+});
