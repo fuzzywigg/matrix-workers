@@ -495,3 +495,150 @@ describe('sliding-sync NSE/range leftovers after #71', () => {
     });
   });
 });
+
+describe('sliding-sync TOKENMAXX leftovers after #78 (list/filter/NSE helpers)', () => {
+  it('treats whitespace-only names as named (truthy) so they are not DMs', () => {
+    expect(isDmRoom(2, ' ')).toBe(false);
+    expect(isDmRoom(1, '\t')).toBe(false);
+  });
+
+  it('matches room_name_like case-insensitively on both name and needle', () => {
+    expect(matchesSlidingRoomFilters('MATRIX hq', false, { room_name_like: 'Hq' })).toBe(true);
+    expect(matchesSlidingRoomFilters('matrix hq', false, { room_name_like: 'MATRIX' })).toBe(true);
+  });
+
+  it('rejects is_dm:false rooms that are DMs even when name_like matches', () => {
+    expect(
+      matchesSlidingRoomFilters(null, true, { is_dm: false, room_name_like: 'anything' })
+    ).toBe(false);
+  });
+
+  it('allows unnamed non-DM rooms through room_name_like (name guard skips includes)', () => {
+    // joinedCount>2 → isDm false; name null → room_name_like check skipped
+    expect(matchesSlidingRoomFilters(null, false, { room_name_like: 'zzz' })).toBe(true);
+  });
+
+  it('uses exact endIndex when range end equals roomCount - 1 (no clamp change)', () => {
+    expect(resolveListRange({ range: [0, 4] }, 5)).toEqual({ startIndex: 0, endIndex: 4 });
+    expect(resolveListRange({ ranges: [[2, 2]] }, 5, true)).toEqual({
+      startIndex: 2,
+      endIndex: 2,
+    });
+  });
+
+  it('preferRangesFirst false ignores empty ranges and uses MSC4186 range', () => {
+    expect(resolveListRange({ ranges: [], range: [3, 4] }, 10, false)).toEqual({
+      startIndex: 3,
+      endIndex: 4,
+    });
+  });
+
+  it('preferRangesFirst false with neither range nor ranges defaults to full list', () => {
+    expect(resolveListRange({}, 7, false)).toEqual({ startIndex: 0, endIndex: 6 });
+  });
+
+  it('does not clamp startIndex below zero when range starts negative and end overshoots', () => {
+    expect(resolveListRange({ range: [-5, 100] }, 3)).toEqual({
+      startIndex: -5,
+      endIndex: 2,
+    });
+  });
+
+  it('flags NSE substring mid User-Agent and NotificationService independently', () => {
+    expect(detectNSERequest('ElementX/NSE/1.0', {}).indicators).toContain('user-agent-nse');
+    expect(
+      detectNSERequest('com.element.NotificationServiceExtension', {}).indicators
+    ).toContain('user-agent-nse');
+  });
+
+  it('marks iOS NSE User-Agent as likely NSE via two UA indicators', () => {
+    const result = detectNSERequest('MyNSE iOS/1.0', {});
+    expect(result.indicators).toEqual(
+      expect.arrayContaining(['user-agent-nse', 'user-agent-different-ios'])
+    );
+    expect(result.isLikelyNSE).toBe(true);
+  });
+
+  it('does not flag minimal-extensions when three non-typing/presence keys are present', () => {
+    expect(
+      detectNSERequest(undefined, {
+        extensions: {
+          to_device: { enabled: true },
+          account_data: { enabled: true },
+          receipts: { enabled: true },
+        },
+      }).indicators
+    ).not.toContain('minimal-extensions');
+  });
+
+  it('flags minimal-extensions for account_data + receipts only (length 2, no typing/presence)', () => {
+    expect(
+      detectNSERequest(undefined, {
+        extensions: {
+          account_data: { enabled: true },
+          receipts: { enabled: true },
+        },
+      }).indicators
+    ).toContain('minimal-extensions');
+  });
+
+  it('treats negative timeline_limit as small (|| 10 does not replace negatives)', () => {
+    // (s.timeline_limit || 10) ≤ 5 — (-1 || 10) is -1 because -1 is truthy
+    expect(
+      detectNSERequest(undefined, {
+        room_subscriptions: { '!a:example.com': { timeline_limit: -1 } },
+      }).indicators
+    ).toContain('small-timeline-limit');
+  });
+
+  it('does not flag single-room-subscription when lists has any key even if empty config', () => {
+    const result = detectNSERequest(undefined, {
+      lists: { ops: {} },
+      room_subscriptions: { '!a:example.com': { timeline_limit: 10 } },
+    });
+    expect(result.indicators).not.toContain('single-room-subscription');
+  });
+
+  it('combines no-extensions + single-room into isLikelyNSE', () => {
+    const result = detectNSERequest(undefined, {
+      room_subscriptions: { '!a:example.com': { timeline_limit: 20 } },
+    });
+    expect(result.indicators).toEqual(
+      expect.arrayContaining(['single-room-subscription', 'no-extensions'])
+    );
+    expect(result.isLikelyNSE).toBe(true);
+  });
+
+  it('flags all-small timelines across many subscriptions', () => {
+    const result = detectNSERequest(undefined, {
+      lists: { all: { range: [0, 10] } },
+      room_subscriptions: {
+        '!a:example.com': { timeline_limit: 1 },
+        '!b:example.com': { timeline_limit: 5 },
+        '!c:example.com': { timeline_limit: 2 },
+      },
+      extensions: {
+        typing: { enabled: true },
+        presence: { enabled: true },
+        to_device: { enabled: true },
+      },
+    });
+    expect(result.indicators).toEqual(['small-timeline-limit']);
+    expect(result.isLikelyNSE).toBe(false);
+  });
+
+  it('does not treat Element X iOS with NSE substring as different-ios', () => {
+    // Contains both "NSE" and "Element X iOS" → nse yes, different-ios no
+    const result = detectNSERequest('Element X iOS NSE/1.0', {
+      lists: { all: { range: [0, 20] } },
+      extensions: {
+        typing: { enabled: true },
+        presence: { enabled: true },
+        to_device: { enabled: true },
+      },
+    });
+    expect(result.indicators).toEqual(['user-agent-nse']);
+    expect(result.indicators).not.toContain('user-agent-different-ios');
+    expect(result.isLikelyNSE).toBe(false);
+  });
+});
