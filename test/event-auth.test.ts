@@ -1827,3 +1827,924 @@ describe('checkEventAuth TOKENMAXX edge paths after #57', () => {
     expect(checkEventAuth(pl, state, '10').allowed).toBe(true);
   });
 });
+
+describe('checkEventAuth TOKENMAXX leftovers after #82/#83 (PL field matrix)', () => {
+  function basePlContent(overrides: Record<string, unknown> = {}) {
+    return {
+      users: { '@alice:example.com': 50 },
+      users_default: 0,
+      events_default: 0,
+      state_default: 50,
+      ban: 50,
+      kick: 50,
+      redact: 50,
+      invite: 0,
+      ...overrides,
+    };
+  }
+
+  it('rejects PL updates that raise redact / state_default / users_default / invite above sender power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50 }),
+    ];
+    for (const field of ['redact', 'state_default', 'users_default', 'invite'] as const) {
+      const pl = pdu({
+        type: 'm.room.power_levels',
+        event_id: `$pl-${field}`,
+        sender: '@alice:example.com',
+        state_key: '',
+        content: basePlContent({ [field]: 51 }),
+      });
+      expect(checkEventAuth(pl, state, '10').error).toBe(
+        'Cannot set power level higher than own (50)'
+      );
+    }
+  });
+
+  it('rejects PL updates that raise ban / kick / events_default above sender power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    for (const field of ['ban', 'kick', 'events_default'] as const) {
+      const pl = pdu({
+        type: 'm.room.power_levels',
+        event_id: `$pl-${field}`,
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+          [field]: 101,
+        },
+      });
+      expect(checkEventAuth(pl, state, '10').error).toBe(
+        'Cannot set power level higher than own (100)'
+      );
+    }
+  });
+
+  it('allows PL content fields and events map values exactly equal to sender power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 80 }),
+    ];
+    for (const field of [
+      'ban',
+      'kick',
+      'redact',
+      'invite',
+      'events_default',
+      'state_default',
+      'users_default',
+    ] as const) {
+      const pl = pdu({
+        type: 'm.room.power_levels',
+        event_id: `$pl-eq-${field}`,
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 80 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+          [field]: 80,
+        },
+      });
+      expect(checkEventAuth(pl, state, '10').allowed).toBe(true);
+    }
+    const eventsEq = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl-eq-events',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 80 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+        events: { 'm.room.name': 80, 'm.room.topic': 0 },
+      },
+    });
+    expect(checkEventAuth(eventsEq, state, '10').allowed).toBe(true);
+  });
+
+  it('rejects v10+ non-integer values in the events map (distinct from users map float)', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const floatEvents = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl-float-events',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+        events: { 'm.room.name': 50.5 },
+      },
+    });
+    expect(checkEventAuth(floatEvents, state, '10').error).toBe(
+      'Power levels must be integers in this room version'
+    );
+  });
+
+  it('pins exact Cannot set user … higher than own error for users map escalation', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50 }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl-user-hi',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50, '@bob:example.com': 51 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').error).toBe(
+      'Cannot set user @bob:example.com power level higher than own (50)'
+    );
+  });
+
+  it('pins exact Cannot change power of equal-or-higher peer in users map', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50, '@bob:example.com': 50 }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl-peer',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50, '@bob:example.com': 40 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').error).toBe(
+      'Cannot change power of user with equal or higher power'
+    );
+  });
+
+  it('allows sender to lower their own users-map power level', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl-self-down',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').allowed).toBe(true);
+  });
+
+  it('allows setting a lower-power peer when sender strictly outranks their old level', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100, '@bob:example.com': 20 }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl-peer-ok',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100, '@bob:example.com': 30 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').allowed).toBe(true);
+  });
+
+  it('rejects changing a peer whose old level equals sender power (users_default fallback)', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 50 },
+          users_default: 50,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+    ];
+    const pl = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl2',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 50, '@bob:example.com': 0 },
+        users_default: 50,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+      },
+    });
+    expect(checkEventAuth(pl, state, '10').error).toBe(
+      'Cannot change power of user with equal or higher power'
+    );
+  });
+});
+
+describe('checkEventAuth TOKENMAXX leftovers after #82/#83 (membership exact errors)', () => {
+  it('pins exact Cannot invite banned user and User is already joined errors', () => {
+    const base = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'invite', '@alice:example.com'),
+        [...base, memberEvent('@bob:example.com', 'ban', '@alice:example.com')],
+        '10'
+      ).error
+    ).toBe('Cannot invite banned user');
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'invite', '@alice:example.com'),
+        [...base, memberEvent('@bob:example.com', 'join')],
+        '10'
+      ).error
+    ).toBe('User is already joined');
+  });
+
+  it('pins exact Insufficient power level to kick when below kick threshold', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      memberEvent('@carol:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100, '@bob:example.com': 40 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+    ];
+    expect(
+      checkEventAuth(
+        memberEvent('@carol:example.com', 'leave', '@bob:example.com'),
+        state,
+        '10'
+      ).error
+    ).toBe('Insufficient power level to kick');
+  });
+
+  it('pins exact Cannot kick user with equal or higher power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 50, '@bob:example.com': 50 }),
+    ];
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'leave', '@alice:example.com'),
+        state,
+        '10'
+      ).error
+    ).toBe('Cannot kick user with equal or higher power');
+  });
+
+  it('pins exact Insufficient power level to unban', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      memberEvent('@carol:example.com', 'ban', '@alice:example.com'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100, '@bob:example.com': 40 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+    ];
+    expect(
+      checkEventAuth(
+        memberEvent('@carol:example.com', 'leave', '@bob:example.com'),
+        state,
+        '10'
+      ).error
+    ).toBe('Insufficient power level to unban');
+  });
+
+  it('allows unban when sender meets ban threshold exactly', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@mod:example.com', 'join'),
+      memberEvent('@bob:example.com', 'ban', '@alice:example.com'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100, '@mod:example.com': 50 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+    ];
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'leave', '@mod:example.com'),
+        state,
+        '10'
+      ).allowed
+    ).toBe(true);
+  });
+
+  it('allows banning a never-membered target and an invited target', () => {
+    const base = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(
+        pdu({
+          type: 'm.room.member',
+          event_id: '$ban-stranger',
+          sender: '@alice:example.com',
+          state_key: '@stranger:example.com',
+          content: { membership: 'ban' },
+        }),
+        base,
+        '10'
+      ).allowed
+    ).toBe(true);
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'ban', '@alice:example.com'),
+        [...base, memberEvent('@bob:example.com', 'invite', '@alice:example.com')],
+        '10'
+      ).allowed
+    ).toBe(true);
+  });
+
+  it('allows kicking a knocking target and an invited target with kick power', () => {
+    const base = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'leave', '@alice:example.com'),
+        [...base, memberEvent('@bob:example.com', 'knock')],
+        '10'
+      ).allowed
+    ).toBe(true);
+    expect(
+      checkEventAuth(
+        memberEvent('@carol:example.com', 'leave', '@alice:example.com'),
+        [...base, memberEvent('@carol:example.com', 'invite', '@alice:example.com')],
+        '10'
+      ).allowed
+    ).toBe(true);
+  });
+
+  it('pins exact knock errors: on-behalf, wrong join_rule, already joined, banned', () => {
+    const knockRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'knock' },
+    });
+    const inviteRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr-invite',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'invite' },
+    });
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'knock', '@alice:example.com'),
+        [createEvent(), knockRules],
+        '10'
+      ).error
+    ).toBe('Cannot knock on behalf of another user');
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'knock'), [createEvent(), inviteRules], '10')
+        .error
+    ).toBe('Room does not allow knocking');
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'knock'),
+        [createEvent(), knockRules, memberEvent('@bob:example.com', 'join')],
+        '10'
+      ).error
+    ).toBe('Already joined');
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'knock'),
+        [
+          createEvent(),
+          knockRules,
+          memberEvent('@bob:example.com', 'ban', '@alice:example.com'),
+        ],
+        '10'
+      ).error
+    ).toBe('Banned users cannot knock');
+  });
+
+  it('allows public re-join after leave; documents public re-join after ban is currently allowed', () => {
+    const joinRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'public' },
+    });
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'join'),
+        [createEvent(), joinRules, memberEvent('@bob:example.com', 'leave')],
+        '10'
+      ).allowed
+    ).toBe(true);
+    // Spec ideally rejects banned users; this implementation only special-cases join/invite
+    // before falling through to public join_rule — document the current gap.
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'join'),
+        [
+          createEvent(),
+          joinRules,
+          memberEvent('@bob:example.com', 'ban', '@alice:example.com'),
+        ],
+        '10'
+      ).allowed
+    ).toBe(true);
+  });
+
+  it('rejects invite-only join when prior membership is leave', () => {
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'join'),
+        [createEvent(), memberEvent('@bob:example.com', 'leave')],
+        '10'
+      ).error
+    ).toBe('Not authorized to join');
+  });
+
+  it('rejects restricted join when authorizer lacks invite power or is not joined', () => {
+    const joinRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { join_rule: 'restricted' },
+    });
+    const lowInvite = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: {
+        users: { '@alice:example.com': 100, '@bob:example.com': 0 },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 50,
+      },
+    });
+    const joinLow = memberEvent('@carol:example.com', 'join');
+    joinLow.content = {
+      membership: 'join',
+      join_authorised_via_users_server: '@bob:example.com',
+    };
+    expect(
+      checkEventAuth(
+        joinLow,
+        [
+          createEvent(),
+          joinRules,
+          lowInvite,
+          memberEvent('@alice:example.com', 'join'),
+          memberEvent('@bob:example.com', 'join'),
+        ],
+        '10'
+      ).error
+    ).toBe('Not authorized to join');
+
+    const joinNotJoined = memberEvent('@carol:example.com', 'join');
+    joinNotJoined.content = {
+      membership: 'join',
+      join_authorised_via_users_server: '@dave:example.com',
+    };
+    expect(
+      checkEventAuth(
+        joinNotJoined,
+        [createEvent(), joinRules, memberEvent('@alice:example.com', 'join'), lowInvite],
+        '10'
+      ).error
+    ).toBe('Not authorized to join');
+  });
+});
+
+describe('checkEventAuth TOKENMAXX leftovers after #82/#83 (power/redact/state helpers)', () => {
+  it('allows redaction at exact redact threshold and rejects one below', () => {
+    const makeState = (modPower: number) => [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@mod:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100, '@mod:example.com': modPower },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+    ];
+    const redaction = pdu({
+      type: 'm.room.redaction',
+      event_id: '$redact',
+      sender: '@mod:example.com',
+      content: { redacts: '$msg' },
+    });
+    expect(checkEventAuth(redaction, makeState(50), '10').allowed).toBe(true);
+    expect(checkEventAuth(redaction, makeState(49), '10').error).toBe(
+      'Insufficient power level to redact (have 49, need 50)'
+    );
+  });
+
+  it('rejects state events at required−1 and allows at exact state_default', () => {
+    const makeState = (bobPower: number) => [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100, '@bob:example.com': bobPower },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+        },
+      }),
+    ];
+    const name = pdu({
+      type: 'm.room.name',
+      event_id: '$name',
+      sender: '@bob:example.com',
+      state_key: '',
+      content: { name: 'x' },
+    });
+    expect(checkEventAuth(name, makeState(49), '10').error).toBe(
+      'Insufficient power level for m.room.name (have 49, need 50)'
+    );
+    expect(checkEventAuth(name, makeState(50), '10').allowed).toBe(true);
+  });
+
+  it('allows state events when events[] override is below sender power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+          events: { 'm.room.topic': 30 },
+        },
+      }),
+    ];
+    const topic = pdu({
+      type: 'm.room.topic',
+      event_id: '$topic',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { topic: 'hi' },
+    });
+    expect(checkEventAuth(topic, state, '10').allowed).toBe(true);
+  });
+
+  it('allows encrypted non-state events under default events_default and rejects when override is high', () => {
+    const joined = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    const enc = pdu({
+      type: 'm.room.encrypted',
+      event_id: '$enc',
+      sender: '@alice:example.com',
+      content: { algorithm: 'm.megolm.v1.aes-sha2', ciphertext: 'x' },
+    });
+    expect(checkEventAuth(enc, joined, '10').allowed).toBe(true);
+
+    const gated = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': 100 },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite: 0,
+          events: { 'm.room.encrypted': 50 },
+        },
+      }),
+    ];
+    const encBob = pdu({
+      type: 'm.room.encrypted',
+      event_id: '$enc2',
+      sender: '@bob:example.com',
+      content: { algorithm: 'm.megolm.v1.aes-sha2', ciphertext: 'y' },
+    });
+    expect(checkEventAuth(encBob, gated, '10').error).toBe(
+      'Insufficient power level for m.room.encrypted (have 0, need 50)'
+    );
+  });
+
+  it('allows third_party_invite at exact invite threshold and rejects one below', () => {
+    const makeState = (alicePower: number, invite: number) => [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: {
+          users: { '@alice:example.com': alicePower },
+          users_default: 0,
+          events_default: 0,
+          state_default: 50,
+          ban: 50,
+          kick: 50,
+          redact: 50,
+          invite,
+        },
+      }),
+    ];
+    const tpi = pdu({
+      type: 'm.room.third_party_invite',
+      event_id: '$tpi',
+      sender: '@alice:example.com',
+      state_key: 'token',
+      content: {
+        display_name: 'x',
+        key_validity_url: 'https://example.com',
+        public_key: 'k',
+      },
+    });
+    expect(checkEventAuth(tpi, makeState(50, 50), '10').allowed).toBe(true);
+    expect(checkEventAuth(tpi, makeState(49, 50), '10').error).toBe(
+      'Insufficient power level for third party invite'
+    );
+  });
+
+  it('buildStateMap skips non-state events and keeps last duplicate state key', () => {
+    const create = createEvent();
+    const msg = pdu({
+      type: 'm.room.message',
+      event_id: '$msg',
+      sender: '@alice:example.com',
+      content: { body: 'x', msgtype: 'm.text' },
+    });
+    const name1 = pdu({
+      type: 'm.room.name',
+      event_id: '$n1',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { name: 'a' },
+    });
+    const name2 = pdu({
+      type: 'm.room.name',
+      event_id: '$n2',
+      sender: '@alice:example.com',
+      state_key: '',
+      content: { name: 'b' },
+    });
+    const map = buildStateMap([create, msg, name1, name2]);
+    expect(map.has(stateKey('m.room.message', ''))).toBe(false);
+    expect(map.size).toBe(2);
+    expect(map.get(stateKey('m.room.name', ''))?.event_id).toBe('$n2');
+  });
+
+  it('stateKey joins type and state_key with a null byte separator', () => {
+    expect(stateKey('m.room.member', '@u:ex.com')).toBe('m.room.member\0@u:ex.com');
+    expect(stateKey('m.room.name', '')).toBe('m.room.name\0');
+    expect(stateKey('a', 'b').includes('\0')).toBe(true);
+  });
+
+  it('rejects non-state messages when sender has left despite high power levels', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'leave'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const msg = pdu({
+      type: 'm.room.message',
+      event_id: '$msg',
+      sender: '@alice:example.com',
+      content: { body: 'hi', msgtype: 'm.text' },
+    });
+    expect(checkEventAuth(msg, state, '10').error).toBe('Sender is not joined to the room');
+  });
+
+  it('rejects ban when sender is not joined (exact error)', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'ban', '@eve:example.com'), state, '10')
+        .error
+    ).toBe('Sender must be joined to ban');
+  });
+
+  it('allows self-leave from invite; rejects leave with no membership', () => {
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'leave'),
+        [createEvent(), memberEvent('@bob:example.com', 'invite', '@alice:example.com')],
+        '10'
+      ).allowed
+    ).toBe(true);
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'leave'), [createEvent()], '10').error
+    ).toBe('Not a member of the room');
+  });
+
+  it('pins exact Unknown membership error string', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    const bad = memberEvent('@bob:example.com', 'join');
+    bad.content = { membership: 'wat' };
+    expect(checkEventAuth(bad, state, '10').error).toBe('Unknown membership: wat');
+  });
+
+  it('uses default power levels when m.room.power_levels is absent (invite=0, ban/kick/redact=50)', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+    ];
+    expect(
+      checkEventAuth(
+        memberEvent('@carol:example.com', 'invite', '@alice:example.com'),
+        state,
+        '10'
+      ).allowed
+    ).toBe(true);
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'ban', '@alice:example.com'),
+        state,
+        '10'
+      ).error
+    ).toBe('Insufficient power level to ban');
+    expect(
+      checkEventAuth(
+        memberEvent('@bob:example.com', 'leave', '@alice:example.com'),
+        state,
+        '10'
+      ).error
+    ).toBe('Insufficient power level to kick');
+  });
+});
