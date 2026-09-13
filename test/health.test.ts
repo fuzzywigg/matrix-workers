@@ -1,36 +1,23 @@
 import { describe, it, expect } from 'vitest';
+import versions from '../src/api/versions';
 import { getSupportedRoomVersions, getDefaultRoomVersion } from '../src/services/room-versions';
+import type { Env } from '../src/types';
 
 /**
- * Shape checks for discovery/version payloads the Worker advertises.
- * These mirror src/api/versions.ts without spinning up a Worker runtime.
+ * Lightweight smoke checks. Full well-known / versions route coverage lives in
+ * test/versions-wellknown.test.ts (TOKENMAXX HEAVY after #83).
  */
 describe('Client versions payload shape', () => {
-  it('advertises Matrix CS API versions expected by modern clients', () => {
-    const versions = [
-      'r0.0.1',
-      'r0.1.0',
-      'r0.2.0',
-      'r0.3.0',
-      'r0.4.0',
-      'r0.5.0',
-      'r0.6.0',
-      'r0.6.1',
-      'v1.1',
-      'v1.2',
-      'v1.3',
-      'v1.4',
-      'v1.5',
-      'v1.6',
-      'v1.7',
-      'v1.8',
-      'v1.9',
-      'v1.10',
-      'v1.11',
-      'v1.12',
-    ];
-    expect(versions).toContain('v1.11');
-    expect(versions[versions.length - 1]).toMatch(/^v1\./);
+  it('advertises Matrix CS API versions from the live versions module', async () => {
+    const res = await versions.request(
+      'http://localhost/_matrix/client/versions',
+      {},
+      { SERVER_NAME: 'matrix.example.com', SERVER_VERSION: 'test' } as Env
+    );
+    const body = (await res.json()) as { versions: string[] };
+    expect(body.versions).toContain('v1.11');
+    expect(body.versions[body.versions.length - 1]).toMatch(/^v1\./);
+    expect(body.versions).toContain('v1.12');
   });
 
   it('exposes supported room versions with a stable default', () => {
@@ -52,5 +39,18 @@ describe('SERVER_NAME hostname hygiene', () => {
 
   it('rejects empty server names', () => {
     expect(''.length).toBe(0);
+  });
+});
+
+describe('health TOKENMAXX after #83 — wire smoke to versions module', () => {
+  it('federation version name stays matrix-worker', async () => {
+    const res = await versions.request(
+      'http://localhost/_matrix/federation/v1/version',
+      {},
+      { SERVER_NAME: 'matrix.fuzzywigg.com', SERVER_VERSION: '0.1.0' } as Env
+    );
+    expect(await res.json()).toEqual({
+      server: { name: 'matrix-worker', version: '0.1.0' },
+    });
   });
 });
