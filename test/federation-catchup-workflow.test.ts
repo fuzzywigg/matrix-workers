@@ -192,3 +192,88 @@ describe('FederationCatchupWorkflow reachability/backfill edge paths after #65',
     expect(step.names).toEqual(['check-server']);
   });
 });
+
+describe('FederationCatchupWorkflow empty-events / timeout wiring after #71', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  let timeoutSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(new AbortController().signal);
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('get_missing_events { events: [] } and { events: null } count as 0', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ events: [] }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ events: null }), { status: 200 })
+      );
+
+    const env = createCatchupEnv({
+      '!a:example.com': '$a',
+      '!b:example.com': '$b',
+    });
+    const wf = new FederationCatchupWorkflow({} as any, env as any);
+    const result = await wf.run(
+      {
+        payload: {
+          serverName: 'remote.example',
+          roomIds: ['!a:example.com', '!b:example.com'],
+        },
+      } as any,
+      mockStep() as any
+    );
+    expect(result).toEqual({
+      serverName: 'remote.example',
+      backfilledEvents: 0,
+      success: true,
+    });
+  });
+
+  it('wires AbortSignal.timeout(10000) for version and 30000 for backfill', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ events: [{}, {}] }), { status: 200 })
+      );
+
+    const env = createCatchupEnv({ '!a:example.com': '$a' });
+    const wf = new FederationCatchupWorkflow({} as any, env as any);
+    const result = await wf.run(
+      {
+        payload: { serverName: 'remote.example', roomIds: ['!a:example.com'] },
+      } as any,
+      mockStep() as any
+    );
+    expect(result).toMatchObject({ backfilledEvents: 2, success: true });
+    expect(timeoutSpy).toHaveBeenCalledWith(10_000);
+    expect(timeoutSpy).toHaveBeenCalledWith(30_000);
+  });
+
+  it('encodes room ids with reserved characters in get_missing_events URL', async () => {
+    const roomId = '!a:b/c';
+    fetchMock
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ events: [{}] }), { status: 200 }));
+
+    const env = createCatchupEnv({ [roomId]: '$x' });
+    const wf = new FederationCatchupWorkflow({} as any, env as any);
+    await wf.run(
+      { payload: { serverName: 'remote.example', roomIds: [roomId] } } as any,
+      mockStep() as any
+    );
+
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      `https://remote.example/_matrix/federation/v1/get_missing_events/${encodeURIComponent(roomId)}`
+    );
+  });
+});

@@ -443,3 +443,55 @@ describe('sliding-sync TOKENMAXX edge paths after #55', () => {
     expect(result.indicators).not.toContain('small-timeline-limit');
   });
 });
+
+describe('sliding-sync NSE/range leftovers after #71', () => {
+  it('skips UA indicators for undefined/empty userAgent; shape alone can still flag', () => {
+    expect(detectNSERequest(undefined, {}).indicators).toEqual(['no-extensions']);
+    expect(detectNSERequest('', {}).indicators).toEqual(['no-extensions']);
+  });
+
+  it('flags timeline_limit exactly 5 as small; 6 does not', () => {
+    expect(
+      detectNSERequest(undefined, {
+        room_subscriptions: { '!a:example.com': { timeline_limit: 5 } },
+      }).indicators
+    ).toContain('small-timeline-limit');
+    expect(
+      detectNSERequest(undefined, {
+        room_subscriptions: { '!a:example.com': { timeline_limit: 6 } },
+      }).indicators
+    ).not.toContain('small-timeline-limit');
+  });
+
+  it('does not flag small-timeline-limit when any subscription omits limit (defaults 10)', () => {
+    const result = detectNSERequest(undefined, {
+      room_subscriptions: {
+        '!a:example.com': { timeline_limit: 1 },
+        '!b:example.com': {},
+      },
+    });
+    expect(result.indicators).not.toContain('small-timeline-limit');
+  });
+
+  it('does not flag minimal-extensions when extensions length is 2 including typing', () => {
+    expect(
+      detectNSERequest(undefined, {
+        extensions: { typing: { enabled: true }, to_device: { enabled: true } },
+      }).indicators
+    ).not.toContain('minimal-extensions');
+  });
+
+  it('preferRangesFirst true with only MSC4186 range uses that range', () => {
+    expect(resolveListRange({ range: [1, 3] }, 10, true)).toEqual({
+      startIndex: 1,
+      endIndex: 3,
+    });
+  });
+
+  it('clamps endIndex to 0 when roomCount is 1 and range overshoots', () => {
+    expect(resolveListRange({ range: [0, 99] }, 1)).toEqual({
+      startIndex: 0,
+      endIndex: 0,
+    });
+  });
+});

@@ -249,3 +249,177 @@ describe('MediaCleanupWorkflow cutoff clock boundaries', () => {
     expect(env.getLastCutoff()).toBe(NOW + DAY_MS - 1 * DAY_MS);
   });
 });
+
+describe('MediaCleanupWorkflow delete/cutoff edges after #71', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function mockStepWithNames() {
+    const names: string[] = [];
+    return {
+      names,
+      async do(name: string, fn: () => Promise<unknown>) {
+        names.push(name);
+        return fn();
+      },
+    };
+  }
+
+  it('maxAgeDays:0 sets cutoff === NOW; only created_at < NOW selected', async () => {
+    const env = createCleanupEnv({
+      media: [
+        {
+          media_id: 'eq',
+          content_type: 'x',
+          file_size: 5,
+          created_at: NOW,
+        },
+        {
+          media_id: 'old',
+          content_type: 'x',
+          file_size: 7,
+          created_at: NOW - 1,
+        },
+      ],
+    });
+    const step = mockStepWithNames();
+    const wf = new MediaCleanupWorkflow({} as any, env as any);
+    const result = await wf.run(
+      { payload: { maxAgeDays: 0, dryRun: false } } as any,
+      step as any
+    );
+    expect(env.getLastCutoff()).toBe(NOW);
+    expect(result).toEqual({
+      deletedCount: 1,
+      freedBytes: 7,
+      dryRun: false,
+      success: true,
+    });
+    expect(step.names).toEqual(['find-expired', 'delete-old']);
+    expect(env.deletedR2).toEqual(['old']);
+  });
+
+  it('treats nullish file_size as 0 on successful non-dryRun delete', async () => {
+    const env = createCleanupEnv({
+      media: [
+        {
+          media_id: 'n',
+          content_type: 'x',
+          file_size: undefined as unknown as number,
+          created_at: NOW - DAY_MS - 1,
+        },
+      ],
+    });
+    const wf = new MediaCleanupWorkflow({} as any, env as any);
+    const result = await wf.run(
+      { payload: { maxAgeDays: 1, dryRun: false } } as any,
+      mockStep() as any
+    );
+    expect(result).toEqual({
+      deletedCount: 1,
+      freedBytes: 0,
+      dryRun: false,
+      success: true,
+    });
+    expect(env.deletedR2).toEqual(['n']);
+    expect(env.deletedDb).toEqual(['n']);
+  });
+
+  it('skips when D1 DELETE throws after R2 ok and continues with later ids', async () => {
+    const media: MediaRow[] = [
+      {
+        media_id: 'fail-db',
+        content_type: 'x',
+        file_size: 50,
+        created_at: NOW - 2 * DAY_MS,
+      },
+      {
+        media_id: 'ok',
+        content_type: 'x',
+        file_size: 10,
+        created_at: NOW - 2 * DAY_MS,
+      },
+    ];
+    const deletedR2: string[] = [];
+    const deletedDb: string[] = [];
+    let lastCutoff: number | undefined;
+
+    const env = {
+      deletedR2,
+      deletedDb,
+      getLastCutoff: () => lastCutoff,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              return {
+                async all<T>() {
+                  if (sql.includes('FROM media') && sql.includes('created_at <')) {
+                    lastCutoff = args[0] as number;
+                    return {
+                      results: media.filter((m) => m.created_at < lastCutoff!) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+                async run() {
+                  if (sql.includes('DELETE FROM media')) {
+                    const id = args[0] as string;
+                    if (id === 'fail-db') throw new Error('d1 fail');
+                    deletedDb.push(id);
+                    const idx = media.findIndex((m) => m.media_id === id);
+                    if (idx >= 0) media.splice(idx, 1);
+                    return { meta: { changes: 1 } };
+                  }
+                  return { meta: { changes: 0 } };
+                },
+              };
+            },
+          };
+        },
+      },
+      MEDIA: {
+        async delete(id: string) {
+          deletedR2.push(id);
+        },
+      },
+    };
+
+    const wf = new MediaCleanupWorkflow({} as any, env as any);
+    const result = await wf.run(
+      { payload: { maxAgeDays: 1, dryRun: false } } as any,
+      mockStep() as any
+    );
+    expect(result).toEqual({
+      deletedCount: 1,
+      freedBytes: 10,
+      dryRun: false,
+      success: true,
+    });
+    // R2 delete still attempted for fail-db before D1 throws
+    expect(deletedR2).toEqual(['fail-db', 'ok']);
+    expect(deletedDb).toEqual(['ok']);
+  });
+
+  it('empty expired set with dryRun:false returns zeros and success', async () => {
+    const step = mockStepWithNames();
+    const env = createCleanupEnv({ media: [] });
+    const wf = new MediaCleanupWorkflow({} as any, env as any);
+    const result = await wf.run(
+      { payload: { maxAgeDays: 30, dryRun: false } } as any,
+      step as any
+    );
+    expect(result).toEqual({
+      deletedCount: 0,
+      freedBytes: 0,
+      dryRun: false,
+      success: true,
+    });
+    expect(step.names).toEqual(['find-expired']);
+  });
+});
