@@ -64,3 +64,35 @@ describe('PushDurableObject TOKENMAXX edge paths after #57', () => {
     });
   });
 });
+
+describe('PushDurableObject TOKENMAXX edge paths after #58', () => {
+  it('returns 500 for invalid JSON on /send and /send-batch', async () => {
+    const { do: push } = makePush();
+    const send = await push.fetch(
+      new Request('https://do/send', { method: 'POST', body: '{bad' })
+    );
+    expect(send.status).toBe(500);
+    expect(await send.json()).toMatchObject({ success: false });
+
+    const batch = await push.fetch(
+      new Request('https://do/send-batch', { method: 'POST', body: '{bad' })
+    );
+    expect(batch.status).toBe(500);
+    expect(await batch.json()).toMatchObject({ success: false });
+  });
+
+  it('returns 404 for wrong methods on gated paths', async () => {
+    const { do: push } = makePush();
+    expect((await push.fetch(new Request('https://do/send'))).status).toBe(404);
+    expect((await push.fetch(new Request('https://do/send-batch'))).status).toBe(404);
+    expect(
+      (await push.fetch(new Request('https://do/status', { method: 'POST' }))).status
+    ).toBe(404);
+  });
+
+  it('alarm is a no-op when pendingPushes is empty', async () => {
+    const { state, do: push } = makePush();
+    await (push as unknown as { alarm: () => Promise<void> }).alarm();
+    expect(state.storage.alarm).toBeNull();
+  });
+});
