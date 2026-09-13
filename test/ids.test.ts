@@ -320,3 +320,12 @@ describe('ids TOKENMAXX edge paths after #55', () => {
     expect(parseUserId(id)).toEqual({ localpart: 'alice', serverName: '[::1]' });
   });
 });
+
+
+describe('ids TOKENMAXX edge paths after #57', () => {
+  it('documents getServerName vs parseRoomId divergence on host:port room IDs', () => {
+    const id = '!r:ex.com:8448' as '!r:ex.com';
+    expect(getServerName(id)).toBe('8448');
+    expect(parseRoomId(id)).toEqual({ opaque: 'r', serverName: 'ex.com:8448' });
+  });
+});

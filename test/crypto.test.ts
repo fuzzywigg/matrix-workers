@@ -320,3 +320,11 @@ describe('crypto TOKENMAXX edge paths after #55', () => {
     expect(canonicalJson(1n)).toBe('null');
   });
 });
+
+
+describe('crypto TOKENMAXX edge paths after #57', () => {
+  it('encodes functions as null via the final typeof fallthrough', () => {
+    expect(canonicalJson(() => 1)).toBe('null');
+    expect(canonicalJson(Symbol('x'))).toBe('null');
+  });
+});

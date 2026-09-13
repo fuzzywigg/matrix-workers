@@ -485,3 +485,11 @@ describe('media helpers TOKENMAXX edge paths after #55', () => {
     expect(isSupportedContentType('   ;charset=utf-8')).toBe(false);
   });
 });
+
+
+describe('media helpers TOKENMAXX edge paths after #57', () => {
+  it('clamps fallback 0 through Math.max(1, …) when raw is undefined', () => {
+    expect(clampThumbnailDimension(undefined, 0)).toBe(1);
+    expect(clampThumbnailDimension('', 0)).toBe(1);
+  });
+});
