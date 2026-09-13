@@ -240,3 +240,114 @@ describe('Cloudflare Calls API helpers', () => {
     });
   });
 });
+
+
+describe('Cloudflare Calls TOKENMAXX after #77/#78', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('treats empty-string CALLS secrets as not configured', () => {
+    expect(isCallsConfigured({ CALLS_APP_ID: '', CALLS_APP_SECRET: 's' } as Env)).toBe(false);
+    expect(isCallsConfigured({ CALLS_APP_ID: 'a', CALLS_APP_SECRET: '' } as Env)).toBe(false);
+  });
+
+  it('throws NOT_CONFIGURED from each API helper when secrets missing', async () => {
+    const bare = {} as Env;
+    await expect(createSession(bare)).rejects.toMatchObject({ code: 'NOT_CONFIGURED' });
+    await expect(addTracks(bare, 's', { tracks: [] })).rejects.toMatchObject({
+      code: 'NOT_CONFIGURED',
+    });
+    await expect(
+      renegotiate(bare, 's', { sessionDescription: { type: 'answer', sdp: 'x' } })
+    ).rejects.toMatchObject({ code: 'NOT_CONFIGURED' });
+    await expect(closeTracks(bare, 's', ['0'])).rejects.toMatchObject({
+      code: 'NOT_CONFIGURED',
+    });
+    await expect(getSessionState(bare, 's')).rejects.toMatchObject({ code: 'NOT_CONFIGURED' });
+    await expect(
+      pushLocalTrack(bare, 's', { type: 'offer', sdp: 'o' }, 't')
+    ).rejects.toMatchObject({ code: 'NOT_CONFIGURED' });
+    await expect(pullRemoteTrack(bare, 's', 'r', 't')).rejects.toMatchObject({
+      code: 'NOT_CONFIGURED',
+    });
+  });
+
+  it('omits body suffix on empty API error and swallows text() throw', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('', { status: 500 }))
+    );
+    await expect(createSession(callsEnv())).rejects.toMatchObject({
+      code: 'API_ERROR',
+      statusCode: 500,
+      message: expect.stringMatching(/Calls API error: 500$/),
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        ({
+          ok: false,
+          status: 502,
+          text: async () => {
+            throw new Error('cant read');
+          },
+        }) as unknown as Response
+      )
+    );
+    await expect(createSession(callsEnv())).rejects.toMatchObject({
+      code: 'API_ERROR',
+      statusCode: 502,
+      message: expect.stringMatching(/Calls API error: 502$/),
+    });
+  });
+
+  it('GET getSessionState sends no body', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ tracks: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await getSessionState(callsEnv(), 'sess-g');
+    expect(fetchMock.mock.calls[0][1].method).toBe('GET');
+    expect(fetchMock.mock.calls[0][1].body).toBeUndefined();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'https://rtc.live.cloudflare.com/v1/apps/app-123/sessions/sess-g'
+    );
+  });
+
+  it('defaults Track error when errorDescription is omitted', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            sessionDescription: { type: 'answer', sdp: 'ans' },
+            tracks: [{ mid: '0', trackName: 'x', errorCode: 'boom' }],
+            requiresImmediateRenegotiation: false,
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    await expect(
+      pushLocalTrack(callsEnv(), 's1', { type: 'offer', sdp: 'off' }, 'cam')
+    ).rejects.toMatchObject({ code: 'boom', message: 'Track error', statusCode: 400 });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            sessionDescription: { type: 'offer', sdp: 'off' },
+            tracks: [{ mid: '1', trackName: 'y', errorCode: 'remote_boom' }],
+            requiresImmediateRenegotiation: false,
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    await expect(
+      pullRemoteTrack(callsEnv(), 'local', 'remote', 'cam')
+    ).rejects.toMatchObject({ code: 'remote_boom', message: 'Track error', statusCode: 400 });
+  });
+});
