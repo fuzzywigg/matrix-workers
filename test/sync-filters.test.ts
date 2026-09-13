@@ -298,3 +298,118 @@ describe('sync filters TOKENMAXX edge paths after #55', () => {
     expect(applyEventFilter(events, { limit: Number.POSITIVE_INFINITY })).toEqual(events);
   });
 });
+
+describe('sync filters TOKENMAXX leftovers after #78 (client sync filter helpers)', () => {
+  it('matches any type pattern in a multi-entry whitelist (OR)', () => {
+    expect(
+      applyEventFilter(events, { types: ['m.reaction', 'm.room.member'] }).map((e) => e.type)
+    ).toEqual(['m.room.member', 'm.reaction']);
+  });
+
+  it('treats not_types: ["*"] as an empty-prefix wildcard excluding every type', () => {
+    expect(applyEventFilter(events, { not_types: ['*'] })).toEqual([]);
+  });
+
+  it('is case-sensitive on exact type and sender matches', () => {
+    expect(applyEventFilter(events, { types: ['M.ROOM.MESSAGE'] })).toEqual([]);
+    expect(applyEventFilter(events, { senders: ['@Alice:example.com'] })).toEqual([]);
+  });
+
+  it('truncates fractional limits via Array.prototype.slice', () => {
+    // slice(0, 1.9) → first element only
+    expect(applyEventFilter(events, { limit: 1.9 })).toHaveLength(1);
+    expect(applyEventFilter(events, { limit: 2.1 })).toHaveLength(2);
+  });
+
+  it('returns empty when filtering an empty event list', () => {
+    expect(applyEventFilter([], { types: ['m.room.*'], limit: 10 })).toEqual([]);
+  });
+
+  it('keeps events whose sender is empty string when not_senders lists a real MXID', () => {
+    const mixed = [
+      { type: 'm.room.message', sender: '' },
+      { type: 'm.room.message', sender: '@bob:example.com' },
+    ];
+    expect(applyEventFilter(mixed, { not_senders: ['@bob:example.com'] })).toEqual([
+      { type: 'm.room.message', sender: '' },
+    ]);
+  });
+
+  it('excludes empty-string sender when senders whitelist requires a real MXID', () => {
+    expect(
+      applyEventFilter(
+        [
+          { type: 'm.room.message', sender: '' },
+          { type: 'm.room.message', sender: '@alice:example.com' },
+        ],
+        { senders: ['@alice:example.com'] }
+      )
+    ).toEqual([{ type: 'm.room.message', sender: '@alice:example.com' }]);
+  });
+
+  it('applies limit after type/sender filtering (not before)', () => {
+    const limited = applyEventFilter(events, {
+      types: ['m.room.*'],
+      senders: ['@bob:example.com'],
+      limit: 5,
+    });
+    expect(limited).toEqual([{ type: 'm.room.member', sender: '@bob:example.com' }]);
+  });
+
+  it('includes a whitelisted room that is absent from not_rooms', () => {
+    expect(
+      shouldIncludeRoom('!keep:example.com', {
+        rooms: ['!keep:example.com', '!other:example.com'],
+        not_rooms: ['!other:example.com'],
+      })
+    ).toBe(true);
+  });
+
+  it('defaults to include when filter object has neither rooms nor not_rooms', () => {
+    expect(shouldIncludeRoom('!a:example.com', {})).toBe(true);
+  });
+
+  it('rejects composite tokens with trailing whitespace or newlines', () => {
+    expect(parseSyncToken('s1_td2 ')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s1_td2\n')).toEqual({ events: 0, toDevice: 0 });
+  });
+
+  it('rejects composite tokens missing the td marker', () => {
+    expect(parseSyncToken('s1_2')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s1td2')).toEqual({ events: 0, toDevice: 0 });
+  });
+
+  it('legacy-parses hex and leading-zero tokens via parseInt', () => {
+    expect(parseSyncToken('0x10')).toEqual({ events: 16, toDevice: 16 });
+    expect(parseSyncToken('08')).toEqual({ events: 8, toDevice: 8 });
+  });
+
+  it('interpolates fractional positions into buildSyncToken verbatim', () => {
+    expect(buildSyncToken(1.5, 2.5)).toBe('s1.5_td2.5');
+    // Composite regex requires \\d+ so floats fail parse and fall through to legacy parseInt
+    expect(parseSyncToken('s1.5_td2.5')).toEqual({ events: 0, toDevice: 0 });
+  });
+
+  it('round-trips large asymmetric positions', () => {
+    const token = buildSyncToken(9_007_199_254_740_991, 0);
+    expect(parseSyncToken(token)).toEqual({ events: 9_007_199_254_740_991, toDevice: 0 });
+  });
+
+  it('applies not_types after types whitelist (intersection)', () => {
+    expect(
+      applyEventFilter(events, {
+        types: ['m.room.message', 'm.room.member', 'm.reaction'],
+        not_types: ['m.reaction', 'm.room.member'],
+      }).map((e) => e.type)
+    ).toEqual(['m.room.message']);
+  });
+
+  it('does not treat a lone asterisk mid-pattern as a glob', () => {
+    expect(applyEventFilter(events, { types: ['*message'] })).toEqual([]);
+    expect(applyEventFilter(events, { not_types: ['*reaction'] }).map((e) => e.type)).toEqual([
+      'm.room.message',
+      'm.room.member',
+      'm.reaction',
+    ]);
+  });
+});
