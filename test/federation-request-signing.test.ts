@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { parseAuthHeader } from '../src/middleware/federation-auth';
 import {
   DEFAULT_KEY_MAX_STALENESS_MS,
@@ -486,23 +486,30 @@ describe('federation signing TOKENMAXX edge paths after #55', () => {
       pair.keyId,
       pair.privateKeyJwk
     );
-    const now = Date.now();
-    const kv = mockKv({
-      'federation:keys:edge.example.com': JSON.stringify([
-        {
-          server_name: 'edge.example.com',
-          key_id: pair.keyId,
-          public_key: pair.publicKey,
-          valid_from: 0,
-          valid_until: now - DEFAULT_KEY_MAX_STALENESS_MS,
-          fetched_at: now,
-          verified: 1,
-        },
-      ]),
-    });
-    // isKeyTooStale uses `>` so equality remains within the grace window
-    expect(
-      await verifyRemoteSignature(signed, 'edge.example.com', pair.keyId, mockDb(), kv)
-    ).toBe(true);
+    // Pin wall-clock so signing + verify cannot drift past the `>` boundary.
+    // isKeyTooStale rejects when (now - valid_until) > maxStaleness; equality is OK.
+    vi.useFakeTimers();
+    const now = 1_700_000_000_000;
+    vi.setSystemTime(now);
+    try {
+      const kv = mockKv({
+        'federation:keys:edge.example.com': JSON.stringify([
+          {
+            server_name: 'edge.example.com',
+            key_id: pair.keyId,
+            public_key: pair.publicKey,
+            valid_from: 0,
+            valid_until: now - DEFAULT_KEY_MAX_STALENESS_MS,
+            fetched_at: now,
+            verified: 1,
+          },
+        ]),
+      });
+      expect(
+        await verifyRemoteSignature(signed, 'edge.example.com', pair.keyId, mockDb(), kv)
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

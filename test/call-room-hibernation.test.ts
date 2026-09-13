@@ -605,3 +605,13 @@ describe('CallRoom signaling TOKENMAXX edge paths after #57', () => {
     expect(wsA.closed?.code).toBe(1000);
   });
 });
+
+
+describe('CallRoom signaling TOKENMAXX edge paths after #58', () => {
+  it('returns 426 for /ws without Upgrade header', async () => {
+    const room = makeRoom(new FakeState()) as any;
+    const res = await room.fetch(new Request('https://do/ws'));
+    expect(res.status).toBe(426);
+    expect(await res.text()).toBe('Expected WebSocket');
+  });
+});

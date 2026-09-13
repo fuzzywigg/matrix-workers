@@ -493,3 +493,25 @@ describe('media helpers TOKENMAXX edge paths after #57', () => {
     expect(clampThumbnailDimension('', 0)).toBe(1);
   });
 });
+
+describe('media helpers TOKENMAXX edge paths after #58', () => {
+  it('absolutizes relative og:image paths against baseUrl', () => {
+    const preview = extractOpenGraphPreview(
+      '<meta property="og:image" content="/img/a.png" />',
+      { protocol: 'https:', host: 'cdn.example.com' }
+    );
+    expect(preview['og:image']).toBe('https://cdn.example.com/img/a.png');
+  });
+
+  it('prefers content-before-property order for og:description', () => {
+    const preview = extractOpenGraphPreview(
+      '<meta content="Hello &amp; there" property="og:description" />'
+    );
+    expect(preview['og:description']).toBe('Hello & there');
+  });
+
+  it('rejects MIME types with only parameters after trim', () => {
+    expect(parseBaseContentType(';charset=utf-8')).toBe('');
+    expect(isSupportedContentType(';charset=utf-8')).toBe(false);
+  });
+});

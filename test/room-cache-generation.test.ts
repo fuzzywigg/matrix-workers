@@ -203,3 +203,39 @@ describe('room-cache metadata TOKENMAXX edge paths after #57', () => {
     expect(meta).toMatchObject({ joinedCount: 0, invitedCount: 0, isDm: true });
   });
 });
+
+describe('room-cache metadata TOKENMAXX edge paths after #58', () => {
+  it('returns empty map for empty batch without touching D1', async () => {
+    const db = mockDb(emptyBatchResults());
+    const map = await getBatchRoomMetadata(mockKv(), db, []);
+    expect([...map.keys()]).toEqual([]);
+    expect(db.batch).not.toHaveBeenCalled();
+  });
+
+  it('marks named rooms as non-DM even with joinedCount <= 2', async () => {
+    const db = mockDb([
+      { results: [{ content: JSON.stringify({ name: 'Lobby' }) }] },
+      { results: [] },
+      { results: [] },
+      { results: [] },
+      { results: [{ count: 2 }] },
+      { results: [{ count: 0 }] },
+    ]);
+    const meta = await getRoomMetadata(mockKv(), db, '!r:ex.com');
+    expect(meta).toMatchObject({ name: 'Lobby', joinedCount: 2, isDm: false });
+  });
+
+  it('still returns DB metadata when KV put throws', async () => {
+    const kv = mockKv({}, { putThrows: true });
+    const db = mockDb([
+      { results: [{ content: JSON.stringify({ name: 'X' }) }] },
+      { results: [] },
+      { results: [] },
+      { results: [] },
+      { results: [{ count: 1 }] },
+      { results: [{ count: 0 }] },
+    ]);
+    const meta = await getRoomMetadata(kv, db, '!r:ex.com');
+    expect(meta).toMatchObject({ name: 'X', joinedCount: 1, isDm: false });
+  });
+});

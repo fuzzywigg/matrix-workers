@@ -133,3 +133,19 @@ describe('RateLimitDurableObject TOKENMAXX edge paths after #57', () => {
     });
   });
 });
+
+describe('RateLimitDurableObject TOKENMAXX edge paths after #58', () => {
+  it('alarm reschedules when counters remain after cleanup', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(4_000_000);
+    const { state, do: rateLimitDo } = makeDo();
+    await check(rateLimitDo, 'ip:keep', 5, 60_000);
+    await (rateLimitDo as unknown as { alarm: () => Promise<void> }).alarm();
+    expect(state.storage.alarm).toBe(4_000_000 + 5 * 60 * 1000);
+    expect((await check(rateLimitDo, 'ip:keep', 5, 60_000)).body).toMatchObject({
+      allowed: true,
+      remaining: 3,
+    });
+    vi.useRealTimers();
+  });
+});
