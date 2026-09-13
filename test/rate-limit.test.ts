@@ -200,4 +200,15 @@ describe('getRateLimitType method / path failure edges', () => {
       'media_upload'
     );
   });
+
+  it('classifies key query under federation and prefers /keys/ over federation', () => {
+    expect(getRateLimitType('/_matrix/key/v2/query', 'POST')).toBe('federation');
+    // `/keys/` is checked before `/_matrix/federation`
+    expect(getRateLimitType('/_matrix/federation/v1/user/keys/claim', 'POST')).toBe('e2ee');
+  });
+
+  it('locks media upload vs download numeric budgets', () => {
+    expect(RATE_LIMITS.media_upload.requests).toBe(30);
+    expect(RATE_LIMITS.media_download.requests).toBe(200);
+  });
 });

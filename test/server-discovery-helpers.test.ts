@@ -128,3 +128,44 @@ describe('selectSRVRecord single zero-weight peer', () => {
     expect(selectSRVRecord([only]).target).toBe('solo.example.com');
   });
 });
+
+describe('selectSRVRecord mixed zero/positive weights', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('can select a zero-weight peer when Math.random is 0 (weight loop quirk)', () => {
+    const zero: SRVRecord = { priority: 0, weight: 0, port: 8448, target: 'zero.example.com' };
+    const heavy: SRVRecord = { priority: 0, weight: 10, port: 8448, target: 'heavy.example.com' };
+    // random=0 → random*totalWeight=0 → subtract weight 0 still 0 → <=0 returns first peer
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    expect(selectSRVRecord([zero, heavy]).target).toBe('zero.example.com');
+    // Near 1, the positive-weight peer wins after the zero-weight subtract leaves random unchanged
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    expect(selectSRVRecord([zero, heavy]).target).toBe('heavy.example.com');
+  });
+
+  it('falls back to the first same-priority record when the weighted loop exhausts', () => {
+    // random * totalWeight just above sum leaves random > 0 after all subtractions
+    vi.spyOn(Math, 'random').mockReturnValue(1); // 1 * 10 = 10; subtract 5 → 5; subtract 5 → 0 → hits last
+    const a: SRVRecord = { priority: 0, weight: 5, port: 8448, target: 'a.example.com' };
+    const b: SRVRecord = { priority: 0, weight: 5, port: 8448, target: 'b.example.com' };
+    expect(selectSRVRecord([a, b]).target).toBe('b.example.com');
+  });
+});
+
+describe('buildServerUrl / isIPLiteral port and bracket edges', () => {
+  it('includes port 0 and 65535 as non-443 suffixes', () => {
+    expect(buildServerUrl({ host: 'example.com', port: 0, tlsHostname: 'example.com' })).toBe(
+      'https://example.com:0'
+    );
+    expect(buildServerUrl({ host: 'example.com', port: 65535, tlsHostname: 'example.com' })).toBe(
+      'https://example.com:65535'
+    );
+  });
+
+  it('treats single-char bracket contents as literals and rejects trailing whitespace', () => {
+    expect(isIPLiteral('[a]')).toBe(true);
+    expect(isIPLiteral('[::1] ')).toBe(false);
+  });
+});

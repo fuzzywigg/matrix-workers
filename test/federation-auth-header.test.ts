@@ -184,3 +184,46 @@ describe('parseAuthHeader duplicate quoted params', () => {
     });
   });
 });
+
+describe('parseAuthHeader / buildSignedRequest additional failure edges', () => {
+  it('lets unquoted parser capture empty quotes as a literal "" destination', () => {
+    // Quoted regex needs ([^"]+) so destination="" is skipped; unquoted then
+    // matches destination="" → value includes the quote characters.
+    expect(
+      parseAuthHeader('X-Matrix origin="a.example.com",destination="",key="ed25519:k",sig="s"')
+    ).toEqual({
+      origin: 'a.example.com',
+      destination: '""',
+      key: 'ed25519:k',
+      sig: 's',
+    });
+  });
+
+  it('rejects leading whitespace before the X-Matrix scheme', () => {
+    expect(parseAuthHeader(' X-Matrix origin="a",key="k",sig="s"')).toBeNull();
+  });
+
+  it('captures unquoted sig values containing equals signs', () => {
+    expect(
+      parseAuthHeader('X-Matrix origin=a.example.com,key=ed25519:k,sig=abc=def')
+    ).toEqual({
+      origin: 'a.example.com',
+      key: 'ed25519:k',
+      sig: 'abc=def',
+    });
+  });
+
+  it('returns null when only key is missing among required fields', () => {
+    expect(parseAuthHeader('X-Matrix origin="a",sig="s"')).toBeNull();
+  });
+
+  it('returns null when only sig is missing among required fields', () => {
+    expect(parseAuthHeader('X-Matrix origin="a",key="ed25519:k"')).toBeNull();
+  });
+
+  it('omits content when buildSignedRequest is called without a body', () => {
+    const req = buildSignedRequest('GET', '/_matrix/key/v2/server', 'a.example.com', 'b.example.com');
+    expect(req.content).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(req, 'content')).toBe(false);
+  });
+});

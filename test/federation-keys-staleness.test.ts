@@ -119,4 +119,24 @@ describe('isKeyTooStale / resolveMaxStalenessMs boundary edges', () => {
   it('parses leading-whitespace env overrides via parseInt', () => {
     expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: ' 5000' })).toBe(5000);
   });
+
+  it('treats NaN and Infinity valid_until as not stale (falsy / non-expiring quirks)', () => {
+    const now = 1_700_000_000_000;
+    // NaN is falsy → early !validUntil return; Infinity yields now - Infinity = -Infinity (not > max)
+    expect(isKeyTooStale(NaN, now, 1000)).toBe(false);
+    expect(isKeyTooStale(Infinity, now, 1)).toBe(false);
+  });
+
+  it('parses trailing-junk env strings via parseInt prefix', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '5000abc' })).toBe(5000);
+  });
+
+  it('rejects Infinity / +Infinity env strings that are not finite integers', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: 'Infinity' })).toBe(
+      DEFAULT_KEY_MAX_STALENESS_MS
+    );
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '+Infinity' })).toBe(
+      DEFAULT_KEY_MAX_STALENESS_MS
+    );
+  });
 });

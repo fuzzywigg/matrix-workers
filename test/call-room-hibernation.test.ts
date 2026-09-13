@@ -245,3 +245,134 @@ describe('CallRoom hibernation: state endpoint', () => {
     expect(u1.tracks).toEqual([{ trackName: 'audio0', kind: 'audio', enabled: true }]);
   });
 });
+
+describe('CallRoom signaling failure / router edges', () => {
+  it('webSocketMessage rejects binary, bad JSON, and unknown types', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state) as any;
+    const ws = new FakeWebSocket();
+
+    await room.webSocketMessage(ws, new ArrayBuffer(4));
+    expect(JSON.parse(ws.sent[0])).toMatchObject({ type: 'error', code: 'INVALID_MESSAGE' });
+
+    await room.webSocketMessage(ws, '{not-json');
+    expect(JSON.parse(ws.sent[1])).toMatchObject({ type: 'error', code: 'INVALID_JSON' });
+
+    await room.webSocketMessage(ws, JSON.stringify({ type: 'nope' }));
+    expect(JSON.parse(ws.sent[2])).toMatchObject({ type: 'error', code: 'UNKNOWN_MESSAGE' });
+  });
+
+  it('handleLeave on a socket without attachment is a no-op', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const room = makeRoom(state) as any;
+    await room.handleLeave(new FakeWebSocket());
+    expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+  });
+
+  it('webSocketError triggers the same leave cleanup as close', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const ws = new FakeWebSocket();
+    ws.serializeAttachment({ participantKey: 'u1|d1' });
+    state.sockets = [ws];
+    const room = makeRoom(state) as any;
+
+    await room.webSocketError(ws, new Error('boom'));
+
+    expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+    expect(room.participants.size).toBe(0);
+  });
+
+  it('loadParticipants is idempotent and does not wipe in-memory mutations', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    const room = makeRoom(state) as any;
+    await room.loadParticipants();
+    room.participants.get('u1|d1').sessionId = 'mutated';
+    await room.loadParticipants();
+    expect(room.participants.get('u1|d1').sessionId).toBe('mutated');
+  });
+
+  it('broadcast without excludeKey reaches every live attached socket', async () => {
+    const state = new FakeState();
+    await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const wsA = new FakeWebSocket();
+    wsA.serializeAttachment({ participantKey: 'u1|d1' });
+    const wsB = new FakeWebSocket();
+    wsB.serializeAttachment({ participantKey: 'u2|d2' });
+    state.sockets = [wsA, wsB];
+    const room = makeRoom(state) as any;
+    await room.loadParticipants();
+
+    room.broadcast({ type: 'ping_all' });
+
+    expect(wsA.sent).toHaveLength(1);
+    expect(wsB.sent).toHaveLength(1);
+    expect(JSON.parse(wsA.sent[0]).type).toBe('ping_all');
+  });
+
+  it('handleMute rejects not-joined sockets and unknown tracks', async () => {
+    const state = new FakeState();
+    await state.storage.put(
+      'participant:u1|d1',
+      storedParticipant('u1', 'd1', { audio0: TRACK })
+    );
+    const joined = new FakeWebSocket();
+    joined.serializeAttachment({ participantKey: 'u1|d1' });
+    const bare = new FakeWebSocket();
+    const room = makeRoom(state) as any;
+
+    await room.handleMute(bare, { type: 'mute', trackName: 'audio0', muted: true });
+    expect(JSON.parse(bare.sent[0])).toMatchObject({ code: 'NOT_JOINED' });
+
+    await room.handleMute(joined, { type: 'mute', trackName: 'missing', muted: true });
+    expect(JSON.parse(joined.sent[0])).toMatchObject({ code: 'TRACK_NOT_FOUND' });
+  });
+
+  it('handleMute toggles enabled and notifies peers', async () => {
+    const state = new FakeState();
+    await state.storage.put(
+      'participant:u1|d1',
+      storedParticipant('u1', 'd1', { audio0: TRACK })
+    );
+    await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+    const wsA = new FakeWebSocket();
+    wsA.serializeAttachment({ participantKey: 'u1|d1' });
+    const wsB = new FakeWebSocket();
+    wsB.serializeAttachment({ participantKey: 'u2|d2' });
+    state.sockets = [wsA, wsB];
+    const room = makeRoom(state) as any;
+
+    await room.handleMute(wsA, { type: 'mute', trackName: 'audio0', muted: true });
+
+    const stored = state.storage.map.get('participant:u1|d1') as any;
+    expect(stored.tracks.audio0.enabled).toBe(false);
+    const changed = wsB.sent.map((s) => JSON.parse(s)).find((m) => m.type === 'mute_changed');
+    expect(changed).toMatchObject({ trackName: 'audio0', muted: true, oderId: 'u1' });
+  });
+
+  it('handleGetState reports null callId/roomId when unset', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state) as any;
+    const body = await (await room.handleGetState()).json();
+    expect(body.callId).toBeNull();
+    expect(body.roomId).toBeNull();
+    expect(body.participants).toEqual([]);
+  });
+
+  it('fetch returns 404 for unknown paths', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state);
+    const res = await room.fetch(new Request('https://do.local/unknown'));
+    expect(res.status).toBe(404);
+  });
+
+  it('fetch /ws without Upgrade header returns 426', async () => {
+    const state = new FakeState();
+    const room = makeRoom(state);
+    const res = await room.fetch(new Request('https://do.local/ws'));
+    expect(res.status).toBe(426);
+  });
+});

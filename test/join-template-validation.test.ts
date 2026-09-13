@@ -204,4 +204,51 @@ describe('validateRemoteJoinTemplate', () => {
       )
     ).toThrow(/membership/);
   });
+
+  it('accepts event IDs using the full EVENT_ID charset', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(
+        validTemplate({
+          auth_events: ['$abc+/=_-.xyz'],
+          prev_events: ['$Ab0/_-.:matrix.org'],
+        }),
+        roomId,
+        userId
+      )
+    ).not.toThrow();
+  });
+
+  it('rejects malformed event IDs ($ alone, double $, extra colon, missing $)', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ auth_events: ['$'] }), roomId, userId)
+    ).toThrow(/invalid event ID/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ auth_events: ['$$'] }), roomId, userId)
+    ).toThrow(/invalid event ID/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ auth_events: ['$a:b:c'] }), roomId, userId)
+    ).toThrow(/invalid event ID/);
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ auth_events: ['abc'] }), roomId, userId)
+    ).toThrow(/invalid event ID/);
+  });
+
+  it('rejects null content and undefined room_version', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ content: null }), roomId, userId)
+    ).toThrow(/membership/);
+    expect(() =>
+      validateRemoteJoinTemplate(
+        { room_version: undefined, event: validTemplate().event },
+        roomId,
+        userId
+      )
+    ).toThrow(/unsupported room_version/);
+  });
+
+  it('accepts a large positive integer depth', () => {
+    expect(() =>
+      validateRemoteJoinTemplate(validTemplate({ depth: 1_000_000 }), roomId, userId)
+    ).not.toThrow();
+  });
 });

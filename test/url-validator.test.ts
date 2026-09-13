@@ -160,3 +160,56 @@ describe('validateUrl blocked hostname list edges', () => {
     expect(validateUrl('http://evil.localhost/').valid).toBe(false);
   });
 });
+
+describe('validateUrl remaining blocked ports / IPv6 prefixes / error strings', () => {
+  it('rejects telnet, RPC, NetBIOS, Postgres, and VNC ports with port errors', () => {
+    for (const port of [23, 135, 139, 5432, 5900]) {
+      const result = validateUrl(`https://example.com:${port}`);
+      expect(result.valid).toBe(false);
+      expect(result.error).toMatch(/port/i);
+    }
+  });
+
+  it('rejects link-local fea/feb and site-local fee/fef IPv6 prefixes', () => {
+    expect(validateUrl('http://[fea0::1]/').valid).toBe(false);
+    expect(validateUrl('http://[feb0::1]/').valid).toBe(false);
+    expect(validateUrl('http://[fee0::1]/').valid).toBe(false);
+    expect(validateUrl('http://[fef0::1]/').valid).toBe(false);
+  });
+
+  it('rejects exact blocked hostnames internal and full k8s cluster.local', () => {
+    expect(validateUrl('http://internal/').valid).toBe(false);
+    expect(validateUrl('http://kubernetes.default.svc.cluster.local/').valid).toBe(false);
+  });
+
+  it('case-folds blocked hostnames via URL hostname lowercasing', () => {
+    expect(validateUrl('http://LOCALHOST/').valid).toBe(false);
+    expect(validateUrl('http://Metadata/').valid).toBe(false);
+  });
+
+  it('returns distinct error messages for protocol, hostname, IP, and parse failures', () => {
+    expect(validateUrl('ftp://example.com').error).toMatch(/HTTP and HTTPS/i);
+    expect(validateUrl('http://localhost/').error).toMatch(/internal hostnames/i);
+    expect(validateUrl('http://10.0.0.1/').error).toMatch(/internal IP/i);
+    expect(validateUrl('not a url').error).toMatch(/Invalid URL/i);
+  });
+
+  it('rejects out-of-range dotted quads as invalid URL format', () => {
+    // WHATWG URL constructor rejects octet > 255 before SSRF checks run
+    const result = validateUrl('http://1.2.3.999/');
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/Invalid URL/i);
+  });
+
+  it('denies 172.16/12 lower bound and allows 172.15 just outside', () => {
+    expect(validateUrl('http://172.16.0.0/').valid).toBe(false);
+    expect(validateUrl('http://172.15.0.1/').valid).toBe(true);
+  });
+});
+
+describe('validateUrlForPreview SSRF-first edges', () => {
+  it('rejects SSRF hosts on allowed preview ports before port allow-list matters', () => {
+    expect(validateUrlForPreview('http://127.0.0.1:8080').valid).toBe(false);
+    expect(validateUrlForPreview('http://internal:8443').valid).toBe(false);
+  });
+});

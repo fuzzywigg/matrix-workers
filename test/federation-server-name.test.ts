@@ -90,4 +90,32 @@ describe('isValidServerName (federation notary gate)', () => {
     expect(isValidServerName('a'.repeat(255))).toBe(true);
     expect(isValidServerName('a'.repeat(256))).toBe(false);
   });
+
+  it('rejects remaining internal service ports mirrored from url-validator', () => {
+    for (const port of [23, 135, 139, 5900]) {
+      expect(isValidServerName(`evil.example.com:${port}`)).toBe(false);
+    }
+  });
+
+  it('rejects exact internal / full k8s / ip6-localhost hostnames', () => {
+    expect(isValidServerName('internal')).toBe(false);
+    expect(isValidServerName('kubernetes.default.svc.cluster.local')).toBe(false);
+    expect(isValidServerName('ip6-localhost')).toBe(false);
+  });
+
+  it('allows public 172.32 and denies broadcast / 172.16 boundary', () => {
+    expect(isValidServerName('172.32.0.1')).toBe(true);
+    expect(isValidServerName('172.15.0.1')).toBe(true);
+    expect(isValidServerName('172.16.0.0')).toBe(false);
+    expect(isValidServerName('255.255.255.255')).toBe(false);
+  });
+
+  it('rejects uppercase LOCALHOST via URL hostname lowercasing', () => {
+    expect(isValidServerName('LOCALHOST')).toBe(false);
+  });
+
+  it('rejects fea/fee IPv6 site/link-local prefixes', () => {
+    expect(isValidServerName('[fea0::1]')).toBe(false);
+    expect(isValidServerName('[fee0::1]')).toBe(false);
+  });
 });

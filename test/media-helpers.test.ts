@@ -314,3 +314,52 @@ describe('extractOpenGraphPreview absolutization / decode edges', () => {
     expect(preview['og:type']).toBe('web&amp;site');
   });
 });
+
+describe('media helpers remaining MIME / clamp / OG / CSP edges', () => {
+  it('accepts remaining video and audio whitelist entries', () => {
+    expect(isSupportedContentType('video/mp4')).toBe(true);
+    expect(isSupportedContentType('audio/mp3')).toBe(true);
+    expect(isSupportedContentType('audio/mpeg')).toBe(true);
+    expect(isSupportedContentType('audio/wav')).toBe(true);
+    expect(isSupportedContentType('audio/webm')).toBe(true);
+  });
+
+  it('sets the full CSP including style-src unsafe-inline', () => {
+    const headers = new Headers();
+    addMediaSecurityHeaders(headers);
+    expect(headers.get('Content-Security-Policy')).toBe(
+      "default-src 'none'; style-src 'unsafe-inline'"
+    );
+  });
+
+  it('clamps leading-plus and scientific-notation dimension strings via parseInt', () => {
+    expect(clampThumbnailDimension('+128')).toBe(128);
+    expect(clampThumbnailDimension('1e3')).toBe(1); // parseInt stops at e → 1
+    expect(clampThumbnailDimension(undefined, 1)).toBe(1);
+  });
+
+  it('builds disposition for empty and all-unsafe filenames', () => {
+    expect(safeContentDisposition('')).toBe('inline; filename=""');
+    expect(safeContentDisposition('@@@')).toBe('inline; filename="___"');
+  });
+
+  it('reads meta description with content-before-name attribute order', () => {
+    const html = `<meta content="Reverse desc" name="description" />`;
+    expect(extractOpenGraphPreview(html)['og:description']).toBe('Reverse desc');
+  });
+
+  it('keeps empty og:title content and absolutizes non-http data: image as relative', () => {
+    const base = { protocol: 'https:', host: 'ex.com' };
+    const html = `
+      <meta property="og:title" content="" />
+      <meta property="og:image" content="data:image/png;base64,aaa" />
+    `;
+    const preview = extractOpenGraphPreview(html, base);
+    expect(preview['og:title']).toBe('');
+    expect(preview['og:image']).toBe('https://ex.com/data:image/png;base64,aaa');
+  });
+
+  it('decodes a lone &amp; entity', () => {
+    expect(decodeHtmlEntities('&amp;')).toBe('&');
+  });
+});
