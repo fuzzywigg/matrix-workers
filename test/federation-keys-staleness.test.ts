@@ -61,4 +61,15 @@ describe('resolveMaxStalenessMs', () => {
       DEFAULT_KEY_MAX_STALENESS_MS
     );
   });
+
+  it('parses leading-plus and float prefixes via parseInt', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '+2500' })).toBe(2500);
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '3600.9' })).toBe(3600);
+  });
+
+  it('accepts large positive overrides', () => {
+    expect(resolveMaxStalenessMs({ FEDERATION_KEY_MAX_STALENESS_MS: '86400000000' })).toBe(
+      86_400_000_000
+    );
+  });
 });

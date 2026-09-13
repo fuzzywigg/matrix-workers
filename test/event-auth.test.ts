@@ -389,4 +389,84 @@ describe('checkEventAuth', () => {
     };
     expect(checkEventAuth(join, state, '10').allowed).toBe(true);
   });
+
+  it('allows invite→join and rejects joining when banned', () => {
+    const base = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const invited = [...base, memberEvent('@bob:example.com', 'invite', '@alice:example.com')];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'join'), invited, '10').allowed).toBe(
+      true
+    );
+
+    const banned = [...base, memberEvent('@bob:example.com', 'ban', '@alice:example.com')];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'join'), banned, '10').allowed).toBe(
+      false
+    );
+  });
+
+  it('allows unban via leave from a privileged sender', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'ban', '@alice:example.com'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    expect(
+      checkEventAuth(memberEvent('@bob:example.com', 'leave', '@alice:example.com'), state, '10')
+        .allowed
+    ).toBe(true);
+  });
+
+  it('rejects knocking when already joined or on behalf of another user', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      pdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr',
+        sender: '@alice:example.com',
+        state_key: '',
+        content: { join_rule: 'knock' },
+      }),
+    ];
+    expect(checkEventAuth(memberEvent('@bob:example.com', 'knock'), state, '10').allowed).toBe(
+      false
+    );
+    expect(
+      checkEventAuth(memberEvent('@carol:example.com', 'knock', '@alice:example.com'), state, '10')
+        .allowed
+    ).toBe(false);
+  });
+
+  it('rejects state events without sufficient power', () => {
+    const state = [
+      createEvent(),
+      memberEvent('@alice:example.com', 'join'),
+      memberEvent('@bob:example.com', 'join'),
+      powerLevels({ '@alice:example.com': 100 }),
+    ];
+    const result = checkEventAuth(
+      pdu({
+        type: 'm.room.name',
+        event_id: '$name',
+        sender: '@bob:example.com',
+        state_key: '',
+        content: { name: 'Nope' },
+      }),
+      state,
+      '10'
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  it('rejects unknown membership values', () => {
+    const state = [createEvent(), memberEvent('@alice:example.com', 'join')];
+    const bad = memberEvent('@bob:example.com', 'join');
+    bad.content = { membership: 'wat' };
+    expect(checkEventAuth(bad, state, '10').allowed).toBe(false);
+  });
 });

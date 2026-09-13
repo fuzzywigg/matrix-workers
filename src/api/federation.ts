@@ -206,7 +206,8 @@ async function getNotarySigningKey(db: D1Database): Promise<{
 }
 
 // Helper function to validate server name
-function isValidServerName(serverName: string): boolean {
+/** Exported for unit tests. */
+export function isValidServerName(serverName: string): boolean {
   // Basic server name validation
   // Server names should be hostname:port or just hostname
   // Must not contain SSRF-vulnerable patterns
