@@ -77,7 +77,8 @@ async function loadFilter(env: Env, userId: string, filterParam?: string): Promi
 }
 
 // Apply an event filter to a list of events
-function applyEventFilter(events: any[], filter?: EventFilter): any[] {
+/** Exported for unit tests. */
+export function applyEventFilter(events: any[], filter?: EventFilter): any[] {
   if (!filter) return events;
 
   let result = events.filter(event => {
@@ -125,7 +126,8 @@ function applyEventFilter(events: any[], filter?: EventFilter): any[] {
 }
 
 // Check if a room should be included based on room filter
-function shouldIncludeRoom(roomId: string, filter?: RoomFilter): boolean {
+/** Exported for unit tests. */
+export function shouldIncludeRoom(roomId: string, filter?: RoomFilter): boolean {
   if (!filter) return true;
 
   // Room whitelist
@@ -224,7 +226,8 @@ const app = new Hono<AppEnv>();
 
 // GET /_matrix/client/v3/sync - Sync with server
 // Parse composite sync token: "s{events}_td{to_device}" or legacy plain number
-function parseSyncToken(token: string | undefined): { events: number; toDevice: number } {
+/** Exported for unit tests. */
+export function parseSyncToken(token: string | undefined): { events: number; toDevice: number } {
   if (!token) {
     return { events: 0, toDevice: 0 };
   }
@@ -245,7 +248,8 @@ function parseSyncToken(token: string | undefined): { events: number; toDevice: 
 }
 
 // Build composite sync token
-function buildSyncToken(eventsPos: number, toDevicePos: number): string {
+/** Exported for unit tests. */
+export function buildSyncToken(eventsPos: number, toDevicePos: number): string {
   return `s${eventsPos}_td${toDevicePos}`;
 }
 

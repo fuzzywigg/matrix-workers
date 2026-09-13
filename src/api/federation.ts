@@ -22,7 +22,8 @@ const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '1
 // Matrix room versions 3 and later require event integrity via hashes.sha256;
 // versions 1 and 2 are legacy where hashes are optional.
 // Issue 006.6 — see docs/issues/006-federation-event-validation-state-resolution.md
-function isModernRoomVersion(version: string): boolean {
+/** Exported for unit tests. */
+export function isModernRoomVersion(version: string): boolean {
   // Numeric room versions: anything >= 3 counts as modern. Non-numeric custom
   // versions are treated as modern by default (fail-closed).
   const n = parseInt(version, 10);

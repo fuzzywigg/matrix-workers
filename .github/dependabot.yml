@@ -8,6 +8,14 @@ updates:
       npm_and_yarn:
         patterns:
           - "*"
+    # eslint 10 / typescript 7 break npm ci with current @typescript-eslint@8
+    # (peer typescript >=4.8.4 <6.1.0). Keep majors out until peers move.
+    # Dependabot #42 demonstrated the failure mode — do not merge majors blindly.
+    ignore:
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

@@ -10,7 +10,8 @@ export interface ServerDiscoveryResult {
   tlsHostname: string; // For SNI/certificate verification
 }
 
-interface SRVRecord {
+/** Exported for unit tests. */
+export interface SRVRecord {
   priority: number;
   weight: number;
   port: number;
@@ -105,9 +106,10 @@ async function performDiscovery(serverName: string): Promise<ServerDiscoveryResu
 }
 
 /**
- * Check if a string is an IP literal (IPv4 or IPv6)
+ * Check if a string is an IP literal (IPv4 or IPv6).
+ * Exported for unit tests.
  */
-function isIPLiteral(hostname: string): boolean {
+export function isIPLiteral(hostname: string): boolean {
   // IPv4 pattern
   if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) {
     return true;
@@ -292,8 +294,9 @@ async function lookupSRVRecords(serverName: string, recordName: string): Promise
 /**
  * Select the best SRV record based on priority and weight
  * Lower priority values are preferred; weight is used for load balancing among same-priority records
+ * Exported for unit tests.
  */
-function selectSRVRecord(records: SRVRecord[]): SRVRecord {
+export function selectSRVRecord(records: SRVRecord[]): SRVRecord {
   if (records.length === 1) {
     return records[0];
   }

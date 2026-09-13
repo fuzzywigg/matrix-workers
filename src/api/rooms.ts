@@ -38,7 +38,8 @@ interface StateEventValidation {
   error?: string;
 }
 
-function validateStateEvent(event: any, index: number): StateEventValidation {
+/** Exported for unit tests. */
+export function validateStateEvent(event: any, index: number): StateEventValidation {
   // Must be an object
   if (!event || typeof event !== 'object') {
     return { valid: false, error: `initial_state[${index}]: must be an object` };

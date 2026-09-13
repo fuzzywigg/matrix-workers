@@ -34,12 +34,14 @@ export const SUPPORTED_TYPES = [
 
 // Sanitize a filename for safe use in Content-Disposition headers.
 // Strips characters that could enable header injection or path traversal.
-function sanitizeFilename(name: string): string {
+/** Exported for unit tests. */
+export function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
 }
 
 // Build a safe Content-Disposition header value using RFC 5987 encoding
-function safeContentDisposition(filename: string): string {
+/** Exported for unit tests. */
+export function safeContentDisposition(filename: string): string {
   const sanitized = sanitizeFilename(filename);
   return `inline; filename="${sanitized}"`;
 }
@@ -424,7 +426,8 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
 });
 
 // Helper to decode HTML entities (only decode once to prevent double-decoding attacks)
-function decodeHtmlEntities(text: string): string {
+/** Exported for unit tests. */
+export function decodeHtmlEntities(text: string): string {
   // Use a proper HTML entity decoder that handles all entities correctly
   // and prevents double-decoding by checking if the text is already decoded
   const decoded = text
