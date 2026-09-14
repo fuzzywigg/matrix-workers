@@ -1,4 +1,4 @@
-import { beforeAll, afterAll, describe, it, expect } from 'vitest';
+import { beforeAll, afterAll, describe, it, expect, vi } from 'vitest';
 import {
   canonicalJson,
   timingSafeEqual,
@@ -14,6 +14,8 @@ import {
   generateSigningKeyPairLegacy,
   signJson,
   verifySignature,
+  base64UrlEncode,
+  base64UrlDecode,
 } from '../src/utils/crypto';
 
 describe('canonicalJson', () => {
@@ -326,5 +328,125 @@ describe('crypto TOKENMAXX edge paths after #57', () => {
   it('encodes functions as null via the final typeof fallthrough', () => {
     expect(canonicalJson(() => 1)).toBe('null');
     expect(canonicalJson(Symbol('x'))).toBe('null');
+  });
+});
+
+
+describe('crypto TOKENMAXX leftovers after #226', () => {
+  it('rejects verifyPassword when iteration field is non-numeric (NaN)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await verifyPassword('password1', '$pbkdf2-sha256$abc$c2FsdA$hash')).toBe(false);
+    expect(await verifyPassword('password1', '$pbkdf2-sha256$$c2FsdA$hash')).toBe(false);
+    expect(console.error).toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+
+  it('rejects verifyPassword when stored hash bytes mismatch after PBKDF2', async () => {
+    const real = await hashPassword('match-me-1');
+    // Keep scheme/iterations/salt; corrupt only the trailing hash segment
+    const parts = real.split('$');
+    parts[4] = parts[4] === 'AAAA' ? 'BBBB' : 'AAAA';
+    expect(await verifyPassword('match-me-1', parts.join('$'))).toBe(false);
+  });
+
+  it('accepts passwords using every documented special-character class', () => {
+    const specials = `!@#$%^&*()_+-=[]{};':"\\|,.<>/?`;
+    for (const ch of specials) {
+      expect(validatePasswordStrength(`abcdefg${ch}`)).toBeNull();
+    }
+  });
+
+  it('hashes empty string / empty bytes deterministically via sha256', async () => {
+    const emptyStr = await sha256('');
+    const emptyBytes = await sha256(new Uint8Array());
+    expect(emptyStr).toBe(emptyBytes);
+    expect(emptyStr).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(await hashToken('')).toBe(emptyStr);
+  });
+
+  it('timingSafeEqual is false for same-length strings differing only at the last char', () => {
+    expect(timingSafeEqual('password', 'passwore')).toBe(false);
+    expect(timingSafeEqual('aaaaaaaa', 'aaaaaaab')).toBe(false);
+  });
+
+  it('canonicalJson deep-nests arrays of nulls and sorts sibling keys', () => {
+    expect(canonicalJson({ z: [null, { b: 1, a: null }], m: true })).toBe(
+      '{"m":true,"z":[null,{"a":null,"b":1}]}'
+    );
+  });
+
+  it('calculateContentHash strips unsigned-only objects the same as signatures', async () => {
+    const base = { type: 'm.test', content: { n: 1 } };
+    const withUnsigned = { ...base, unsigned: { age: 9 } };
+    expect(await calculateContentHash(base)).toBe(await calculateContentHash(withUnsigned));
+    expect(await verifyContentHash(withUnsigned, await calculateContentHash(base))).toBe(true);
+  });
+
+  it('generateRandomString(1) stays in alphabet and length-64 samples stay unique', () => {
+    expect(generateRandomString(1)).toMatch(/^[A-Za-z0-9]$/);
+    const samples = new Set(Array.from({ length: 8 }, () => generateRandomString(64)));
+    expect(samples.size).toBe(8);
+  });
+
+  it('re-exports base64UrlEncode/Decode and round-trips signing material bytes', () => {
+    const bytes = new Uint8Array([0, 1, 255, 128, 64]);
+    const enc = base64UrlEncode(bytes);
+    expect(enc).not.toMatch(/[+/=]/);
+    expect(Array.from(base64UrlDecode(enc))).toEqual(Array.from(bytes));
+  });
+});
+
+describe('federation signing TOKENMAXX leftovers after #226', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('signJson creates a signatures map when the object had none', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test', content: {} }, 'ex.com', keyId, privateKeyJwk);
+    expect(Object.keys(signed.signatures as object)).toEqual(['ex.com']);
+    expect(await verifySignature(signed, 'ex.com', keyId, publicKey)).toBe(true);
+  });
+
+  it('verifySignature returns false for wrong serverName even with a valid key', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test' }, 'a.example.com', keyId, privateKeyJwk);
+    expect(await verifySignature(signed, 'b.example.com', keyId, publicKey)).toBe(false);
+  });
+
+  it('verifySignature catch path returns false for garbage public key material', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test' }, 'ex.com', keyId, privateKeyJwk);
+    expect(await verifySignature(signed, 'ex.com', keyId, '!!!not-base64!!!')).toBe(false);
+    expect(console.error).toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+
+  it('verifySignature returns false for truncated/corrupt signature bytes', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test' }, 'ex.com', keyId, privateKeyJwk);
+    const sigs = signed.signatures as Record<string, Record<string, string>>;
+    sigs['ex.com'][keyId] = 'AA';
+    expect(await verifySignature(signed, 'ex.com', keyId, publicKey)).toBe(false);
+    vi.restoreAllMocks();
+  });
+
+  it('preserves unsigned through signJson while hashing omits it', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const obj = { type: 'm.test', content: { x: 1 }, unsigned: { age: 3 } };
+    const signed = await signJson(obj, 'ex.com', keyId, privateKeyJwk);
+    expect(signed.unsigned).toEqual({ age: 3 });
+    expect(await verifySignature(signed, 'ex.com', keyId, publicKey)).toBe(true);
+    // Tamper only unsigned — signature still valid (unsigned stripped before verify)
+    const tamperedUnsigned = { ...signed, unsigned: { age: 99 } };
+    expect(await verifySignature(tamperedUnsigned, 'ex.com', keyId, publicKey)).toBe(true);
   });
 });

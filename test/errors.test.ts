@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   MatrixApiError,
   Errors,
@@ -162,6 +162,90 @@ describe('errors TOKENMAXX edge paths after #55', () => {
     expect((res as Response).status).toBe(500);
     await expect((res as Response).json()).resolves.toMatchObject({
       errcode: 'M_UNKNOWN',
+    });
+  });
+});
+
+
+describe('errors TOKENMAXX leftovers after #226', () => {
+  it('MatrixApiError sets name and defaults status to 400', () => {
+    const err = new MatrixApiError(ErrorCodes.M_BAD_JSON, 'bad');
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe('MatrixApiError');
+    expect(err.status).toBe(400);
+    expect(err.message).toBe('bad');
+    expect(err.retryAfterMs).toBeUndefined();
+  });
+
+  it('pins exact default factory messages and statuses', () => {
+    expect(Errors.forbidden().message).toBe('Forbidden');
+    expect(Errors.unknownToken().message).toBe('Unknown token');
+    expect(Errors.missingToken().message).toBe('Missing access token');
+    expect(Errors.badJson().message).toBe('Could not parse request body as JSON');
+    expect(Errors.notJson().message).toBe('Content-Type must be application/json');
+    expect(Errors.notFound().message).toBe('Not found');
+    expect(Errors.limitExceeded().message).toBe('Rate limit exceeded');
+    expect(Errors.limitExceeded().status).toBe(429);
+    expect(Errors.unknown().message).toBe('An unknown error occurred');
+    expect(Errors.unrecognized().message).toBe('Unrecognized request');
+    expect(Errors.unauthorized().message).toBe('Unauthorized');
+    expect(Errors.userDeactivated().message).toBe('User account has been deactivated');
+    expect(Errors.userInUse().message).toBe('User ID already taken');
+    expect(Errors.invalidUsername().message).toBe('Invalid username');
+    expect(Errors.roomInUse().message).toBe('Room alias already taken');
+    expect(Errors.invalidRoomState().message).toBe('Invalid room state');
+    expect(Errors.unsupportedRoomVersion().message).toBe('Unsupported room version');
+    expect(Errors.guestAccessForbidden().message).toBe('Guest access forbidden');
+    expect(Errors.tooLarge().message).toBe('Request too large');
+    expect(Errors.conflict().message).toBe('State changed concurrently; retry the operation');
+    expect(Errors.conflict('race').message).toBe('race');
+  });
+
+  it('includes retry_after_ms for any truthy retryAfterMs including negatives', () => {
+    const err = new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'slow', 429, -1);
+    expect(err.toJSON()).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'slow',
+      retry_after_ms: -1,
+    });
+  });
+
+  it('withErrorHandler logs unexpected Error throws before mapping to M_UNKNOWN', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = await withErrorHandler(async () => {
+      throw new Error('unexpected-path');
+    });
+    expect((res as Response).status).toBe(500);
+    expect(spy).toHaveBeenCalledWith('Unexpected error:', expect.any(Error));
+    spy.mockRestore();
+  });
+
+  it('jsonResponse serializes nested objects, arrays, and null', async () => {
+    const res = jsonResponse({ a: [1, null, { b: true }] }, 202);
+    expect(res.status).toBe(202);
+    expect(res.headers.get('Content-Type')).toBe('application/json');
+    await expect(res.json()).resolves.toEqual({ a: [1, null, { b: true }] });
+  });
+
+  it('toResponse Content-Type is application/json and body matches toJSON', async () => {
+    const err = Errors.missingParam('device_id');
+    const res = err.toResponse();
+    expect(res.headers.get('Content-Type')).toBe('application/json');
+    await expect(res.json()).resolves.toEqual(err.toJSON());
+    expect(err.toJSON()).toEqual({
+      errcode: 'M_MISSING_PARAM',
+      error: 'Missing required parameter: device_id',
+    });
+  });
+
+  it('withErrorHandler returns MatrixApiError.toResponse verbatim for factories', async () => {
+    const res = (await withErrorHandler(async () => {
+      throw Errors.conflict('lost race');
+    })) as Response;
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'lost race',
     });
   });
 });
