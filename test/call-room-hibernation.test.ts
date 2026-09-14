@@ -2628,3 +2628,133 @@ describe('CallRoom hibernation senary mute/end/answer concurrent after #273', ()
     });
   }
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #273/#276 senary — CallRoom hibernation
+ * *septenary* concurrent races (mute∥leave WS, offer∥answer cross-socket,
+ * TRACK_NOT_FOUND mute∥peer join).
+ */
+
+describe('CallRoom hibernation septenary mute/leave/offer concurrent after #273', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    createSessionMock.mockResolvedValue({ sessionId: 'sess-s7' });
+    renegotiateMock.mockResolvedValue(undefined);
+    addTracksMock.mockResolvedValue({
+      sessionDescription: { type: 'answer', sdp: 'v=answer' },
+      tracks: [{ mid: '7' }],
+    });
+    closeTracksMock.mockResolvedValue(undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`mute∥leave WS LWW deleted-or-muted flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+      const ws = new FakeWebSocket();
+      ws.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [ws, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(
+          ws,
+          JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })
+        ),
+        room.webSocketMessage(ws, JSON.stringify({ type: 'leave' })),
+      ]);
+
+      const stored = state.storage.map.get('participant:u1|d1') as
+        | { tracks: Record<string, { enabled: boolean }> }
+        | undefined;
+      expect(
+        stored === undefined || stored.tracks.audio0.enabled === false
+      ).toBe(true);
+      expect(state.storage.map.has('participant:u2|d2')).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`offer∥answer different sockets SFU isolation flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(
+          wsA,
+          JSON.stringify({
+            type: 'offer',
+            trackName: 'video0',
+            kind: 'video',
+            sdp: 'v=0',
+          })
+        ),
+        room.webSocketMessage(
+          wsB,
+          JSON.stringify({ type: 'answer', sdp: 'v=ans', mid: '0' })
+        ),
+      ]);
+
+      expect(addTracksMock).toHaveBeenCalled();
+      expect(renegotiateMock).toHaveBeenCalled();
+      expect(wsA.sent.some((s) => JSON.parse(s).type === 'offer_response')).toBe(
+        true
+      );
+      expect(wsB.sent.some((s) => JSON.parse(s).type === 'track_published')).toBe(
+        true
+      );
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`TRACK_NOT_FOUND mute∥peer join welcome flood-${i}`, async () => {
+      createSessionMock.mockResolvedValue({ sessionId: 'sess-tnf' });
+      const state = new RacingState();
+      await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(
+          wsA,
+          JSON.stringify({ type: 'mute', trackName: 'missing', muted: true })
+        ),
+        room.webSocketMessage(
+          wsB,
+          JSON.stringify({ type: 'join', userId: 'u2', deviceId: 'd2' })
+        ),
+      ]);
+
+      expect(JSON.parse(wsA.sent[0])).toMatchObject({
+        type: 'error',
+        code: 'TRACK_NOT_FOUND',
+      });
+      expect(JSON.parse(wsB.sent[0])).toMatchObject({ type: 'welcome' });
+      expect(room.participants.has('u2|d2')).toBe(true);
+    });
+  }
+});

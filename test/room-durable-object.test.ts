@@ -2115,3 +2115,87 @@ describe('RoomDurableObject hibernation senary typing/receipt/ws leftovers after
     });
   }
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #273/#276 senary — RoomDurableObject
+ * hibernation *septenary* (WS typing false∥true, thread_id ''∥omit).
+ */
+
+describe('RoomDurableObject hibernation septenary typing/thread leftovers after #273', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`WS typing false∥true same user both broadcast flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      state.sockets.push(a, b);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'typing', typing: false })),
+        wsMsg(room, a, JSON.stringify({ type: 'typing', typing: true })),
+      ]);
+
+      const peerTyping = b.sent
+        .map((s) => JSON.parse(s))
+        .filter((m) => m.type === 'typing' && m.user_id === '@a:example.com');
+      expect(peerTyping.length).toBeGreaterThanOrEqual(2);
+      expect(peerTyping.some((m) => m.typing === false)).toBe(true);
+      expect(peerTyping.some((m) => m.typing === true)).toBe(true);
+      // WS path does not touch typingUsers map
+      const typing = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(typing.user_ids).toEqual([]);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`thread_id ''∥omit distinct receipt keys flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              event_id: '$empty',
+              receipt_type: 'm.read',
+              thread_id: '',
+            }),
+          })
+        ),
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              event_id: '$omit',
+              receipt_type: 'm.read',
+            }),
+          })
+        ),
+      ]);
+
+      // '' is not coalesced by ?? → key ends with ':' ; omit → unthreaded
+      expect(state.storage.map.has('receipt:@a:example.com:m.read:')).toBe(true);
+      expect(state.storage.map.has('receipt:@a:example.com:m.read:unthreaded')).toBe(
+        true
+      );
+      const get = (await (await room.fetch(new Request('https://do/receipts'))).json()) as {
+        receipts: Record<
+          string,
+          Record<string, Record<string, { thread_id?: string }>>
+        >;
+      };
+      expect(get.receipts.$empty['m.read']['@a:example.com'].thread_id).toBeUndefined();
+      expect(get.receipts.$omit['m.read']['@a:example.com'].thread_id).toBeUndefined();
+    });
+  }
+});
