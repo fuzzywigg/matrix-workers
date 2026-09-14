@@ -1,7 +1,7 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 — deepen residual client *filters +
- * capabilities* concurrent race / TOCTOU + soft/edge reliability on the
- * existing module (first pass landed in #214 after #210).
+ * TOKENMAXX HEAVY leftovers after #214 / #218 — deepen residual client
+ * *filters + capabilities* concurrent race / TOCTOU + soft/edge reliability
+ * on the existing module (first pass #214 after #210; residual #218).
  *
  * Live handlers live inline on `src/index.ts` (capabilities GET; POST/GET
  * user filter KV). Sync only *consumes* `filter:` KV keys (#202); never races
@@ -11,18 +11,24 @@
  * aliases/power-levels/redact/voip concurrent-race files and from relations
  * (#210), account (#209), directory/userdir (#211), rooms-read-upgrade (#208),
  * push (#207), typing (#206), sliding-sync (#205), presence (#204), sync (#202),
- * voip (#201).
+ * voip (#201), room-cache (#232).
  *
  * #214 covered: parallel POST distinct IDs; CACHE put barrier TOCTOU;
  * POST∥GET mid-flight empty-vs-body; corrupt/missing KV → {}; forbidden
  * other-user; capabilities parallel coherency; method/JSON/charset soft
  * floods; TTL bind contracts; cross-endpoint filter∥capabilities isolation.
  *
- * Residual deepen (#214+): delayMs put/get soft; mutateAfterPuts wipe TOCTOU;
- * POST put-barrier ∥ seeded GET isolation; auth/device identity matrix;
- * Content-Type/Accept/charset matrix; filter-item method floods; query-string
- * ignore; root JSON type soft; filter-id vocabulary edges; capabilities
- * exhaustive key bind; events order coherency; unicode bodies; HEAD/OPTIONS.
+ * Residual deepen (#214+ / #218): delayMs put/get soft; mutateAfterPuts wipe
+ * TOCTOU; POST put-barrier ∥ seeded GET isolation; auth/device identity;
+ * Content-Type/Accept/charset; filter-item method floods; query-string ignore;
+ * root JSON type soft; filter-id vocabulary; capabilities exhaustive key bind;
+ * events order; unicode bodies; HEAD/OPTIONS.
+ *
+ * Residual deepen after #232: mutateAfterGets dual-GET barrier TOCTOU;
+ * failPut∥capabilities isolation; room_versions available exhaustive under
+ * Promise.all; double-encoded userId soft; filter_id hex-segment bind;
+ * failGet mid∥capabilities; oversized nested body; cross-user wipe inject;
+ * query access_token ignored (auth mocked); PUT collection soft.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -332,6 +338,12 @@ function filterKeys(cache: RaceCache, userId = USER): string[] {
 function statusesOf(results: Array<{ status: number }>): number[] {
   return results.map((r) => r.status).sort((a, b) => a - b);
 }
+
+type CapabilitiesBody = {
+  capabilities: {
+    'm.room_versions': { default: string; available: Record<string, string> };
+  };
+};
 
 function expectCapabilitiesShape(body: any) {
   expect(body).toHaveProperty('capabilities');
@@ -1853,6 +1865,352 @@ describe('race filter corrupt whitespace BOM soft after #214', () => {
       ]);
       expect(cache.getCount).toBe(beforeGets);
       expect(cache.putCount).toBe(beforePuts);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — mutateAfterGets dual-GET barrier TOCTOU
+// ---------------------------------------------------------------------------
+
+describe('race filter mutateAfterGets dual-GET barrier after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`dual GET under barrier then wipe soft flood-${i}`, async () => {
+      const fid = `mag${i}`;
+      const body = sampleFilter(i);
+      const cache = mockCache(
+        { [`filter:${USER}:${fid}`]: JSON.stringify(body) },
+        {
+          getBarrier: { count: 2, match: (key) => key === `filter:${USER}:${fid}` },
+          mutateAfterGets: { after: 2, next: {} },
+        }
+      );
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, filterPath(fid), authGet()),
+        request(env, filterPath(fid), authGet()),
+      ]);
+      // Both barriered GETs snapshot pre-mutation body
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(results[0].body).toEqual(body);
+      expect(results[1].body).toEqual(body);
+      const after = await Promise.all([
+        request(env, filterPath(fid), authGet()),
+        request(env, filterPath(fid), authGet()),
+      ]);
+      expect(after.every((r) => r.status === 200 && JSON.stringify(r.body) === '{}')).toBe(true);
+      expect(cache.events).toContain('mutate:after-get');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`mutateAfterGets inject foreign key soft flood-${i}`, async () => {
+      const fid = `src${i}`;
+      const inj = `inj${i}`;
+      const cache = mockCache(
+        { [`filter:${USER}:${fid}`]: JSON.stringify(sampleFilter(i)) },
+        {
+          getBarrier: { count: 2, match: (key) => key === `filter:${USER}:${fid}` },
+          mutateAfterGets: {
+            after: 2,
+            next: { [`filter:${USER}:${inj}`]: JSON.stringify(sampleFilter(90 + i)) },
+          },
+        }
+      );
+      const env = createEnv(cache);
+      const [a, b] = await Promise.all([
+        request(env, filterPath(fid), authGet()),
+        request(env, filterPath(fid), authGet()),
+      ]);
+      expect(a.body).toEqual(sampleFilter(i));
+      expect(b.body).toEqual(sampleFilter(i));
+      const [gone, present] = await Promise.all([
+        request(env, filterPath(fid), authGet()),
+        request(env, filterPath(inj), authGet()),
+      ]);
+      expect(gone.body).toEqual({});
+      expect(present.body).toEqual(sampleFilter(90 + i));
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`mutateAfterGets after-1 serial first-sees second-empty flood-${i}`, async () => {
+      const fid = `ser${i}`;
+      const cache = mockCache(
+        { [`filter:${USER}:${fid}`]: JSON.stringify(sampleFilter(i)) },
+        { mutateAfterGets: { after: 1, next: {} } }
+      );
+      const env = createEnv(cache);
+      const first = await request(env, filterPath(fid), authGet());
+      const second = await request(env, filterPath(fid), authGet());
+      expect(first.body).toEqual(sampleFilter(i));
+      expect(second.body).toEqual({});
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — failPut∥capabilities + failGet isolation
+// ---------------------------------------------------------------------------
+
+describe('race filter failPut∥capabilities isolation after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`failPutAfter 0 POST∥capabilities soft flood-${i}`, async () => {
+      const cache = mockCache({}, { failPutAfter: 0 });
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i))),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i + 1))),
+        request(env, capabilitiesPath(), authGet()),
+      ]);
+      expect(results[0].status).toBeGreaterThanOrEqual(500);
+      expect(results[1].status).toBe(200);
+      expect(results[2].status).toBeGreaterThanOrEqual(500);
+      expect(results[3].status).toBe(200);
+      expectCapabilitiesShape(results[1].body);
+      expect(results[1].body).toEqual(results[3].body);
+      expect(cache.puts).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`failGetAfter mid GET∥capabilities soft flood-${i}`, async () => {
+      const fid = `fg${i}`;
+      const cache = mockCache(
+        { [`filter:${USER}:${fid}`]: JSON.stringify(sampleFilter(i)) },
+        { failGetAfter: 1 }
+      );
+      const env = createEnv(cache);
+      const first = await request(env, filterPath(fid), authGet());
+      expect(first.status).toBe(200);
+      expect(first.body).toEqual(sampleFilter(i));
+      const results = await Promise.all([
+        request(env, filterPath(fid), authGet()),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+        request(env, filterPath(fid), authGet()),
+      ]);
+      expect(results[0].status).toBeGreaterThanOrEqual(500);
+      expect(results[1].status).toBe(200);
+      expect(results[2].status).toBeGreaterThanOrEqual(500);
+      expectCapabilitiesShape(results[1].body);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`failPutAfter 1 dual POST∥GET seeded soft flood-${i}`, async () => {
+      const seeded = `seedFail${i}`;
+      const cache = mockCache(
+        { [`filter:${USER}:${seeded}`]: JSON.stringify(sampleFilter(0)) },
+        { failPutAfter: 1 }
+      );
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i))),
+        request(env, filterPath(seeded), authGet()),
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i + 40))),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[1].status).toBe(200);
+      expect(results[1].body).toEqual(sampleFilter(0));
+      expect(results[2].status).toBeGreaterThanOrEqual(500);
+      expect(cache.puts).toHaveLength(1);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — room_versions available exhaustive under race
+// ---------------------------------------------------------------------------
+
+describe('race capabilities room_versions available exhaustive after #232', () => {
+  const expectedVersions = Array.from({ length: 12 }, (_, v) => String(v + 1));
+
+  for (let i = 0; i < 12; i++) {
+    it(`available 1–12 stable bind flood-${i}`, async () => {
+      const env = createEnv();
+      const results = await Promise.all(
+        Array.from({ length: 6 }, () => request(env, capabilitiesPath(), { method: 'GET' }))
+      );
+      for (const r of results) {
+        expect(r.status).toBe(200);
+        const available = (r.body as CapabilitiesBody).capabilities['m.room_versions'].available;
+        expect(Object.keys(available).sort((a, b) => Number(a) - Number(b))).toEqual(
+          expectedVersions
+        );
+        for (const v of expectedVersions) {
+          expect(available[v]).toBe('stable');
+        }
+        expect((r.body as CapabilitiesBody).capabilities['m.room_versions'].default).toBe('10');
+      }
+      expect(results.every((r) => JSON.stringify(r.body) === JSON.stringify(results[0].body))).toBe(
+        true
+      );
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`room_versions∥filter mint coherency soft flood-${i}`, async () => {
+      const cache = mockCache();
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, capabilitiesPath(), { method: 'GET' }),
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i))),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[1].status).toBe(200);
+      expect(results[2].status).toBe(200);
+      const avail0 = (results[0].body as CapabilitiesBody).capabilities['m.room_versions'].available;
+      const avail2 = (results[2].body as CapabilitiesBody).capabilities['m.room_versions'].available;
+      expect(avail0).toEqual(avail2);
+      expect(Object.keys(avail0)).toHaveLength(12);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — double-encoded userId + filter_id hex bind
+// ---------------------------------------------------------------------------
+
+describe('race filter path encoding + filter_id hex bind after #232', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`double-encoded userId soft flood-${i}`, async () => {
+      // Hono decodes once; double-encoding yields wrong userId → forbidden
+      const doubleEnc = encodeURIComponent(USER_ENC);
+      const cache = mockCache();
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, `/_matrix/client/v3/user/${doubleEnc}/filter`, jsonInit('POST', sampleFilter(i))),
+        request(env, filterCollection(USER_ENC), jsonInit('POST', sampleFilter(i + 1))),
+      ]);
+      expect(results[0].status).toBe(403);
+      expect(results[1].status).toBe(200);
+      expect(filterKeys(cache)).toHaveLength(1);
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`filter_id hex-segment charset bind flood-${i}`, async () => {
+      const cache = mockCache();
+      const env = createEnv(cache);
+      const results = await Promise.all(
+        Array.from({ length: 4 }, (_, j) =>
+          request(env, filterCollection(), jsonInit('POST', sampleFilter(i * 4 + j)))
+        )
+      );
+      expect(results.every((r) => r.status === 200)).toBe(true);
+      for (const r of results) {
+        const id = (r.body as { filter_id: string }).filter_id;
+        expect(id).toMatch(/^[0-9a-f]+$/i);
+        expect(id.includes('-')).toBe(false);
+        expect(id.length).toBeGreaterThanOrEqual(8);
+      }
+      expect(new Set(results.map((r) => (r.body as { filter_id: string }).filter_id)).size).toBe(4);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`query access_token ignored on filter routes soft flood-${i}`, async () => {
+      // Auth is mocked — query must not alter path/KV key shape
+      const fid = `qtok${i}`;
+      const cache = mockCache({
+        [`filter:${USER}:${fid}`]: JSON.stringify(sampleFilter(i)),
+      });
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(
+          env,
+          `${filterPath(fid)}?access_token=should-not-matter`,
+          authGet()
+        ),
+        request(
+          env,
+          `${filterCollection()}?access_token=also-ignored`,
+          jsonInit('POST', sampleFilter(i + 5))
+        ),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[0].body).toEqual(sampleFilter(i));
+      expect(results[1].status).toBe(200);
+      expect(filterKeys(cache).length).toBeGreaterThanOrEqual(2);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — oversized nested + collection method soft
+// ---------------------------------------------------------------------------
+
+describe('race filter oversized nested + collection method soft after #232', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`oversized event_fields + rooms soft flood-${i}`, async () => {
+      const cache = mockCache();
+      const env = createEnv(cache);
+      const body = {
+        event_fields: Array.from({ length: 80 + i }, (_, j) => `field_${j}`),
+        room: {
+          rooms: Array.from({ length: 40 + i }, (_, j) => `!big${j}:example.com`),
+          timeline: { limit: 100 + i },
+        },
+      };
+      const results = await Promise.all([
+        request(env, filterCollection(), jsonInit('POST', body)),
+        request(env, filterCollection(), jsonInit('POST', { ...body, tag: i })),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      const ids = results.map((r) => (r.body as { filter_id: string }).filter_id);
+      const got = await Promise.all(ids.map((id) => request(env, filterPath(id), authGet())));
+      expect(got[0].body).toEqual(body);
+      expect(got[1].body).toEqual({ ...body, tag: i });
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`collection wrong method soft flood-${i}`, async () => {
+      const methods = ['PUT', 'DELETE', 'PATCH'] as const;
+      const method = methods[i % methods.length];
+      const cache = mockCache();
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, filterCollection(), { method, headers: { ...AUTH }, body: '{}' }),
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i))),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+      ]);
+      expect(results[0].status).toBeGreaterThanOrEqual(400);
+      expect(results[1].status).toBe(200);
+      expect(results[2].status).toBe(200);
+      expect(cache.puts).toHaveLength(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`cross-user wipe inject under mutateAfterPuts soft flood-${i}`, async () => {
+      const cache = mockCache(
+        {},
+        {
+          mutateAfterPuts: {
+            after: 1,
+            next: {
+              [`filter:${BOB}:steal${i}`]: JSON.stringify(sampleFilter(77)),
+            },
+          },
+        }
+      );
+      const env = createEnv(cache);
+      authState.userId = USER;
+      const created = await request(env, filterCollection(USER_ENC), jsonInit('POST', sampleFilter(i)));
+      expect(created.status).toBe(200);
+      const mintedId = (created.body as { filter_id: string }).filter_id;
+      authState.userId = BOB;
+      const [aliceGone, bobGot] = await Promise.all([
+        // Alice path forbidden under bob auth
+        request(env, filterPath(mintedId, USER_ENC), authGet()),
+        request(env, filterPath(`steal${i}`, BOB_ENC), authGet()),
+      ]);
+      expect(aliceGone.status).toBe(403);
+      expect(bobGot.status).toBe(200);
+      expect(bobGot.body).toEqual(sampleFilter(77));
     });
   }
 });

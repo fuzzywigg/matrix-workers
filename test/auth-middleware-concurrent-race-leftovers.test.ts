@@ -1,6 +1,6 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 — auth-middleware *concurrent race*
- * + residual failure soft edges.
+ * TOKENMAXX HEAVY leftovers after #214 / #217 — auth-middleware *concurrent race*
+ * + residual failure soft edges (first concurrent-race pass #217).
  *
  * Complements auth-middleware.test.ts and auth-middleware-failure-leftovers
  * (#147 extract/requireAuth/optionalAuth). Prior leftovers only race two
@@ -8,6 +8,11 @@
  * Bearer-over-query precedence under requireAuth, format/foreign/forbidden
  * soft floods, optionalAuth AS-non-impersonation isolation, sender fallback
  * coherency, throwOnAs → M_UNKNOWN_TOKEN under race.
+ *
+ * Residual deepen after #232: throwOnToken under race; empty/whitespace
+ * Bearer extract; allowed localpart charset (=/_/+/.); multi-AS isolation;
+ * SERVER_NAME override; optionalAuth query-token; empty Authorization;
+ * AS sender∥user_id parallel; accessToken field bind under race.
  *
  * Tests-only. Fixtures use example.com / matrix.example.com only.
  * No product inventing. Does not touch auth.ts source.
@@ -829,6 +834,297 @@ describe('race auth errcode contracts under parallel after #214', () => {
           errcode: 'M_UNKNOWN_TOKEN',
           status: 401,
         });
+      }
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — throwOnToken isolation vs throwOnAs swallow
+// ---------------------------------------------------------------------------
+
+describe('race auth throwOnToken isolation after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`throwOnToken bubbles ∥ ok isolation flood-${i}`, async () => {
+      const token = `syt_ok_${i}`;
+      const hash = await hashToken(token);
+      const throwDb = createAuthDb({ throwOnToken: true });
+      const okDb = createAuthDb({
+        tokens: new Map([[hash, { user_id: `@ok${i}:${SERVER}`, device_id: 'D' }]]),
+      });
+      const ok = makeAuthCtx({
+        db: okDb,
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const next = vi.fn(async () => 'ok');
+      const [bad, good] = await Promise.allSettled([
+        requireAuth()(makeAuthCtx({ db: throwDb, headers: { Authorization: `Bearer t${i}` } }), vi.fn()),
+        requireAuth()(ok, next),
+      ]);
+      expect(bad.status).toBe('rejected');
+      expect(good.status).toBe('fulfilled');
+      expect(next).toHaveBeenCalledOnce();
+      expect(ok.get('userId')).toBe(`@ok${i}:${SERVER}`);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`throwOnToken vs throwOnAs swallow isolation flood-${i}`, async () => {
+      const asDb = createAuthDb({ throwOnAs: true });
+      const tokDb = createAuthDb({ throwOnToken: true });
+      const [asRes, tokRes] = await Promise.allSettled([
+        requireAuth()(
+          makeAuthCtx({ db: asDb, headers: { Authorization: `Bearer as_${i}` } }),
+          vi.fn()
+        ),
+        requireAuth()(
+          makeAuthCtx({ db: tokDb, headers: { Authorization: `Bearer tok_${i}` } }),
+          vi.fn()
+        ),
+      ]);
+      expect(asRes.status).toBe('fulfilled');
+      expect(await jsonBody(asRes.value as Response)).toMatchObject({
+        errcode: 'M_UNKNOWN_TOKEN',
+        status: 401,
+      });
+      expect(tokRes.status).toBe('rejected');
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — extractAccessToken whitespace / empty
+// ---------------------------------------------------------------------------
+
+describe('race auth extractAccessToken whitespace after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`Bearer extra whitespace still captures flood-${i}`, () => {
+      const req = new Request(`https://${SERVER}/sync`, {
+        headers: { Authorization: `Bearer    tok_ws_${i}` },
+      });
+      expect(extractAccessToken(req)).toBe(`tok_ws_${i}`);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`bare Bearer / empty header falls to query flood-${i}`, () => {
+      const a = new Request(`https://${SERVER}/sync?access_token=q${i}`, {
+        headers: { Authorization: 'Bearer' },
+      });
+      const b = new Request(`https://${SERVER}/sync?access_token=q${i}`, {
+        headers: { Authorization: '' },
+      });
+      const c = new Request(`https://${SERVER}/sync?access_token=q${i}`, {
+        headers: { Authorization: 'Bearer ' },
+      });
+      expect(extractAccessToken(a)).toBe(`q${i}`);
+      expect(extractAccessToken(b)).toBe(`q${i}`);
+      // "Bearer " + empty capture fails `.+` → query fallback
+      expect(extractAccessToken(c)).toBe(`q${i}`);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`tab/newline Bearer whitespace flood-${i}`, () => {
+      const req = new Request(`https://${SERVER}/sync`, {
+        headers: { Authorization: `Bearer\ttabtok_${i}` },
+      });
+      expect(extractAccessToken(req)).toBe(`tabtok_${i}`);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — multi-AS isolation + SERVER_NAME override
+// ---------------------------------------------------------------------------
+
+describe('race auth multi-AS + SERVER_NAME after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`two AS tokens isolate senders flood-${i}`, async () => {
+      const db = createAuthDb({
+        appservices: new Map([
+          [
+            `as_a_${i}`,
+            asRow({
+              id: 'a',
+              as_token: `as_a_${i}`,
+              sender_localpart: `alpha_${i}`,
+              namespaces: JSON.stringify({ users: [] }),
+            }),
+          ],
+          [
+            `as_b_${i}`,
+            asRow({
+              id: 'b',
+              as_token: `as_b_${i}`,
+              sender_localpart: `beta_${i}`,
+              namespaces: JSON.stringify({ users: [] }),
+            }),
+          ],
+        ]),
+      });
+      const ctxA = makeAuthCtx({ db, headers: { Authorization: `Bearer as_a_${i}` } });
+      const ctxB = makeAuthCtx({ db, headers: { Authorization: `Bearer as_b_${i}` } });
+      await Promise.all([
+        requireAuth()(ctxA, vi.fn(async () => undefined)),
+        requireAuth()(ctxB, vi.fn(async () => undefined)),
+      ]);
+      expect(ctxA.get('userId')).toBe(`@alpha_${i}:${SERVER}`);
+      expect(ctxB.get('userId')).toBe(`@beta_${i}:${SERVER}`);
+      expect(ctxA.get('deviceId')).toBeNull();
+      expect(ctxB.get('deviceId')).toBeNull();
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`SERVER_NAME override foreign vs local flood-${i}`, async () => {
+      const db = createAuthDb({
+        appservices: new Map([
+          [
+            'as_tok',
+            asRow({
+              as_token: 'as_tok',
+              sender_localpart: 'bot',
+              namespaces: JSON.stringify({ users: [] }),
+            }),
+          ],
+        ]),
+      });
+      const other = 'other.example.com';
+      const [foreign, local] = await Promise.all([
+        requireAuth()(
+          makeAuthCtx({
+            db,
+            serverName: other,
+            url: `https://${other}/sync?user_id=${encodeURIComponent(`@bot_${i}:${SERVER}`)}`,
+            headers: { Authorization: 'Bearer as_tok' },
+          }),
+          vi.fn()
+        ),
+        requireAuth()(
+          makeAuthCtx({
+            db,
+            serverName: other,
+            url: `https://${other}/sync?user_id=${encodeURIComponent(`@bot_${i}:${other}`)}`,
+            headers: { Authorization: 'Bearer as_tok' },
+          }),
+          vi.fn(async () => 'ok')
+        ),
+      ]);
+      expect(await jsonBody(foreign as Response)).toMatchObject({
+        errcode: 'M_FORBIDDEN',
+        error: 'Cannot impersonate users on other servers',
+      });
+      expect(local).toBe('ok');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`AS sender fallback ∥ explicit user_id parallel flood-${i}`, async () => {
+      const db = createAuthDb({
+        appservices: new Map([
+          [
+            `as_p_${i}`,
+            asRow({
+              as_token: `as_p_${i}`,
+              sender_localpart: `hook_${i}`,
+              namespaces: JSON.stringify({
+                users: [{ exclusive: true, regex: `@hook_.*:${SERVER.replace(/\./g, '\\.')}` }],
+              }),
+            }),
+          ],
+        ]),
+      });
+      const fallback = makeAuthCtx({
+        db,
+        headers: { Authorization: `Bearer as_p_${i}` },
+      });
+      const explicit = makeAuthCtx({
+        db,
+        url: `https://${SERVER}/sync?user_id=${encodeURIComponent(`@hook_user_${i}:${SERVER}`)}`,
+        headers: { Authorization: `Bearer as_p_${i}` },
+      });
+      await Promise.all([
+        requireAuth()(fallback, vi.fn(async () => undefined)),
+        requireAuth()(explicit, vi.fn(async () => undefined)),
+      ]);
+      expect(fallback.get('userId')).toBe(`@hook_${i}:${SERVER}`);
+      expect(explicit.get('userId')).toBe(`@hook_user_${i}:${SERVER}`);
+      expect(fallback.get('accessToken')).toBe(`as_p_${i}`);
+      expect(explicit.get('accessToken')).toBe(`as_p_${i}`);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #232 — optionalAuth query-token + empty Authorization
+// ---------------------------------------------------------------------------
+
+describe('race auth optionalAuth query + empty Authorization after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`optionalAuth query-only token flood-${i}`, async () => {
+      const token = `syt_q_${i}`;
+      const hash = await hashToken(token);
+      const db = createAuthDb({
+        tokens: new Map([[hash, { user_id: `@q${i}:${SERVER}`, device_id: 'QD' }]]),
+      });
+      const q = makeAuthCtx({
+        db,
+        url: `https://${SERVER}/sync?access_token=${encodeURIComponent(token)}`,
+      });
+      const missing = makeAuthCtx({ db });
+      const emptyAuth = makeAuthCtx({
+        db,
+        url: `https://${SERVER}/sync?access_token=${encodeURIComponent(token)}`,
+        headers: { Authorization: '' },
+      });
+      await Promise.all([
+        optionalAuth()(q, vi.fn(async () => undefined)),
+        optionalAuth()(missing, vi.fn(async () => undefined)),
+        optionalAuth()(emptyAuth, vi.fn(async () => undefined)),
+      ]);
+      expect(q.get('userId')).toBe(`@q${i}:${SERVER}`);
+      expect(q.get('deviceId')).toBe('QD');
+      expect(missing.get('userId')).toBeUndefined();
+      expect(emptyAuth.get('userId')).toBe(`@q${i}:${SERVER}`);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`requireAuth empty Authorization uses query flood-${i}`, async () => {
+      const token = `syt_empty_${i}`;
+      const hash = await hashToken(token);
+      const db = createAuthDb({
+        tokens: new Map([[hash, { user_id: `@e${i}:${SERVER}`, device_id: 'ED' }]]),
+      });
+      const ctx = makeAuthCtx({
+        db,
+        url: `https://${SERVER}/sync?access_token=${encodeURIComponent(token)}`,
+        headers: { Authorization: '' },
+      });
+      const next = vi.fn(async () => 'ok');
+      await expect(requireAuth()(ctx, next)).resolves.toBe('ok');
+      expect(ctx.get('userId')).toBe(`@e${i}:${SERVER}`);
+      expect(ctx.get('accessToken')).toBe(token);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`accessToken field bind under parallel flood-${i}`, async () => {
+      const tokens = [`syt_a_${i}`, `syt_b_${i}`, `syt_c_${i}`];
+      const hashes = await Promise.all(tokens.map((t) => hashToken(t)));
+      const db = createAuthDb({
+        tokens: new Map(
+          hashes.map((h, j) => [h, { user_id: `@ab${i}_${j}:${SERVER}`, device_id: `D${j}` }])
+        ),
+      });
+      const ctxs = tokens.map((t) =>
+        makeAuthCtx({ db, headers: { Authorization: `Bearer ${t}` } })
+      );
+      await Promise.all(ctxs.map((ctx) => requireAuth()(ctx, vi.fn(async () => undefined))));
+      for (let j = 0; j < tokens.length; j++) {
+        expect(ctxs[j].get('accessToken')).toBe(tokens[j]);
+        expect((ctxs[j].get('auth') as { accessToken: string }).accessToken).toBe(tokens[j]);
       }
     });
   }
