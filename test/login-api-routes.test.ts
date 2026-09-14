@@ -3,6 +3,10 @@
  * Avoids keys (#99), key-backups (#96), search (#94). Tests-only — no product inventing.
  * Exercises login flows, lockout, refresh rotation, register/guest, logout, whoami,
  * and get_token via Hono app.request().
+ *
+ * Soft-cap flood after #101/#127: response contracts, device display names, lockout KV,
+ * refresh TTL, identifier/UIA edges, lifecycle, charset — avoids account-data (#127),
+ * push (#128), federation (#129).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
