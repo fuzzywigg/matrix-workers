@@ -1,24 +1,26 @@
 /**
- * TOKENMAXX HEAVY leftovers after #215 / deepen after #232 — oauth
- * *concurrent race / TOCTOU* for `src/api/oauth.ts` (register / authorize /
- * token / refresh / revoke / introspect / userinfo / UIA).
+ * TOKENMAXX HEAVY leftovers after #215 / deepen after #232 / residual after #238
+ * — oauth *concurrent race / TOCTOU* for `src/api/oauth.ts` (register /
+ * authorize / token / refresh / revoke / introspect / userinfo / UIA).
  *
  * Soft/contract leftovers for oauth are deep (#177/#186 and oauth-api-* files)
  * but concurrent-race coverage was near-zero: only a sequential "distinct auth
  * codes" case in oauth-api-route-leftovers (no Promise.all / KV get-barrier
  * double-spend / refresh rotation races).
  *
- * Distinct from tip #215 (power-levels/redact), #214 (filters+capabilities),
- * #211 (directory/userdir), open #217 (appservice+auth-middleware), open #216
- * (event-auth+state-resolution), and saturated keys/devices/to-device/media/
- * rooms/voip/sync/push concurrent-race files. Orthogonal to login-qr-identity
- * races (#163) and account OpenID mint races (#209).
+ * Distinct from tip #241 (devices+keybackups residual), #240 (room-cache),
+ * #239 (admin+federation), #238 (this slice's prior deepen), and saturated
+ * keys/devices/to-device/media/rooms/voip/sync/push concurrent-race files.
+ * Orthogonal to login-qr-identity races (#163) and account OpenID mint (#209).
  *
  * Focus: auth-code double-redeem get-barrier TOCTOU; refresh rotate∥rotate;
  * authorize auth_request single-flight consume; register∥register distinct
  * clients; revoke∥refresh / introspect∥revoke interleave; CACHE client wipe
  * mid token; UIA session get-barrier; userinfo GET∥POST coherency; method /
  * body / charset / missing soft floods under Promise.all; TTL bind contracts.
+ * Residual after #238: wrong∥right authorize, hint-scoped revoke, expired/
+ * corrupt code+refresh, refresh device/scope preserve, register/GET defaults,
+ * userinfo vanish, UIA mid-wipe, public-client secret skip.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -4086,6 +4088,464 @@ describe('race leftover UIA approve/cancel + JWT introspect after #232', () => {
       expect(results.every((r) => r.body.active === true && r.body.sub === `@u${i}:${SERVER}`)).toBe(
         true
       );
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// After #238 / tip after #241: residual authorize / revoke-hint / expired+
+// corrupt token / refresh preserve / register+GET defaults / userinfo vanish /
+// UIA mid-wipe TOCTOU niches unsaturated by the #232 deepen.
+// ---------------------------------------------------------------------------
+
+describe('race residual wrong∥right authorize + state echo after #238', () => {
+  it('wrong∥right password same auth_request under get barrier — TOCTOU documented', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv(
+      {},
+      { getBarrier: { count: 2, match: (k) => k === 'oauth_auth_request:ar-wr' } }
+    );
+    seedAuthRequest(sessions, 'ar-wr', { state: 'st-wr' });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'WRONG', auth_request_id: 'ar-wr' }),
+        env
+      ),
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-wr' }),
+        env
+      ),
+    ]);
+    expect(sessions.gets.filter((k) => k === 'oauth_auth_request:ar-wr').length).toBeGreaterThanOrEqual(
+      2
+    );
+    const statuses = results.map((r) => r.status).sort((a, b) => a - b);
+    expect(statuses.every((s) => s === 200 || s === 302 || s === 400)).toBe(true);
+    expect(
+      results.some(
+        (r) =>
+          r.status === 302 ||
+          (r.status === 200 && String(r.body).includes('Invalid username or password')) ||
+          r.status === 400
+      )
+    ).toBe(true);
+  });
+
+  it('missing username∥password leaves auth_request intact under parallel', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv();
+    seedAuthRequest(sessions, 'ar-miss');
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request('/oauth/authorize', formInit({ password: 'secret', auth_request_id: 'ar-miss' }), env),
+      request('/oauth/authorize', formInit({ username: 'alice', auth_request_id: 'ar-miss' }), env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => String(r.body).includes('Missing username or password'))).toBe(true);
+    expect(sessions.data['oauth_auth_request:ar-miss']).toBeTruthy();
+    expect(sessions.deletes.filter((k) => k === 'oauth_auth_request:ar-miss')).toHaveLength(0);
+  });
+
+  it('POST authorize echoes distinct state in Location under parallel', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv();
+    seedAuthRequest(sessions, 'ar-st-a', { state: 'state-alpha' });
+    seedAuthRequest(sessions, 'ar-st-b', { state: 'state-beta' });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-st-a' }),
+        env
+      ),
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-st-b' }),
+        env
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([302, 302]);
+    const locs = results.map((r) => r.headers.get('location') || '');
+    expect(locs.some((l) => l.includes('state=state-alpha'))).toBe(true);
+    expect(locs.some((l) => l.includes('state=state-beta'))).toBe(true);
+    expect(locs[0]).not.toBe(locs[1]);
+  });
+
+  it('successful authorize puts oauth_code with TTL 600 under parallel', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv();
+    seedAuthRequest(sessions, 'ar-ttl-a', { state: 'ttl-a' });
+    seedAuthRequest(sessions, 'ar-ttl-b', { state: 'ttl-b' });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-ttl-a' }),
+        env
+      ),
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-ttl-b' }),
+        env
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([302, 302]);
+    const codePuts = sessions.puts.filter((p) => p.key.startsWith('oauth_code:'));
+    expect(codePuts).toHaveLength(2);
+    for (const p of codePuts) {
+      expect(p.options?.expirationTtl).toBe(600);
+      const parsed = JSON.parse(p.value);
+      expect(parsed.user_id).toBe(USER_ID);
+      expect(parsed.client_id).toBe('cid-1');
+    }
+  });
+});
+
+describe('race residual revoke hint + expired/corrupt token after #238', () => {
+  it('revoke hint=access_token leaves refresh; hint=refresh_token deletes', async () => {
+    const sessions = mockKv();
+    seedRefresh(sessions, 'rt-hint-keep');
+    seedRefresh(sessions, 'rt-hint-drop');
+    const db = aliceDb();
+    const at = 'at-hint-del';
+    const hash = await hashToken(at);
+    db.tokensByHash.set(hash, { user_id: USER_ID, device_id: 'DEVICEA', created_at: NOW });
+    const env = makeEnv({ sessions, db });
+    const results = await Promise.all([
+      request(
+        '/oauth/revoke',
+        urlencoded({ token: 'rt-hint-keep', token_type_hint: 'access_token' }),
+        env
+      ),
+      request(
+        '/oauth/revoke',
+        urlencoded({ token: 'rt-hint-drop', token_type_hint: 'refresh_token' }),
+        env
+      ),
+      request('/oauth/revoke', urlencoded({ token: at, token_type_hint: 'access_token' }), env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200, 200]);
+    expect(sessions.data['oauth_refresh:rt-hint-keep']).toBeTruthy();
+    expect(sessions.data['oauth_refresh:rt-hint-drop']).toBeUndefined();
+    expect(db.tokensByHash.has(hash)).toBe(false);
+  });
+
+  it('expired auth code expires_at past → invalid_grant under parallel', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv();
+    seedAuthCode(sessions, 'code-exp-a', { expires_at: NOW - 1 });
+    seedAuthCode(sessions, 'code-exp-b', { expires_at: NOW - 1000 });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'authorization_code', client_id: 'cid-1', code: 'code-exp-a' }),
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'authorization_code', client_id: 'cid-1', code: 'code-exp-b' }),
+        env
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([400, 400]);
+    expect(results.every((r) => r.body.error === 'invalid_grant')).toBe(true);
+    expect(sessions.data['oauth_code:code-exp-a']).toBeUndefined();
+    expect(sessions.data['oauth_code:code-exp-b']).toBeUndefined();
+  });
+
+  it('corrupt oauth_code ∥ oauth_refresh JSON soft under parallel', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv();
+    sessions.data['oauth_code:bad-json'] = '{not-json';
+    sessions.data['oauth_refresh:bad-rt'] = '{also-bad';
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'authorization_code', client_id: 'cid-1', code: 'bad-json' }),
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'refresh_token', client_id: 'cid-1', refresh_token: 'bad-rt' }),
+        env
+      ),
+    ]);
+    expect(results.every((r) => r.status === 400 || r.status === 500)).toBe(true);
+  });
+
+  it('refresh preserves device_id + scope under parallel distinct tokens', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv();
+    seedRefresh(sessions, 'rt-keep-a', {
+      device_id: 'DEVA',
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:DEVA',
+    });
+    seedRefresh(sessions, 'rt-keep-b', {
+      device_id: 'DEVB',
+      scope: 'openid profile',
+    });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'refresh_token', client_id: 'cid-1', refresh_token: 'rt-keep-a' }),
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'refresh_token', client_id: 'cid-1', refresh_token: 'rt-keep-b' }),
+        env
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    const byScope = Object.fromEntries(results.map((r) => [r.body.scope as string, r.body]));
+    expect(byScope['openid urn:matrix:org.matrix.msc2967.client:device:DEVA']).toBeTruthy();
+    expect(byScope['openid profile']).toBeTruthy();
+    const stored = Object.values(sessions.data)
+      .filter((v) => v.includes('"device_id"'))
+      .map((v) => JSON.parse(v));
+    const devices = stored.map((s) => s.device_id).sort();
+    expect(devices).toEqual(['DEVA', 'DEVB'].sort());
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`revoke access_token hint residual flood-${i}`, async () => {
+      const db = aliceDb();
+      const token = `at-flood-${i}`;
+      const hash = await hashToken(token);
+      db.tokensByHash.set(hash, { user_id: USER_ID, device_id: `D${i}`, created_at: NOW });
+      const sessions = mockKv();
+      seedRefresh(sessions, `rt-flood-${i}`);
+      const env = makeEnv({ db, sessions });
+      const results = await Promise.all([
+        request('/oauth/revoke', urlencoded({ token, token_type_hint: 'access_token' }), env),
+        request(
+          '/oauth/revoke',
+          urlencoded({ token: `rt-flood-${i}`, token_type_hint: 'access_token' }),
+          env
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(db.tokensByHash.has(hash)).toBe(false);
+      expect(sessions.data[`oauth_refresh:rt-flood-${i}`]).toBeTruthy();
+    });
+  }
+});
+
+describe('race residual register/GET defaults + userinfo vanish + UIA mid-wipe after #238', () => {
+  it('register omitted grant_types/response_types/name defaults under parallel', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache });
+    const results = await Promise.all([
+      registerClient(env, { redirect_uris: [REDIRECT], token_endpoint_auth_method: 'none' }),
+      registerClient(env, {
+        redirect_uris: [REDIRECT],
+        token_endpoint_auth_method: 'none',
+        client_name: 'Named',
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+      }),
+    ]);
+    expect(statusesOf(results)).toEqual([201, 201]);
+    const def = results.find((r) => r.body.client_name === 'Unknown Client')!;
+    const named = results.find((r) => r.body.client_name === 'Named')!;
+    expect(def.body.grant_types).toEqual(['authorization_code']);
+    expect(def.body.response_types).toEqual(['code']);
+    expect(named.body.grant_types).toEqual(['authorization_code', 'refresh_token']);
+    expect(named.body.response_types).toEqual(['code']);
+  });
+
+  it('GET authorize omitted scope defaults to openid under parallel', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv();
+    const env = makeEnv({ cache, sessions });
+    const qs = (extra: string) =>
+      `/oauth/authorize?client_id=cid-1&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code${extra}`;
+    const results = await Promise.all([
+      request(qs(''), {}, env),
+      request(qs('&scope=openid%20profile'), {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    const scopes = Object.values(sessions.data).map((v) => JSON.parse(v).scope).sort();
+    expect(scopes).toEqual(['openid', 'openid profile'].sort());
+  });
+
+  it('public client (auth none) ignores wrong client_secret under parallel', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-pub', { token_endpoint_auth_method: 'none', client_secret_hash: null });
+    const sessions = mockKv();
+    seedAuthCode(sessions, 'code-pub-a', {
+      client_id: 'cid-pub',
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:PUBA',
+    });
+    seedAuthCode(sessions, 'code-pub-b', {
+      client_id: 'cid-pub',
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:PUBB',
+    });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/token',
+        urlencoded({
+          grant_type: 'authorization_code',
+          client_id: 'cid-pub',
+          client_secret: 'ignored-wrong',
+          code: 'code-pub-a',
+        }),
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({
+          grant_type: 'authorization_code',
+          client_id: 'cid-pub',
+          code: 'code-pub-b',
+        }),
+        env
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.map((r) => r.body.device_id).sort()).toEqual(['PUBA', 'PUBB'].sort());
+  });
+
+  it('userinfo token valid but user vanished → 401 under parallel', async () => {
+    const db = createOAuthDb({
+      users: new Map(),
+      tokensByHash: new Map(),
+    });
+    const token = 'ui-orphan';
+    const hash = await hashToken(token);
+    db.tokensByHash.set(hash, { user_id: USER_ID, device_id: 'DEVICEA', created_at: NOW });
+    const env = makeEnv({ db });
+    const results = await Promise.all([
+      request('/oauth/userinfo', { headers: { Authorization: `Bearer ${token}` } }, env),
+      request('/oauth/userinfo', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }, env),
+    ]);
+    expect(statusesOf(results)).toEqual([401, 401]);
+    expect(results.every((r) => r.body.error === 'invalid_token')).toBe(true);
+  });
+
+  it('UIA session wipe after first get — second Session Expired', async () => {
+    const cache = mockKv({}, { mutateAfterGets: { after: 1, next: {} } });
+    cache.data['uia_session:mid'] = JSON.stringify({ user_id: USER_ID });
+    const env = makeEnv({ cache, db: aliceDb() });
+    const fd = new FormData();
+    fd.set('session', 'mid');
+    fd.set('username', 'alice');
+    fd.set('password', 'secret');
+    const first = await request('/oauth/authorize/uia?session=mid', {}, env);
+    const second = await request('/oauth/authorize/uia', { method: 'POST', body: fd }, env);
+    expect(first.status).toBe(200);
+    expect(String(first.body)).toContain('Approve Request');
+    expect(second.status).toBe(200);
+    expect(String(second.body)).toContain('Session Expired');
+  });
+
+  it('UIA GET missing session ∥ expired session isolation', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache });
+    const results = await Promise.all([
+      request('/oauth/authorize/uia', {}, env),
+      request('/oauth/authorize/uia?session=gone', {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(String(results[0].body)).toContain('Missing Session');
+    expect(String(results[1].body)).toContain('Session Expired');
+  });
+
+  it('OIDC-only UIA without IdP link fails under parallel soft', async () => {
+    const oidcUser = userRow({
+      user_id: USER_ID,
+      localpart: 'alice',
+      password_hash: null,
+      display_name: 'Alice SSO',
+    });
+    const db = createOAuthDb({
+      users: new Map([[USER_ID, oidcUser]]),
+      idpLinkUserIds: [],
+    });
+    const cache = mockKv();
+    cache.data['uia_session:noidp'] = JSON.stringify({ user_id: USER_ID });
+    const env = makeEnv({ cache, db });
+    const fd = new FormData();
+    fd.set('session', 'noidp');
+    fd.set('username', 'alice');
+    fd.set('password', 'anything');
+    const results = await Promise.all([
+      request('/oauth/authorize/uia', { method: 'POST', body: fd }, env),
+      request('/oauth/authorize/uia?session=noidp', {}, env),
+    ]);
+    expect(results[0].status).toBe(200);
+    expect(String(results[0].body)).toContain('Invalid username or password');
+    expect(results[1].status).toBe(200);
+    expect(cache.data['uia_session:noidp']).toBeTruthy();
+  });
+
+  it('introspect opaque∥JWT isolation under same parallel batch', async () => {
+    const db = aliceDb();
+    const opaque = 'opaque-mix';
+    const hash = await hashToken(opaque);
+    db.tokensByHash.set(hash, { user_id: USER_ID, device_id: 'DEVICEA', created_at: NOW });
+    const jwt = fakeJwt({
+      sub: BOB_ID,
+      client_id: 'cid-jwt',
+      exp: Math.floor(NOW / 1000) + 3600,
+      scope: 'openid',
+    });
+    const env = makeEnv({ db });
+    const results = await Promise.all([
+      request('/oauth/introspect', urlencoded({ token: opaque }), env),
+      request('/oauth/introspect', urlencoded({ token: jwt }), env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    const opaqueRes = results.find((r) => r.body.sub === USER_ID)!;
+    const jwtRes = results.find((r) => r.body.sub === BOB_ID)!;
+    expect(opaqueRes.body.active).toBe(true);
+    expect(opaqueRes.body.client_id).toBe('unknown');
+    expect(jwtRes.body.active).toBe(true);
+    expect(jwtRes.body.client_id).toBe('cid-jwt');
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`GET authorize default-scope residual flood-${i}`, async () => {
+      const cache = mockKv();
+      seedClient(cache, 'cid-1');
+      const sessions = mockKv();
+      const env = makeEnv({ cache, sessions });
+      const results = await Promise.all([
+        request(
+          `/oauth/authorize?client_id=cid-1&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&state=f${i}a`,
+          {},
+          env
+        ),
+        request(
+          `/oauth/authorize?client_id=cid-1&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&state=f${i}b&scope=email`,
+          {},
+          env
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      const byState = Object.fromEntries(
+        Object.values(sessions.data).map((v) => {
+          const p = JSON.parse(v);
+          return [p.state, p.scope];
+        })
+      );
+      expect(byState[`f${i}a`]).toBe('openid');
+      expect(byState[`f${i}b`]).toBe('email');
     });
   }
 });
