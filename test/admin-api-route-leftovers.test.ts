@@ -1,7 +1,14 @@
 /**
- * TOKENMAXX HEAVY leftovers after #157 — admin API soft/edge/reliability.
- * Complements admin-api-routes.test.ts. Tests-only — no product inventing.
+ * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 — admin API
+ * soft/edge/reliability. Complements admin-api-routes.test.ts and
+ * admin-api-concurrent-race leftovers (#239). Tests-only — no product inventing.
  * Fixtures use example.com only.
+ *
+ * Deepen after #241: analytics period soft, synapse destinations/event_reports,
+ * federation status/servers/test, sessions revoke, make/remove-admin edges,
+ * login-token TTL soft, reactivate, quarantine, registration GET, room events,
+ * keys debug, self-purge/self-demote guards — niches present in admin.ts /
+ * admin-api-routes but unsaturated in this leftovers soft flood after #157/#161.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -3641,4 +3648,377 @@ describe('admin leftovers failure edges after #157', () => {
     const res = await jsonReq('/admin/api/config', {}, createEnv({ db: bobOnlyDb() }));
     expect(res.status).toBe(403);
   });
+});
+
+// deepen admin-api route leftovers after #241 (unsaturated soft/edge niches)
+
+describe('admin leftovers analytics period soft flood after #241', () => {
+  const periods = ['1h', '6h', '24h', '7d', 'weird', '', '1h', '6h', '24h', '7d', '1h', '24h'];
+
+  for (let i = 0; i < periods.length; i++) {
+    it(`analytics requests period soft-${i}`, async () => {
+      const q = periods[i] ? `?period=${periods[i]}` : '';
+      const res = await jsonReq(`/_matrix/client/v3/admin/analytics/requests${q}`);
+      expect(res.status).toBe(200);
+      expect(res.body.period).toBe(periods[i] || '1h');
+      expect(typeof res.body.total_events).toBe('number');
+      expect(typeof res.body.active_users).toBe('number');
+      expect(Array.isArray(res.body.events_by_type)).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < periods.length; i++) {
+    it(`analytics federation period soft-${i}`, async () => {
+      const q = periods[i] ? `?period=${periods[i]}` : '';
+      const res = await jsonReq(`/_matrix/client/v3/admin/analytics/federation${q}`);
+      expect(res.status).toBe(200);
+      expect(res.body.period).toBe(periods[i] || '24h');
+      expect(typeof res.body.inbound_events).toBe('number');
+      expect(typeof res.body.outbound_events).toBe('number');
+      expect(typeof res.body.known_servers).toBe('number');
+    });
+  }
+});
+
+describe('admin leftovers synapse destinations/event_reports soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`destinations pagination soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/_synapse/admin/v1/federation/destinations?limit=${1 + (i % 5)}&from=${i % 3}`
+      );
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.destinations)).toBe(true);
+      expect(typeof res.body.total).toBe('number');
+      if ((res.body.destinations as unknown[]).length > 0) {
+        expect((res.body.destinations as Array<{ destination: string }>)[0].destination).toBe(
+          'remote.example.org'
+        );
+      }
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`event_reports filter soft-${i}`, async () => {
+      const dir = i % 2 === 0 ? 'b' : 'f';
+      const roomQ = i % 3 === 0 ? `&room_id=${encodeURIComponent(ROOM)}` : '';
+      const userQ = i % 4 === 0 ? `&user_id=${encodeURIComponent(ADMIN)}` : '';
+      const res = await jsonReq(
+        `/_synapse/admin/v1/event_reports?limit=${2 + (i % 4)}&from=0&dir=${dir}${roomQ}${userQ}`
+      );
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.event_reports)).toBe(true);
+      expect(typeof res.body.total).toBe('number');
+    });
+  }
+});
+
+describe('admin leftovers federation status/servers soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`federation/status soft-${i}`, async () => {
+      const env = createEnv({
+        cache: mockKv(
+          i % 2 === 0
+            ? { server_signing_key: JSON.stringify({ keyId: `ed25519:soft${i}` }) }
+            : {}
+        ),
+      });
+      const res = await jsonReq('/admin/api/federation/status', {}, env);
+      expect(res.status).toBe(200);
+      expect(res.body.server_name).toBe(SERVER);
+      expect(res.body.federation_enabled).toBe(true);
+      expect(typeof res.body.signing_key_id).toBe('string');
+      expect(res.body.known_servers_count).toBe(1);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`federation/servers soft-${i}`, async () => {
+      const res = await jsonReq('/admin/api/federation/servers');
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.servers)).toBe(true);
+      expect((res.body.servers as Array<{ server_name: string }>)[0].server_name).toBe(
+        'remote.example.org'
+      );
+    });
+  }
+});
+
+describe('admin leftovers federation/test soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`federation/test fetch-fail soft-${i}`, async () => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+        throw new Error(`net-soft-${i}`);
+      });
+      const res = await jsonReq('/admin/api/federation/test');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(false);
+      expect((res.body.tests as unknown[]).length).toBe(4);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`federation/test mixed HTTP soft-${i}`, async () => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/.well-known/matrix/server')) {
+          return Response.json({ 'm.server': `${SERVER}:443` });
+        }
+        if (url.includes('/_matrix/key/v2/server')) {
+          return i % 2 === 0
+            ? Response.json({ verify_keys: { 'ed25519:a': { key: 'x' } } })
+            : new Response('nope', { status: 503 });
+        }
+        if (url.includes('/_matrix/federation/v1/version')) {
+          return Response.json({ server: { name: 'matrix-worker', version: 't' } });
+        }
+        if (url.includes('/.well-known/matrix/client')) {
+          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
+        }
+        return new Response('missing', { status: 404 });
+      });
+      const res = await jsonReq('/admin/api/federation/test');
+      expect(res.status).toBe(200);
+      expect((res.body.tests as unknown[]).length).toBe(4);
+      expect(typeof res.body.success).toBe('boolean');
+    });
+  }
+});
+
+describe('admin leftovers sessions soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`sessions list soft-${i}`, async () => {
+      const res = await jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/sessions`);
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.sessions)).toBe(true);
+      expect((res.body.sessions as Array<{ id: string }>)[0].id).toBe('tok-bob');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`sessions revoke-all soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/sessions`,
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(typeof res.body.revoked).toBe('number');
+      expect(db.tokens.every((t) => t.user_id !== BOB)).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`session id revoke soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/admin/api/sessions/tok-bob`,
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.tokens.find((t) => t.token_id === 'tok-bob')).toBeUndefined();
+    });
+  }
+});
+
+describe('admin leftovers make/remove-admin soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`make-admin soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/make-admin',
+        jsonInit('POST', { user_id: BOB }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.users.find((u) => u.user_id === BOB)?.admin).toBe(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`remove-admin soft-${i}`, async () => {
+      const db = createAdminDb({
+        users: [defaultAdmin(), { ...defaultBob(), admin: 1 }],
+      });
+      const res = await jsonReq(
+        '/admin/api/remove-admin',
+        jsonInit('POST', { user_id: BOB }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.users.find((u) => u.user_id === BOB)?.admin).toBe(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`remove-admin self-demote guard soft-${i}`, async () => {
+      const res = await jsonReq(
+        '/admin/api/remove-admin',
+        jsonInit('POST', { user_id: ADMIN })
+      );
+      expect(res.status).toBe(403);
+      expect(res.body.errcode).toBe('M_FORBIDDEN');
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`make-admin missing user_id soft-${i}`, async () => {
+      const res = await jsonReq('/admin/api/make-admin', jsonInit('POST', {}));
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`make-admin bad JSON soft-${i}`, async () => {
+      const res = await jsonReq('/admin/api/make-admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...AUTH },
+        body: '{bad',
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_BAD_JSON');
+    });
+  }
+});
+
+describe('admin leftovers login-token soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`login-token mint soft-${i}`, async () => {
+      const sessions = mockKv();
+      const env = createEnv({ sessions });
+      const ttl = i % 3 === 0 ? undefined : { ttl_minutes: 1 + (i % 5) };
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        ttl === undefined
+          ? { method: 'POST', headers: AUTH }
+          : jsonInit('POST', ttl),
+        env
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.token).toBe('mlt_pinned_login_token');
+      expect(res.body.user_id).toBe(BOB);
+      expect(res.body.homeserver).toBe(SERVER);
+      expect(typeof res.body.ttl_seconds).toBe('number');
+      expect(sessions.puts.length).toBeGreaterThanOrEqual(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`login-token deactivated soft-${i}`, async () => {
+      const db = createAdminDb({
+        users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+      });
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        jsonInit('POST', { ttl_minutes: 5 }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_USER_DEACTIVATED');
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`login-token missing user soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent('@nope:example.com')}/login-token`,
+        jsonInit('POST', {})
+      );
+      expect(res.status).toBe(404);
+    });
+  }
+});
+
+describe('admin leftovers reactivate/quarantine/registration soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`reactivate soft-${i}`, async () => {
+      const db = createAdminDb({
+        users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+      });
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/reactivate`,
+        { method: 'POST', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.users.find((u) => u.user_id === BOB)?.is_deactivated).toBe(0);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`media quarantine soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/admin/api/media/${MEDIA_ID}/quarantine`,
+        { method: 'POST', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.media.find((m) => m.media_id === MEDIA_ID)?.quarantined).toBe(1);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`registration GET soft-${i}`, async () => {
+      const adminDO = createAdminDO({
+        config: { registration_enabled: i % 2 === 0 },
+      });
+      const res = await jsonReq('/admin/api/registration', {}, createEnv({ adminDO }));
+      expect(res.status).toBe(200);
+      expect(res.body.enabled).toBe(i % 2 === 0);
+    });
+  }
+});
+
+describe('admin leftovers room events/keys/self-purge soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`room events browse soft-${i}`, async () => {
+      const before = i % 2 === 0 ? `&before=${Date.now()}` : '';
+      const res = await jsonReq(
+        `/admin/api/rooms/${encodeURIComponent(ROOM)}/events?limit=${5 + (i % 5)}${before}`
+      );
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.events)).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`user keys debug soft-${i}`, async () => {
+      const res = await jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/keys`);
+      expect(res.status).toBe(200);
+      expect(res.body.user_id).toBe(BOB);
+      expect(Array.isArray(res.body.devices) || typeof res.body.devices === 'object').toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`self-purge forbidden soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(ADMIN)}/purge`,
+        { method: 'DELETE', headers: AUTH }
+      );
+      expect(res.status).toBe(403);
+      expect(res.body.errcode).toBe('M_FORBIDDEN');
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`idp providers list soft-${i}`, async () => {
+      const res = await jsonReq('/admin/api/idp/providers');
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.providers)).toBe(true);
+      const providers = res.body.providers as Array<Record<string, unknown>>;
+      expect(providers[0].id).toBe('idp1');
+      expect(providers[0].client_secret_encrypted).toBeUndefined();
+    });
+  }
 });
