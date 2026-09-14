@@ -6,8 +6,9 @@
  * Distinct from quaternary (#297):
  *   backfill / get_missing_events exact Requesting server has no users in this room;
  *   send_join / send_leave exact Event ID mismatch (leave-shaped leave body);
- *   key query exact Too many servers / Invalid server name / No keys found /
- *     No keys found for server / Key not found / Missing server_keys;
+ *   key query exact Too many servers / Invalid server name /
+ *     Server signing key not configured / No keys found for server /
+ *     Key not found (query/:keyId) / Missing server_keys;
  *   directory exact room_alias / Room alias not found;
  *   profile exact user_id / User not found;
  *   timestamp exact Missing required parameter: ts;
@@ -17,11 +18,59 @@
  * No product inventing. Reversible by deleting this file.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
+import { generateSigningKeyPair } from '../src/utils/crypto';
 
 const FED_ORIGIN = 'remote.example.com';
 let federationOrigin: string | undefined = FED_ORIGIN;
+
+/** Remap Cloudflare NODE-ED25519 → Node Ed25519 for unit tests. */
+function installNodeEd25519Shim() {
+  const subtle = crypto.subtle;
+  const origGenerateKey = subtle.generateKey.bind(subtle);
+  const origImportKey = subtle.importKey.bind(subtle);
+  const origSign = subtle.sign.bind(subtle);
+  const origVerify = subtle.verify.bind(subtle);
+
+  const mapAlg = (
+    alg: AlgorithmIdentifier | EcKeyGenParams | EcKeyImportParams | EcdsaParams | unknown
+  ): AlgorithmIdentifier => {
+    if (typeof alg === 'string') {
+      return alg === 'NODE-ED25519' ? 'Ed25519' : alg;
+    }
+    if (alg && typeof alg === 'object' && (alg as { name?: string }).name === 'NODE-ED25519') {
+      return 'Ed25519';
+    }
+    return alg as AlgorithmIdentifier;
+  };
+
+  subtle.generateKey = ((alg: AlgorithmIdentifier, extractable: boolean, usages: KeyUsage[]) =>
+    origGenerateKey(mapAlg(alg), extractable, usages)) as typeof subtle.generateKey;
+  subtle.importKey = ((
+    format: KeyFormat,
+    keyData: BufferSource | JsonWebKey,
+    alg: AlgorithmIdentifier,
+    extractable: boolean,
+    usages: KeyUsage[]
+  ) =>
+    origImportKey(format, keyData, mapAlg(alg), extractable, usages)) as typeof subtle.importKey;
+  subtle.sign = ((alg: AlgorithmIdentifier, key: CryptoKey, data: BufferSource) =>
+    origSign(mapAlg(alg), key, data)) as typeof subtle.sign;
+  subtle.verify = ((
+    alg: AlgorithmIdentifier,
+    key: CryptoKey,
+    signature: BufferSource,
+    data: BufferSource
+  ) => origVerify(mapAlg(alg), key, signature, data)) as typeof subtle.verify;
+
+  return () => {
+    subtle.generateKey = origGenerateKey;
+    subtle.importKey = origImportKey;
+    subtle.sign = origSign;
+    subtle.verify = origVerify;
+  };
+}
 
 vi.mock('../src/middleware/federation-auth', () => ({
   requireFederationAuth: () => {
@@ -1053,58 +1102,73 @@ describe('soft quinary federation membership/keys/query exact after #310', () =>
   }
 
   for (let i = 0; i < 12; i++) {
-    it(`own-server No keys found exact flood-${i}`, async () => {
+    it(`query Server signing key not configured exact flood-${i}`, async () => {
       const db = createFedDb({ serverKeys: [] });
       const env = makeEnv(db);
       const res = await req('GET', `/_matrix/key/v2/query/${encodeURIComponent(SERVER)}`, env);
-      expect(res.status).toBe(404);
-      expect((res.body as { errcode: string; error: string }).errcode).toBe('M_NOT_FOUND');
-      expect((res.body as { error: string }).error).toBe('No keys found');
+      expect(res.status).toBe(500);
+      expect((res.body as { errcode: string; error: string }).errcode).toBe('M_UNKNOWN');
+      expect((res.body as { error: string }).error).toBe('Server signing key not configured');
     });
   }
 
-  for (let i = 0; i < 12; i++) {
-    it(`remote No keys found for server exact flood-${i}`, async () => {
-      getRemoteKeysWithNotarySignature.mockResolvedValue([]);
-      const db = createFedDb();
-      const env = makeEnv(db);
-      const res = await req(
-        'GET',
-        `/_matrix/key/v2/query/${encodeURIComponent('remote.example.com')}`,
-        env
-      );
-      expect(res.status).toBe(404);
-      expect((res.body as { errcode: string; error: string }).errcode).toBe('M_NOT_FOUND');
-      expect((res.body as { error: string }).error).toBe('No keys found for server');
-    });
-  }
+  describe('soft quinary federation notary-gated key exact after #310', () => {
+    let restore: (() => void) | undefined;
+    let serverKeyPair: Awaited<ReturnType<typeof generateSigningKeyPair>>;
 
-  for (let i = 0; i < 12; i++) {
-    it(`own Key not found exact flood-${i}`, async () => {
-      const db = createFedDb({
+    beforeAll(async () => {
+      restore = installNodeEd25519Shim();
+      serverKeyPair = await generateSigningKeyPair();
+    });
+    afterAll(() => restore?.());
+
+    function notaryDb(extra: FedDbOptions = {}) {
+      return createFedDb({
+        ...extra,
         serverKeys: [
           {
-            key_id: 'ed25519:present',
-            public_key: 'pk',
-            private_key_jwk: null,
-            key_version: 1,
-            valid_from: 1,
-            valid_until: null,
+            key_id: serverKeyPair.keyId,
+            public_key: serverKeyPair.publicKey,
+            private_key_jwk: JSON.stringify(serverKeyPair.privateKeyJwk),
+            key_version: 2,
+            valid_from: Date.now() - 1000,
+            valid_until: Date.now() + 86_400_000,
             is_current: 1,
           },
+          ...(extra.serverKeys ?? []),
         ],
       });
-      const env = makeEnv(db);
-      const res = await req(
-        'GET',
-        `/_matrix/key/v2/query/${encodeURIComponent(SERVER)}/${encodeURIComponent('ed25519:missing')}`,
-        env
-      );
-      expect(res.status).toBe(404);
-      expect((res.body as { errcode: string; error: string }).errcode).toBe('M_NOT_FOUND');
-      expect((res.body as { error: string }).error).toBe('Key not found');
-    });
-  }
+    }
+
+    for (let i = 0; i < 12; i++) {
+      it(`remote No keys found for server exact flood-${i}`, async () => {
+        getRemoteKeysWithNotarySignature.mockResolvedValue([]);
+        const env = makeEnv(notaryDb());
+        const res = await req(
+          'GET',
+          `/_matrix/key/v2/query/${encodeURIComponent('remote.example.com')}`,
+          env
+        );
+        expect(res.status).toBe(404);
+        expect((res.body as { errcode: string; error: string }).errcode).toBe('M_NOT_FOUND');
+        expect((res.body as { error: string }).error).toBe('No keys found for server');
+      });
+    }
+
+    for (let i = 0; i < 12; i++) {
+      it(`own Key not found exact flood-${i}`, async () => {
+        const env = makeEnv(notaryDb());
+        const res = await req(
+          'GET',
+          `/_matrix/key/v2/query/${encodeURIComponent(SERVER)}/${encodeURIComponent('ed25519:missing')}`,
+          env
+        );
+        expect(res.status).toBe(404);
+        expect((res.body as { errcode: string; error: string }).errcode).toBe('M_NOT_FOUND');
+        expect((res.body as { error: string }).error).toBe('Key not found');
+      });
+    }
+  });
 
   for (let i = 0; i < 12; i++) {
     it(`POST query missing server_keys exact flood-${i}`, async () => {
@@ -1346,46 +1410,60 @@ describe('race quinary federation membership/keys/query exact after #310', () =>
     );
   });
 
-  it('Invalid server name∥own No keys found isolation', async () => {
+  it('Invalid server name∥Server signing key not configured isolation', async () => {
     const db = createFedDb({ serverKeys: [] });
     const env = makeEnv(db);
-    const [invalid, none] = await Promise.all([
+    const [invalid, noNotary] = await Promise.all([
       req('GET', '/_matrix/key/v2/query/localhost', env),
       req('GET', `/_matrix/key/v2/query/${encodeURIComponent(SERVER)}`, env),
     ]);
     expect(invalid.status).toBe(400);
     expect((invalid.body as { error: string }).error).toBe('Invalid server name');
-    expect(none.status).toBe(404);
-    expect((none.body as { error: string }).error).toBe('No keys found');
+    expect(noNotary.status).toBe(500);
+    expect((noNotary.body as { error: string }).error).toBe('Server signing key not configured');
   });
 
-  it('remote No keys found for server∥Key not found isolation', async () => {
-    getRemoteKeysWithNotarySignature.mockResolvedValue([]);
-    const db = createFedDb({
-      serverKeys: [
-        {
-          key_id: 'ed25519:a',
-          public_key: 'pk',
-          private_key_jwk: null,
-          key_version: 1,
-          valid_from: 1,
-          valid_until: null,
-          is_current: 1,
-        },
-      ],
+  describe('race quinary federation notary-gated key exact after #310', () => {
+    let restore: (() => void) | undefined;
+    let serverKeyPair: Awaited<ReturnType<typeof generateSigningKeyPair>>;
+
+    beforeAll(async () => {
+      restore = installNodeEd25519Shim();
+      serverKeyPair = await generateSigningKeyPair();
     });
-    const env = makeEnv(db);
-    const [remote, missingKey] = await Promise.all([
-      req('GET', '/_matrix/key/v2/query/remote.example.com', env),
-      req(
-        'GET',
-        `/_matrix/key/v2/query/${encodeURIComponent(SERVER)}/${encodeURIComponent('ed25519:nope')}`,
-        env
-      ),
-    ]);
-    expect(statusesOf([remote, missingKey])).toEqual([404, 404]);
-    expect((remote.body as { error: string }).error).toBe('No keys found for server');
-    expect((missingKey.body as { error: string }).error).toBe('Key not found');
+    afterAll(() => restore?.());
+
+    function notaryDb() {
+      return createFedDb({
+        serverKeys: [
+          {
+            key_id: serverKeyPair.keyId,
+            public_key: serverKeyPair.publicKey,
+            private_key_jwk: JSON.stringify(serverKeyPair.privateKeyJwk),
+            key_version: 2,
+            valid_from: Date.now() - 1000,
+            valid_until: Date.now() + 86_400_000,
+            is_current: 1,
+          },
+        ],
+      });
+    }
+
+    it('remote No keys found for server∥Key not found isolation', async () => {
+      getRemoteKeysWithNotarySignature.mockResolvedValue([]);
+      const env = makeEnv(notaryDb());
+      const [remote, missingKey] = await Promise.all([
+        req('GET', '/_matrix/key/v2/query/remote.example.com', env),
+        req(
+          'GET',
+          `/_matrix/key/v2/query/${encodeURIComponent(SERVER)}/${encodeURIComponent('ed25519:nope')}`,
+          env
+        ),
+      ]);
+      expect(statusesOf([remote, missingKey])).toEqual([404, 404]);
+      expect((remote.body as { error: string }).error).toBe('No keys found for server');
+      expect((missingKey.body as { error: string }).error).toBe('Key not found');
+    });
   });
 
   it('directory missing room_alias∥Room alias not found isolation', async () => {
