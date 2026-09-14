@@ -1,10 +1,11 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
- * / residual after #265 / second-wave residual after tip #271 (post-#270) —
- * federation S2S soft/edge/reliability (non-catchup). Complements
- * federation-api-routes.test.ts and federation-api-concurrent-race leftovers
- * (#239/#248/#265/#270). Tests-only — no product inventing. Fixtures use
- * example.com only. Skips FederationCatchupWorkflow (#249/#250).
+ * / residual after #265 / second-wave residual after tip #271 (post-#270) /
+ * tertiary residual after tip #275 (post-#275 second-wave) — federation S2S
+ * soft/edge/reliability (non-catchup). Complements federation-api-routes.test.ts
+ * and federation-api-concurrent-race leftovers (#239/#248/#265/#270/#275).
+ * Tests-only — no product inventing. Fixtures use example.com only. Skips
+ * FederationCatchupWorkflow (#249/#250).
  *
  * Deepen after #241: hierarchy, timestamp_to_event, event_auth, backfill,
  * get_missing_events, media/thumbnail soft floods — present in federation.ts /
@@ -26,6 +27,12 @@
  * Event authorization failed / DB Auth failed; pdus.unknown; openid success
  * sub+token-retained; missing federationOrigin 401; hierarchy suggested_only
  * absent returns non-suggested children.
+ *
+ * Tertiary residual after tip #275 (post-#275 second-wave, skip catchup):
+ * invite v1/v2 exact validation strings (not-invite, mismatch, wrong-origin,
+ * bad state_key, not-local, user-missing, no signing key); v2 missing
+ * room_version/event + Unsupported room version; v1/v2 success shapes —
+ * base routes assert status/errcode only; leftovers soft floods never did.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -3904,6 +3911,287 @@ describe('soft second-wave openid retained / missing-origin / hierarchy nonsugge
       const childIds = body.children.map((c) => c.room_id);
       expect(childIds).toContain('!sug:example.com');
       expect(childIds).not.toContain('!plain:example.com');
+    });
+  }
+});
+
+// tertiary residual soft floods after tip #275 (invite validation niches unsaturated)
+
+describe('soft tertiary invite v1 exact validation after #275', () => {
+  let restore: (() => void) | undefined;
+  let serverKeyPair: Awaited<ReturnType<typeof generateSigningKeyPair>>;
+
+  beforeAll(async () => {
+    restore = installNodeEd25519Shim();
+    serverKeyPair = await generateSigningKeyPair();
+  });
+  afterAll(() => restore?.());
+
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+  });
+
+  function inviteEnv(extra: Parameters<typeof createFedDb>[0] = {}) {
+    return makeEnv(
+      createFedDb({
+        users: [{ user_id: LOCAL_USER }],
+        serverKeys: [
+          {
+            key_id: serverKeyPair.keyId,
+            public_key: serverKeyPair.publicKey,
+            private_key_jwk: JSON.stringify(serverKeyPair.privateKeyJwk),
+            key_version: 2,
+            valid_from: 1,
+            valid_until: Date.now() + 100_000,
+            is_current: 1,
+          },
+        ],
+        ...extra,
+      })
+    );
+  }
+
+  function invitePath(eventId: string) {
+    return `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent(eventId)}`;
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`v1 not-invite soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$ni${i}`), inviteEnv(), {
+        type: 'm.room.member',
+        content: { membership: 'join' },
+        sender: REMOTE_USER,
+        state_key: LOCAL_USER,
+      });
+      expect(r.status).toBe(400);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_INVALID_PARAM');
+      expect((r.body as { error: string }).error).toBe('Event is not an invite event');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v1 event_id mismatch soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$want${i}`), inviteEnv(), {
+        event_id: `$other${i}`,
+        type: 'm.room.member',
+        content: { membership: 'invite' },
+        sender: REMOTE_USER,
+        state_key: LOCAL_USER,
+      });
+      expect(r.status).toBe(400);
+      expect((r.body as { error: string }).error).toBe('Event ID mismatch');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v1 wrong-origin soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$wo${i}`), inviteEnv(), {
+        type: 'm.room.member',
+        content: { membership: 'invite' },
+        sender: '@eve:evil.example.com',
+        state_key: LOCAL_USER,
+      });
+      expect(r.status).toBe(403);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_FORBIDDEN');
+      expect((r.body as { error: string }).error).toBe(
+        'Sender does not belong to the authenticated origin server'
+      );
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v1 bad state_key soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$bs${i}`), inviteEnv(), {
+        type: 'm.room.member',
+        content: { membership: 'invite' },
+        sender: REMOTE_USER,
+        state_key: 'bad',
+      });
+      expect(r.status).toBe(400);
+      expect((r.body as { error: string }).error).toBe('Invalid state_key for invite');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v1 not-local soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$nl${i}`), inviteEnv(), {
+        type: 'm.room.member',
+        content: { membership: 'invite' },
+        sender: REMOTE_USER,
+        state_key: '@x:other.com',
+      });
+      expect(r.status).toBe(403);
+      expect((r.body as { error: string }).error).toBe('User is not local to this server');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v1 user-missing soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$um${i}`), inviteEnv({ users: [] }), {
+        type: 'm.room.member',
+        content: { membership: 'invite' },
+        sender: REMOTE_USER,
+        state_key: LOCAL_USER,
+      });
+      expect(r.status).toBe(404);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_NOT_FOUND');
+      expect((r.body as { error: string }).error).toBe('User not found');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v1 no signing key soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$nk${i}`), inviteEnv({ serverKeys: [] }), {
+        type: 'm.room.member',
+        content: { membership: 'invite' },
+        sender: REMOTE_USER,
+        state_key: LOCAL_USER,
+      });
+      expect(r.status).toBe(500);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_UNKNOWN');
+      expect((r.body as { error: string }).error).toBe('Server signing key not configured');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v1 success [200, signed] soft-${i}`, async () => {
+      const eid = `$iok${i}`;
+      const r = await req('PUT', invitePath(eid), inviteEnv(), {
+        event: {
+          event_id: eid,
+          type: 'm.room.member',
+          content: { membership: 'invite' },
+          sender: REMOTE_USER,
+          state_key: LOCAL_USER,
+        },
+      });
+      expect(r.status).toBe(200);
+      expect(Array.isArray(r.body)).toBe(true);
+      const tuple = r.body as [number, { signatures?: unknown; event_id?: string }];
+      expect(tuple[0]).toBe(200);
+      expect(tuple[1].signatures).toBeDefined();
+      expect(tuple[1].event_id).toBe(eid);
+    });
+  }
+});
+
+describe('soft tertiary invite v2 exact validation after #275', () => {
+  let restore: (() => void) | undefined;
+  let serverKeyPair: Awaited<ReturnType<typeof generateSigningKeyPair>>;
+
+  beforeAll(async () => {
+    restore = installNodeEd25519Shim();
+    serverKeyPair = await generateSigningKeyPair();
+  });
+  afterAll(() => restore?.());
+
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+  });
+
+  function inviteEnv(extra: Parameters<typeof createFedDb>[0] = {}) {
+    return makeEnv(
+      createFedDb({
+        users: [{ user_id: LOCAL_USER }],
+        serverKeys: [
+          {
+            key_id: serverKeyPair.keyId,
+            public_key: serverKeyPair.publicKey,
+            private_key_jwk: JSON.stringify(serverKeyPair.privateKeyJwk),
+            key_version: 2,
+            valid_from: 1,
+            valid_until: Date.now() + 100_000,
+            is_current: 1,
+          },
+        ],
+        ...extra,
+      })
+    );
+  }
+
+  function invitePath(eventId: string) {
+    return `/_matrix/federation/v2/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent(eventId)}`;
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v2 missing room_version soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$nrv${i}`), inviteEnv(), {
+        event: {
+          type: 'm.room.member',
+          content: { membership: 'invite' },
+          sender: REMOTE_USER,
+          state_key: LOCAL_USER,
+        },
+      });
+      expect(r.status).toBe(400);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_MISSING_PARAM');
+      expect((r.body as { error: string }).error).toBe('Missing required parameter: room_version');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v2 missing event soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$ne${i}`), inviteEnv(), {
+        room_version: '10',
+      });
+      expect(r.status).toBe(400);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_MISSING_PARAM');
+      expect((r.body as { error: string }).error).toBe('Missing required parameter: event');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v2 Unsupported room version soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$uv${i}`), inviteEnv(), {
+        room_version: '99',
+        event: {
+          type: 'm.room.member',
+          content: { membership: 'invite' },
+          sender: REMOTE_USER,
+          state_key: LOCAL_USER,
+        },
+      });
+      expect(r.status).toBe(400);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe(
+        'M_INCOMPATIBLE_ROOM_VERSION'
+      );
+      expect((r.body as { error: string }).error).toBe('Unsupported room version: 99');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v2 not-invite soft-${i}`, async () => {
+      const r = await req('PUT', invitePath(`$v2ni${i}`), inviteEnv(), {
+        room_version: '10',
+        event: {
+          type: 'm.room.member',
+          content: { membership: 'leave' },
+          sender: REMOTE_USER,
+          state_key: LOCAL_USER,
+        },
+      });
+      expect(r.status).toBe(400);
+      expect((r.body as { error: string }).error).toBe('Event is not an invite event');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`v2 success {event:signed} soft-${i}`, async () => {
+      const eid = `$iv2ok${i}`;
+      const r = await req('PUT', invitePath(eid), inviteEnv(), {
+        room_version: '10',
+        event: {
+          event_id: eid,
+          type: 'm.room.member',
+          content: { membership: 'invite' },
+          sender: REMOTE_USER,
+          state_key: LOCAL_USER,
+        },
+      });
+      expect(r.status).toBe(200);
+      const body = r.body as { event: { signatures?: unknown; event_id?: string } };
+      expect(body.event.signatures).toBeDefined();
+      expect(body.event.event_id).toBe(eid);
     });
   }
 });

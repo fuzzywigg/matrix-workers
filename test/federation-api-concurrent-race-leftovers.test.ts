@@ -1,12 +1,13 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
  * / residual after #252 / residual after #265 / second-wave residual after tip
- * #271 (post-#270) — federation-api concurrent race / TOCTOU for leftover S2S
- * routes (non-catchup) that only had serial soft floods (#157 leftover).
- * Distinct from federation-keys-membership-account-data concurrent-race
- * (OTK / make_join) and federation-api-route-leftovers (serial floods).
- * Distinct from tip #241/#239/#265/#270 prior deepens. Skip catchup residual
- * covered by #249/#250.
+ * #271 (post-#270) / tertiary residual after tip #275 (post-#275 second-wave)
+ * — federation-api concurrent race / TOCTOU for leftover S2S routes
+ * (non-catchup) that only had serial soft floods (#157 leftover). Distinct from
+ * federation-keys-membership-account-data concurrent-race (OTK / make_join) and
+ * federation-api-route-leftovers (serial floods). Distinct from tip
+ * #241/#239/#265/#270/#275 prior deepens. Skip catchup residual covered by
+ * #249/#250.
  *
  * Residual after #241: hierarchy∥timestamp∥backfill triple; thumbnail∥download;
  * event_auth∥get_missing isolation; version∥publicRooms — soft-flooded in
@@ -23,6 +24,10 @@
  * Second-wave residual after tip #271 (post-#270, skip catchup): legacy-v1∥
  * missing-hash-v10; Cache-Control-hit∥octet-stream; typing∥noop EDU;
  * custom-reject∥auth-fallback; openid success∥invalid; missing-origin∥empty-send.
+ *
+ * Tertiary residual after tip #275 (post-#275 second-wave, skip catchup):
+ * invite not-invite∥signed-ok; not-local∥v2 bad-version; no-key∥ok serial dual;
+ * v2 missing-param∥v1 mismatch — invite exact-string soft niches not dual-raced.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -3062,6 +3067,262 @@ describe('race second-wave Cache-Control∥octet / typing∥noop / openid / orig
       expect(statusesOf(results)).toEqual([200, 200]);
       expect(results[0].headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
       expect(results[1].body).toEqual({ sub: LOCAL_USER });
+    });
+  }
+});
+
+// tertiary residual concurrent races after tip #275 (invite soft niches not dual-raced)
+
+describe('race tertiary invite not-invite∥ok / not-local∥bad-version / no-key after #275', () => {
+  let restore: (() => void) | undefined;
+  let serverKeyPair: Awaited<ReturnType<typeof generateSigningKeyPair>>;
+
+  beforeAll(async () => {
+    restore = installNodeEd25519Shim();
+    serverKeyPair = await generateSigningKeyPair();
+  });
+  afterAll(() => restore?.());
+
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+  });
+
+  function inviteEnv(extra: Parameters<typeof createFedDb>[0] = {}) {
+    return makeEnv(
+      createFedDb({
+        users: [{ user_id: LOCAL_USER }],
+        serverKeys: [
+          {
+            key_id: serverKeyPair.keyId,
+            public_key: serverKeyPair.publicKey,
+            private_key_jwk: JSON.stringify(serverKeyPair.privateKeyJwk),
+            key_version: 2,
+            valid_from: 1,
+            valid_until: Date.now() + 100_000,
+            is_current: 1,
+          },
+        ],
+        ...extra,
+      })
+    );
+  }
+
+  it('v1 not-invite∥signed-ok isolation', async () => {
+    const env = inviteEnv();
+    const eid = '$race_ok';
+    const [bad, ok] = await Promise.all([
+      req(
+        'PUT',
+        `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent('$race_ni')}`,
+        env,
+        {
+          type: 'm.room.member',
+          content: { membership: 'join' },
+          sender: REMOTE_USER,
+          state_key: LOCAL_USER,
+        }
+      ),
+      req(
+        'PUT',
+        `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent(eid)}`,
+        env,
+        {
+          event: {
+            event_id: eid,
+            type: 'm.room.member',
+            content: { membership: 'invite' },
+            sender: REMOTE_USER,
+            state_key: LOCAL_USER,
+          },
+        }
+      ),
+    ]);
+    expect(bad.status).toBe(400);
+    expect((bad.body as { error: string }).error).toBe('Event is not an invite event');
+    expect(ok.status).toBe(200);
+    expect(Array.isArray(ok.body)).toBe(true);
+    expect((ok.body as [number, { signatures: unknown }])[0]).toBe(200);
+    expect((ok.body as [number, { signatures: unknown }])[1].signatures).toBeDefined();
+  });
+
+  it('v1 not-local∥v2 Unsupported room version isolation', async () => {
+    const env = inviteEnv();
+    const [notLocal, badVer] = await Promise.all([
+      req(
+        'PUT',
+        `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent('$race_nl')}`,
+        env,
+        {
+          type: 'm.room.member',
+          content: { membership: 'invite' },
+          sender: REMOTE_USER,
+          state_key: '@x:other.com',
+        }
+      ),
+      req(
+        'PUT',
+        `/_matrix/federation/v2/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent('$race_uv')}`,
+        env,
+        {
+          room_version: '99',
+          event: {
+            type: 'm.room.member',
+            content: { membership: 'invite' },
+            sender: REMOTE_USER,
+            state_key: LOCAL_USER,
+          },
+        }
+      ),
+    ]);
+    expect(notLocal.status).toBe(403);
+    expect((notLocal.body as { error: string }).error).toBe('User is not local to this server');
+    expect(badVer.status).toBe(400);
+    expect((badVer.body as { error: string }).error).toBe('Unsupported room version: 99');
+  });
+
+  it('v1 no-key then signed-ok serial dual', async () => {
+    const a = await req(
+      'PUT',
+      `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent('$race_nk')}`,
+      inviteEnv({ serverKeys: [] }),
+      {
+        type: 'm.room.member',
+        content: { membership: 'invite' },
+        sender: REMOTE_USER,
+        state_key: LOCAL_USER,
+      }
+    );
+    expect(a.status).toBe(500);
+    expect((a.body as { error: string }).error).toBe('Server signing key not configured');
+
+    const eid = '$race_serial_ok';
+    const b = await req(
+      'PUT',
+      `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent(eid)}`,
+      inviteEnv(),
+      {
+        event: {
+          event_id: eid,
+          type: 'm.room.member',
+          content: { membership: 'invite' },
+          sender: REMOTE_USER,
+          state_key: LOCAL_USER,
+        },
+      }
+    );
+    expect(b.status).toBe(200);
+    expect((b.body as [number, unknown])[0]).toBe(200);
+  });
+
+  it('v2 missing room_version∥v1 event_id mismatch isolation', async () => {
+    const env = inviteEnv();
+    const [missingRv, mismatch] = await Promise.all([
+      req(
+        'PUT',
+        `/_matrix/federation/v2/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent('$race_nrv')}`,
+        env,
+        {
+          event: {
+            type: 'm.room.member',
+            content: { membership: 'invite' },
+            sender: REMOTE_USER,
+            state_key: LOCAL_USER,
+          },
+        }
+      ),
+      req(
+        'PUT',
+        `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent('$want')}`,
+        env,
+        {
+          event_id: '$other',
+          type: 'm.room.member',
+          content: { membership: 'invite' },
+          sender: REMOTE_USER,
+          state_key: LOCAL_USER,
+        }
+      ),
+    ]);
+    expect(missingRv.status).toBe(400);
+    expect((missingRv.body as { error: string }).error).toBe(
+      'Missing required parameter: room_version'
+    );
+    expect(mismatch.status).toBe(400);
+    expect((mismatch.body as { error: string }).error).toBe('Event ID mismatch');
+  });
+
+  it('v2 success∥v1 wrong-origin isolation', async () => {
+    const env = inviteEnv();
+    const eid = '$race_v2ok';
+    const [ok, wrong] = await Promise.all([
+      req(
+        'PUT',
+        `/_matrix/federation/v2/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent(eid)}`,
+        env,
+        {
+          room_version: '10',
+          event: {
+            event_id: eid,
+            type: 'm.room.member',
+            content: { membership: 'invite' },
+            sender: REMOTE_USER,
+            state_key: LOCAL_USER,
+          },
+        }
+      ),
+      req(
+        'PUT',
+        `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent('$race_wo')}`,
+        env,
+        {
+          type: 'm.room.member',
+          content: { membership: 'invite' },
+          sender: '@eve:evil.example.com',
+          state_key: LOCAL_USER,
+        }
+      ),
+    ]);
+    expect(ok.status).toBe(200);
+    expect((ok.body as { event: { signatures: unknown } }).event.signatures).toBeDefined();
+    expect(wrong.status).toBe(403);
+    expect((wrong.body as { error: string }).error).toBe(
+      'Sender does not belong to the authenticated origin server'
+    );
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`invite tertiary residual flood-${i}`, async () => {
+      const env = inviteEnv();
+      const results = await Promise.all([
+        req(
+          'PUT',
+          `/_matrix/federation/v1/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$fni${i}`)}`,
+          env,
+          {
+            type: 'm.room.member',
+            content: { membership: 'join' },
+            sender: REMOTE_USER,
+            state_key: LOCAL_USER,
+          }
+        ),
+        req(
+          'PUT',
+          `/_matrix/federation/v2/invite/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$fuv${i}`)}`,
+          env,
+          {
+            room_version: '99',
+            event: {
+              type: 'm.room.member',
+              content: { membership: 'invite' },
+              sender: REMOTE_USER,
+              state_key: LOCAL_USER,
+            },
+          }
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([400, 400]);
+      expect((results[0].body as { error: string }).error).toBe('Event is not an invite event');
+      expect((results[1].body as { error: string }).error).toBe('Unsupported room version: 99');
     });
   }
 });

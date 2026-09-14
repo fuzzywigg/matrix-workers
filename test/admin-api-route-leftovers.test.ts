@@ -1,8 +1,9 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
- * / residual after #265 / second-wave residual after tip #271 (post-#270) —
- * admin API soft/edge/reliability. Complements admin-api-routes.test.ts and
- * admin-api-concurrent-race leftovers (#239/#248/#265/#270). Tests-only —
+ * / residual after #265 / second-wave residual after tip #271 (post-#270) /
+ * tertiary residual after tip #275 (post-#275 second-wave) — admin API
+ * soft/edge/reliability. Complements admin-api-routes.test.ts and
+ * admin-api-concurrent-race leftovers (#239/#248/#265/#270/#275). Tests-only —
  * no product inventing. Fixtures use example.com only.
  *
  * Deepen after #241: analytics period soft, synapse destinations/event_reports,
@@ -25,6 +26,12 @@
  * No-changes / DELETE 404 / unlink message; server-notice devices_notified:0;
  * unresolve 404; keys reason ladder soft; reset_password omit logout_devices;
  * PUT deactivated:true; DELETE deactivate.
+ *
+ * Tertiary residual after tip #275 (post-#275 second-wave): IdP create success /
+ * missing-param / INSERT-fail; PUT updated; DELETE deleted; GET/PUT/test 404
+ * exact "Identity provider not found"; POST /test Connection successful +
+ * discovery-fail success:false — success/test niches unsaturated after #275
+ * failure/empty soft floods.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -410,6 +417,7 @@ function createAdminDb(opts: {
   streamPositions?: Record<string, number>;
   knownServersCount?: number;
   nullCounts?: boolean;
+  failIdpInsert?: boolean;
 } = {}) {
   const users = opts.users ?? [defaultAdmin(), defaultBob()];
   const devices = opts.devices ?? [
@@ -1573,6 +1581,9 @@ function createAdminDb(opts: {
                 }
               }
               if (sql.includes('INSERT INTO idp_providers')) {
+                if (opts.failIdpInsert) {
+                  throw new Error('simulated idp insert failure');
+                }
                 idpProviders.push({
                   id: args[0] as string,
                   name: args[1] as string,
@@ -4821,6 +4832,202 @@ describe('admin second-wave PUT deactivated / DELETE deactivate soft after #271'
       expect(db.users.find((u) => u.user_id === BOB)?.is_deactivated).toBe(1);
       expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(0);
       expect(db.audit.some((a) => a.action === 'user.deactivate')).toBe(true);
+    });
+  }
+});
+
+// tertiary residual soft floods after tip #275 (post-#275 second-wave niches unsaturated)
+
+describe('admin tertiary IdP create success / missing-param / INSERT-fail soft after #275', () => {
+  const MISSING =
+    'Missing required parameter: name, issuer_url, client_id, and client_secret are required';
+
+  for (let i = 0; i < 10; i++) {
+    it(`idp POST create success soft-${i}`, async () => {
+      const db = createAdminDb({ idpProviders: [] });
+      const res = await jsonReq(
+        '/admin/api/idp/providers',
+        jsonInit('POST', {
+          name: `OkIdP-${i}`,
+          issuer_url: `https://idp-ok-${i}.example.com/`,
+          client_id: `cid-ok-${i}`,
+          client_secret: `sec-ok-${i}`,
+        }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        success: true,
+        id: 'idp-opaque-12',
+        message: 'Identity provider created successfully',
+      });
+      expect(db.idpProviders).toHaveLength(1);
+      expect(db.idpProviders[0].name).toBe(`OkIdP-${i}`);
+      expect(db.idpProviders[0].issuer_url).toBe(`https://idp-ok-${i}.example.com`);
+      expect(db.idpProviders[0].client_secret_encrypted).toBe(`enc:sec-ok-${i}`);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp POST missing-param soft-${i}`, async () => {
+      const bodies = [
+        { issuer_url: 'https://idp.example.com', client_id: 'c', client_secret: 's' },
+        { name: 'n', client_id: 'c', client_secret: 's' },
+        { name: 'n', issuer_url: 'https://idp.example.com', client_secret: 's' },
+        { name: 'n', issuer_url: 'https://idp.example.com', client_id: 'c' },
+      ];
+      const res = await jsonReq(
+        '/admin/api/idp/providers',
+        jsonInit('POST', bodies[i % bodies.length]),
+        createEnv({ db: createAdminDb({ idpProviders: [] }) })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+      expect(res.body.error).toBe(MISSING);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp POST INSERT-fail soft-${i}`, async () => {
+      const db = createAdminDb({ idpProviders: [], failIdpInsert: true });
+      const res = await jsonReq(
+        '/admin/api/idp/providers',
+        jsonInit('POST', {
+          name: `FailIdP-${i}`,
+          issuer_url: `https://idp-fail-${i}.example.com`,
+          client_id: `cid-fail-${i}`,
+          client_secret: `sec-fail-${i}`,
+        }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({
+        errcode: 'M_UNKNOWN',
+        error: 'Failed to create identity provider',
+      });
+      expect(db.idpProviders).toHaveLength(0);
+    });
+  }
+});
+
+describe('admin tertiary IdP update / delete / 404 exact / test soft after #275', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`idp PUT updated soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/idp/providers/idp1',
+        jsonInit('PUT', { name: `GitHub-upd-${i}`, enabled: i % 2 === 0 }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, message: 'Identity provider updated' });
+      expect(db.idpProviders.find((p) => p.id === 'idp1')?.name).toBe(`GitHub-upd-${i}`);
+      expect(db.updates.some((u) => String(u.sql).includes('UPDATE idp_providers SET'))).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp DELETE deleted soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/idp/providers/idp1',
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, message: 'Identity provider deleted' });
+      expect(db.idpProviders.some((p) => p.id === 'idp1')).toBe(false);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp GET 404 exact soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/idp/providers/missing-get-${i}`,
+        {},
+        createEnv({ db: createAdminDb({ idpProviders: [] }) })
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+      expect(res.body.error).toBe('Identity provider not found');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp PUT 404 exact soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/idp/providers/missing-put-${i}`,
+        jsonInit('PUT', { name: `x-${i}` }),
+        createEnv({ db: createAdminDb({ idpProviders: [] }) })
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+      expect(res.body.error).toBe('Identity provider not found');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp test 404 exact soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/idp/providers/missing-test-${i}/test`,
+        { method: 'POST', headers: AUTH },
+        createEnv({ db: createAdminDb({ idpProviders: [] }) })
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+      expect(res.body.error).toBe('Identity provider not found');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`idp test Connection successful soft-${i}`, async () => {
+      const res = await jsonReq(
+        '/admin/api/idp/providers/idp1/test',
+        { method: 'POST', headers: AUTH },
+        createEnv({ db: createAdminDb() })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toBe('Connection successful');
+      expect(res.body.discovery).toEqual({
+        issuer: 'https://idp.example.com',
+        authorization_endpoint: 'https://idp.example.com/authorize',
+        token_endpoint: 'https://idp.example.com/token',
+        userinfo_endpoint: 'https://idp.example.com/userinfo',
+        jwks_uri: 'https://idp.example.com/jwks',
+      });
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp test discovery-fail success:false soft-${i}`, async () => {
+      const db = createAdminDb({
+        idpProviders: [
+          {
+            id: 'badidp',
+            name: 'Bad',
+            issuer_url: `https://bad-issuer-test-${i}.example.com`,
+            client_id: 'cid',
+            client_secret_encrypted: 'enc:s',
+            scopes: 'openid',
+            enabled: 1,
+            auto_create_users: 1,
+            username_claim: 'email',
+            display_order: 0,
+            icon_url: null,
+            created_at: 1,
+            updated_at: 1,
+          },
+        ],
+      });
+      const res = await jsonReq(
+        '/admin/api/idp/providers/badidp/test',
+        { method: 'POST', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(String(res.body.error)).toContain('discovery failed');
     });
   }
 });
