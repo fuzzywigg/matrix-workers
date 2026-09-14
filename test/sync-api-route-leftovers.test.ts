@@ -82,8 +82,6 @@ const CAROL = '@carol:example.com';
 const DEVICE = 'DEVICEA';
 const ROOM = '!room:example.com';
 const ROOM2 = '!other:example.com';
-const INVITE_ROOM = '!invite:example.com';
-const LEFT_ROOM = '!left:example.com';
 const NOW = 1_700_000_000_000;
 
 type SqlCall = { sql: string; args: unknown[] };

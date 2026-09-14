@@ -2110,7 +2110,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 20,
@@ -2146,7 +2145,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 21,
@@ -2182,7 +2180,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 22,
@@ -2218,7 +2215,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 23,
@@ -2254,7 +2250,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 24,
@@ -2290,7 +2285,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 25,
@@ -2326,7 +2320,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 26,
@@ -2362,7 +2355,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 27,
@@ -2398,7 +2390,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 28,
@@ -2434,7 +2425,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 29,
@@ -2470,7 +2460,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 30,
@@ -2506,7 +2495,6 @@ describe('sliding-sync leftovers lifecycle soft floods after #157', () => {
     expect(first.body.rooms).toEqual({});
 
     // bump stream and subscribe
-    db; // retain ref
     const env2 = createEnv({
       db: createSlidingDb({
         maxStreamPos: 31,
