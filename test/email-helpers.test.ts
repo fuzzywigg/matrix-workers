@@ -502,3 +502,236 @@ describe('getValidatedSession', () => {
     });
   });
 });
+
+describe('email helpers TOKENMAXX leftovers after #78/#82 (catch + falsy edges)', () => {
+  const NOW = 1_700_000_200_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /** D1 stand-in that can fail DELETE or UPDATE while leaving SELECT intact. */
+  function createSelectiveFailDb(
+    store: Map<string, SessionRow>,
+    failOn: 'DELETE' | 'UPDATE' | 'INSERT'
+  ): D1Database & { store: Map<string, SessionRow> } {
+    const base = createEmailDb(store);
+    return {
+      store,
+      prepare(sql: string) {
+        const stmt = (base as unknown as { prepare: (s: string) => { bind: (...a: unknown[]) => unknown } }).prepare(sql);
+        return {
+          bind(...args: unknown[]) {
+            const bound = stmt.bind(...args) as {
+              first: <T>() => Promise<T | null>;
+              run: () => Promise<{ meta: { changes: number } }>;
+            };
+            return {
+              first: bound.first.bind(bound),
+              async run() {
+                if (failOn === 'DELETE' && sql.includes('DELETE FROM email_verification_sessions')) {
+                  throw new Error('delete boom');
+                }
+                if (failOn === 'UPDATE' && sql.includes('UPDATE email_verification_sessions')) {
+                  throw new Error('update boom');
+                }
+                if (failOn === 'INSERT' && sql.includes('INSERT INTO email_verification_sessions')) {
+                  throw new Error('insert boom');
+                }
+                return bound.run();
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database & { store: Map<string, SessionRow> };
+  }
+
+  it('defaults from to noreply@serverName when EMAIL_FROM is empty string', async () => {
+    const send = vi.fn(async () => ({ messageId: 'mid-empty-from' }));
+    const env = {
+      EMAIL_FROM: '',
+      EMAIL: { send },
+    } as unknown as Env;
+    await sendVerificationEmail(env, 'u@ex.com', '222222', 'homeserver.test');
+    expect(send.mock.calls[0][0].from).toBe('noreply@homeserver.test');
+  });
+
+  it('stores null user_id when create is called with empty-string userId', async () => {
+    const db = createEmailDb();
+    const result = await createVerificationSession(db, 'a@b.c', 'secret', 1, '');
+    expect('sessionId' in result).toBe(true);
+    expect([...db.store.values()][0].user_id).toBeNull();
+  });
+
+  it('treats sendAttempt 0 vs existing 0 as retry (empty token) then upgrades at 1', async () => {
+    const db = createEmailDb();
+    db.store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '111111',
+      send_attempt: 0,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 0)).toEqual({
+      sessionId: 'old',
+      token: '',
+    });
+    expect(db.store.size).toBe(1);
+
+    const upgraded = await createVerificationSession(db, 'a@b.c', 'secret', 1);
+    expect('sessionId' in upgraded).toBe(true);
+    if ('error' in upgraded) throw new Error(upgraded.error);
+    expect(upgraded.sessionId).not.toBe('old');
+    expect(upgraded.token).toMatch(/^\d{6}$/);
+    expect(db.store.has('old')).toBe(false);
+    expect([...db.store.values()][0].send_attempt).toBe(1);
+  });
+
+  it('does not treat a different email/client_secret pair as an existing session', async () => {
+    const db = createEmailDb();
+    db.store.set('other', {
+      session_id: 'other',
+      email: 'other@b.c',
+      user_id: null,
+      client_secret: 'other-secret',
+      token: '999999',
+      send_attempt: 5,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    const result = await createVerificationSession(db, 'a@b.c', 'secret', 1);
+    expect('sessionId' in result).toBe(true);
+    if ('error' in result) throw new Error(result.error);
+    expect(result.sessionId).not.toBe('other');
+    expect(db.store.size).toBe(2);
+    expect(db.store.has('other')).toBe(true);
+  });
+
+  it('returns create error when DELETE fails on higher sendAttempt upgrade', async () => {
+    const store = new Map<string, SessionRow>();
+    store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '123456',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    const db = createSelectiveFailDb(store, 'DELETE');
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 2)).toEqual({
+      error: 'Failed to create verification session',
+    });
+    expect(store.has('old')).toBe(true);
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it('returns create error when INSERT fails after successful DELETE on upgrade', async () => {
+    const store = new Map<string, SessionRow>();
+    store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '123456',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    const db = createSelectiveFailDb(store, 'INSERT');
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 2)).toEqual({
+      error: 'Failed to create verification session',
+    });
+    // DELETE succeeded; INSERT failed — old row is gone
+    expect(store.has('old')).toBe(false);
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it('returns Validation failed when UPDATE throws after token checks pass', async () => {
+    const store = new Map<string, SessionRow>();
+    store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '654321',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 60_000,
+    });
+    const db = createSelectiveFailDb(store, 'UPDATE');
+    expect(await validateEmailToken(db, 'sid', 'secret', '654321')).toEqual({
+      success: false,
+      error: 'Validation failed',
+    });
+    expect(store.get('sid')!.validated).toBe(0);
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it('omits userId when validated row has empty-string user_id', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: '',
+      client_secret: 'secret',
+      token: '1',
+      send_attempt: 1,
+      validated: 1,
+      created_at: 1,
+      expires_at: 2,
+    });
+    expect(await getValidatedSession(db, 'sid', 'secret')).toEqual({
+      email: 'a@b.c',
+      userId: undefined,
+    });
+  });
+
+  it('picks the newest existing session when multiple rows share email/client_secret', async () => {
+    const db = createEmailDb();
+    db.store.set('older', {
+      session_id: 'older',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '111111',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 5000,
+      expires_at: NOW + 1000,
+    });
+    db.store.set('newer', {
+      session_id: 'newer',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '222222',
+      send_attempt: 2,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 2)).toEqual({
+      sessionId: 'newer',
+      token: '',
+    });
+  });
+});

@@ -500,3 +500,124 @@ describe('getStateAtEvent / getAuthChain / getServersInRoomsWithUser TOKENMAXX a
     expect(chain[0].event_id).toBe('$tip');
   });
 });
+
+describe('database notify/authchain TOKENMAXX leftovers after #75/#78', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function createServersDb(rows: { user_id: string }[]) {
+    return {
+      prepare(sql: string) {
+        return {
+          bind(..._args: unknown[]) {
+            return {
+              async all<T>() {
+                if (sql.includes('room_memberships')) {
+                  const seen = new Set<string | null>();
+                  const results: { server_name: string | null }[] = [];
+                  for (const r of rows) {
+                    const colon = r.user_id.indexOf(':');
+                    // Mirror SQL: INSTR > 0 yields SUBSTR after colon (may be empty)
+                    const server_name = colon > 0 ? r.user_id.slice(colon + 1) : null;
+                    if (seen.has(server_name)) continue;
+                    seen.add(server_name);
+                    results.push({ server_name });
+                  }
+                  return { results: results as T[] };
+                }
+                return { results: [] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  it('getServersInRoomsWithUser keeps empty server_name from trailing-colon MXID', async () => {
+    // `@bob:` → server_name '' — filter is only `s !== null`, so empty string is kept
+    const db = createServersDb([{ user_id: '@bob:' }, { user_id: '@carol:good.example' }]);
+    const servers = await getServersInRoomsWithUser(db, '@alice:ex.com');
+    expect(servers.sort()).toEqual(['', 'good.example']);
+  });
+
+  it('getStateAtEvent ignores missing auth ids and keeps only found rows', async () => {
+    const events = new Map<string, PDU>([
+      ['$leaf', pdu('$leaf', ['$ghost', '$create'])],
+      [
+        '$create',
+        pdu('$create', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:ex.com' },
+        }),
+      ],
+    ]);
+    const state = await getStateAtEvent(createAuthChainDb(events), '$leaf');
+    expect(state.map((e) => e.event_id)).toEqual(['$create']);
+  });
+
+  it('getAuthChain continue path: already-seen batch after diamond fan-in does not throw', async () => {
+    // $tip → $a,$b; both point at $shared; second batch may include already-seen ids
+    const events = new Map<string, PDU>([
+      ['$tip', pdu('$tip', ['$a', '$b'])],
+      ['$a', pdu('$a', ['$shared'])],
+      ['$b', pdu('$b', ['$shared'])],
+      ['$shared', pdu('$shared', [])],
+    ]);
+    const chain = await getAuthChain(createAuthChainDb(events), ['$tip']);
+    expect(chain.map((e) => e.event_id).sort()).toEqual(['$a', '$b', '$shared', '$tip']);
+    // No duplicates
+    expect(new Set(chain.map((e) => e.event_id)).size).toBe(chain.length);
+  });
+
+  it('notifyUsersOfEvent resolves when every Sync DO fails and logs each failure', async () => {
+    const members = ['@a:ex.com', '@b:ex.com', '@c:ex.com'];
+    const env = {
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(..._args: unknown[]) {
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: () => ({
+          async fetch() {
+            throw new Error('all do fail');
+          },
+        }),
+      },
+    } as any;
+
+    await expect(
+      notifyUsersOfEvent(env, '!r:ex.com', '$e', 'm.room.message')
+    ).resolves.toBeUndefined();
+    expect(console.error).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(console.error).mock.calls.map((c) => String(c[0]))).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('@a:ex.com'),
+        expect.stringContaining('@b:ex.com'),
+        expect.stringContaining('@c:ex.com'),
+      ])
+    );
+  });
+});

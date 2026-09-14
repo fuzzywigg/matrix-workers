@@ -113,3 +113,27 @@ describe('extractAccessToken TOKENMAXX edge paths after #50', () => {
     expect(extractAccessToken(req)).toBe('first');
   });
 });
+
+describe('extractAccessToken TOKENMAXX leftovers after #78', () => {
+  it('falls back to query when Authorization is bare Bearer without a token', () => {
+    // `Bearer` alone fails /^Bearer\s+(.+)$/i → fall through to query
+    const req = new Request('https://matrix.example.com/?access_token=from_query', {
+      headers: { Authorization: 'Bearer' },
+    });
+    expect(extractAccessToken(req)).toBe('from_query');
+  });
+
+  it('falls back to query when Authorization is Bearer with only whitespace', () => {
+    const req = new Request('https://matrix.example.com/?access_token=from_query', {
+      headers: { Authorization: 'Bearer   ' },
+    });
+    expect(extractAccessToken(req)).toBe('from_query');
+  });
+
+  it('returns null for bare Bearer when no query token is present either', () => {
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Authorization: 'Bearer' },
+    });
+    expect(extractAccessToken(req)).toBeNull();
+  });
+});

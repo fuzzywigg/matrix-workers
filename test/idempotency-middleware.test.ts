@@ -137,3 +137,26 @@ describe('idempotentResponse TOKENMAXX edge paths after #58', () => {
     expect(db.store.size).toBe(0);
   });
 });
+
+describe('idempotentResponse TOKENMAXX leftovers after #78', () => {
+  it('stores event_id as null when eventId arg is omitted', async () => {
+    const db = createTxnDb();
+    const ctx = makeCtx({ db, txnId: 't-null', userId: '@u:ex.com' });
+    const result = await idempotentResponse(ctx, { ok: true });
+    expect(result).toEqual({ body: { ok: true } });
+    expect(db.store.get('@u:ex.com:t-null')).toEqual({
+      event_id: null,
+      response: JSON.stringify({ ok: true }),
+    });
+  });
+
+  it('stores event_id as null when eventId is explicitly undefined', async () => {
+    const db = createTxnDb();
+    const ctx = makeCtx({ db, txnId: 't-undef', userId: '@u:ex.com' });
+    await idempotentResponse(ctx, { event_id: '$maybe' }, undefined);
+    expect(db.store.get('@u:ex.com:t-undef')).toEqual({
+      event_id: null,
+      response: JSON.stringify({ event_id: '$maybe' }),
+    });
+  });
+});

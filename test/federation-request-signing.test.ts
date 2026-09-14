@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { parseAuthHeader } from '../src/middleware/federation-auth';
 import {
   DEFAULT_KEY_MAX_STALENESS_MS,
@@ -7,11 +7,9 @@ import {
   verifyRemoteSignature,
   type SigningKey,
 } from '../src/services/federation-keys';
-import {
-  generateSigningKeyPair,
-  signJson,
-  verifySignature,
-} from '../src/utils/crypto';
+import * as cryptoUtils from '../src/utils/crypto';
+
+const { generateSigningKeyPair, signJson, verifySignature } = cryptoUtils;
 
 /** Remap Cloudflare's NODE-ED25519 algorithm name to Node's Ed25519 for unit tests. */
 function installNodeEd25519Shim() {
@@ -511,5 +509,100 @@ describe('federation signing TOKENMAXX edge paths after #55', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('signFederationRequest / getServerSigningKey TOKENMAXX leftovers after #78', () => {
+  let restore: (() => void) | undefined;
+  let signingKey: SigningKey;
+
+  beforeAll(async () => {
+    restore = installNodeEd25519Shim();
+    const pair = await generateSigningKeyPair();
+    signingKey = { keyId: pair.keyId, privateKeyJwk: pair.privateKeyJwk };
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('throws Failed to sign federation request when signJson omits the signature', async () => {
+    vi.spyOn(cryptoUtils, 'signJson').mockResolvedValue({
+      method: 'GET',
+      uri: '/path',
+      origin: 'a.example.com',
+      destination: 'b.example.com',
+      signatures: {},
+    });
+
+    await expect(
+      signFederationRequest(
+        'GET',
+        '/path',
+        'a.example.com',
+        'b.example.com',
+        signingKey
+      )
+    ).rejects.toThrow('Failed to sign federation request');
+  });
+
+  it('throws Failed to sign when signatures exist only under a different origin', async () => {
+    vi.spyOn(cryptoUtils, 'signJson').mockResolvedValue({
+      method: 'PUT',
+      uri: '/x',
+      origin: 'a.example.com',
+      destination: 'b.example.com',
+      signatures: {
+        'other.example.com': { [signingKey.keyId]: 'deadbeef' },
+      },
+    });
+
+    await expect(
+      signFederationRequest('PUT', '/x', 'a.example.com', 'b.example.com', signingKey, {
+        hi: 1,
+      })
+    ).rejects.toThrow('Failed to sign federation request');
+  });
+
+  it('throws Failed to sign when origin signature map lacks the expected keyId', async () => {
+    vi.spyOn(cryptoUtils, 'signJson').mockResolvedValue({
+      method: 'GET',
+      uri: '/y',
+      origin: 'a.example.com',
+      destination: 'b.example.com',
+      signatures: {
+        'a.example.com': { 'ed25519:wrong': 'sig' },
+      },
+    });
+
+    await expect(
+      signFederationRequest('GET', '/y', 'a.example.com', 'b.example.com', signingKey)
+    ).rejects.toThrow('Failed to sign federation request');
+  });
+
+  it('rejects from getServerSigningKey when private_key_jwk is corrupt JSON', async () => {
+    const db = {
+      prepare: () => ({
+        first: async () => ({ key_id: 'ed25519:1', private_key_jwk: 'not-json{' }),
+      }),
+    } as unknown as D1Database;
+    await expect(getServerSigningKey(db)).rejects.toThrow();
+  });
+
+  it('rejects from getServerSigningKey when private_key_jwk is a non-object JSON value', async () => {
+    // JSON.parse succeeds; callers later fail when importing the JWK — surface parse result shape
+    const db = {
+      prepare: () => ({
+        first: async () => ({ key_id: 'ed25519:1', private_key_jwk: '"just-a-string"' }),
+      }),
+    } as unknown as D1Database;
+    await expect(getServerSigningKey(db)).resolves.toEqual({
+      keyId: 'ed25519:1',
+      privateKeyJwk: 'just-a-string',
+    });
   });
 });

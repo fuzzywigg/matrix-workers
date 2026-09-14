@@ -114,3 +114,37 @@ describe('validateEventSize TOKENMAXX edge paths after #50', () => {
     expect(() => validateEventSize(event)).not.toThrow();
   });
 });
+
+describe('validateEventSize TOKENMAXX leftovers after #78 (hard-cap MatrixApiError shape)', () => {
+  it('rejects hard-cap overflows with M_TOO_LARGE / 413', () => {
+    const event = baseEvent({ body: 'ok' });
+    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(event).length).toBeGreaterThan(921_600);
+    try {
+      validateEventSize(event);
+      throw new Error('expected throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(MatrixApiError);
+      const e = err as MatrixApiError;
+      expect(e.errcode).toBe('M_TOO_LARGE');
+      expect(e.status).toBe(413);
+      expect(e.message).toMatch(/D1 row limit/);
+      expect(e.message).toMatch(/got \d+/);
+    }
+  });
+
+  it('hard-cap check runs only after soft-cap passes', () => {
+    // Soft-cap failure must win when both would fail
+    const event = baseEvent({ body: 'x'.repeat(65_536) });
+    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    try {
+      validateEventSize(event);
+      throw new Error('expected throw');
+    } catch (err) {
+      const e = err as MatrixApiError;
+      expect(e.message).toMatch(/content exceeds/);
+      expect(e.message).not.toMatch(/D1 row limit/);
+    }
+  });
+});

@@ -1153,6 +1153,33 @@ describe('makeFederationRequest / federationGet|Post|Put TOKENMAXX after #63', (
     await federationPut('dest.example.com', '/u', { b: 2 }, 'local.example.com', keyDb, kv);
     expect(fetch).toHaveBeenCalledTimes(3);
   });
+
+  it('omits fetch body when makeFederationRequest body is null (same as undefined)', async () => {
+    const kv = mockKv();
+    seedDiscovery(kv, 'remote.example.com', 'hs.example.com', 8448);
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response('{}', { status: 200 })
+    );
+
+    await makeFederationRequest(
+      'POST',
+      'remote.example.com',
+      '/_matrix/federation/v1/user/devices/@u:remote.example.com',
+      'local.example.com',
+      { keyId: pair.keyId, privateKeyJwk: pair.privateKeyJwk },
+      kv,
+      null
+    );
+
+    const init = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit;
+    expect(init.method).toBe('POST');
+    expect(init.body).toBeUndefined();
+    expect(init.headers).toEqual(
+      expect.objectContaining({
+        Authorization: expect.stringContaining('X-Matrix'),
+      })
+    );
+  });
 });
 
 describe('getRemoteKeysWithNotarySignature self-signature path after #63', () => {
