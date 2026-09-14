@@ -97,6 +97,21 @@ jobs:
       - run: npm ci
       - run: npm run test:admin-federation
 
+  # Fail-fast canary for oauth + devices/keys soft concurrent leftovers
+  # (denary/undecenary/duodenary oauth + seventh/eighth/ninth-wave devices).
+  # Isolates flake attribution before the full vitest suite.
+  oauth-devices:
+    name: OAuth/Devices Concurrent Canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:oauth-devices
+
   test:
     name: Tests
     runs-on: ubuntu-latest
