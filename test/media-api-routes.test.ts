@@ -283,7 +283,7 @@ async function request(
   path: string,
   init: RequestInit = {},
   env: Env = envFor()
-): Promise<{ status: number; body: any; headers: Headers; res: Response }> {
+): Promise<{ status: number; body: unknown; headers: Headers; res: Response }> {
   const res = await mediaApp.request(`http://localhost${path}`, init, env);
   const headers = res.headers;
   const contentType = headers.get('Content-Type') || '';
