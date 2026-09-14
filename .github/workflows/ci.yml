@@ -66,6 +66,21 @@ jobs:
       - run: npm ci
       - run: npm run test:crypto-db
 
+  # Fail-fast canary for filters + appservice + auth concurrent leftovers
+  # (septenary #304 + octonary #312 + nonary deepen). Isolates flake
+  # attribution before the full vitest suite.
+  filters-appservice-auth:
+    name: Filters/Appservice/Auth Concurrent Canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:filters-appservice-auth
+
   test:
     name: Tests
     runs-on: ubuntu-latest
