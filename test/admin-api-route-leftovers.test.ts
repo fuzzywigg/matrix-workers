@@ -1,9 +1,10 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
- * / residual after #265 / second-wave residual after tip #271 (post-#270) —
- * admin API soft/edge/reliability. Complements admin-api-routes.test.ts and
- * admin-api-concurrent-race leftovers (#239/#248/#265/#270). Tests-only —
- * no product inventing. Fixtures use example.com only.
+ * / residual after #265 / second-wave residual after tip #271 (post-#270) /
+ * third-wave residual after tip #275 (post-#276 tip) — admin API soft/edge/
+ * reliability. Complements admin-api-routes.test.ts and admin-api-concurrent-race
+ * leftovers (#239/#248/#265/#270/#275). Tests-only — no product inventing.
+ * Fixtures use example.com only.
  *
  * Deepen after #241: analytics period soft, synapse destinations/event_reports,
  * federation status/servers/test, sessions revoke, make/remove-admin edges,
@@ -25,6 +26,11 @@
  * No-changes / DELETE 404 / unlink message; server-notice devices_notified:0;
  * unresolve 404; keys reason ladder soft; reset_password omit logout_devices;
  * PUT deactivated:true; DELETE deactivate.
+ *
+ * Third-wave residual after tip #275 (post-#276 tip): keys Verified /
+ * No self-signing; IdP PUT updated / DELETE success / test ok+fail; exact
+ * self-demote/self-purge/whois-forbid/login-token deactivated strings;
+ * registration enabled (boolean) required string.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -4821,6 +4827,187 @@ describe('admin second-wave PUT deactivated / DELETE deactivate soft after #271'
       expect(db.users.find((u) => u.user_id === BOB)?.is_deactivated).toBe(1);
       expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(0);
       expect(db.audit.some((a) => a.action === 'user.deactivate')).toBe(true);
+    });
+  }
+});
+
+// third-wave residual soft floods after tip #275 (post-#276 tip niches unsaturated)
+
+describe('admin third-wave keys Verified / No self-signing soft after #275', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`keys Verified soft-${i}`, async () => {
+      const res = await jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/keys`);
+      expect(res.status).toBe(200);
+      expect(res.body.user_id).toBe(BOB);
+      expect(
+        (res.body.verification_status as Record<string, { verified: boolean; reason: string }>).BOBDEVICE
+      ).toEqual({ verified: true, reason: 'Verified' });
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`keys No self-signing key soft-${i}`, async () => {
+      const db = createAdminDb({
+        crossSigningKeys: [
+          {
+            user_id: BOB,
+            key_type: 'master',
+            key_id: 'ed25519:master',
+            key_data: JSON.stringify({ keys: { 'ed25519:master': 'AAAA' } }),
+          },
+        ],
+        crossSigningSigs: [],
+      });
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/keys`,
+        {},
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(
+        (res.body.verification_status as Record<string, { verified: boolean; reason: string }>).BOBDEVICE
+      ).toEqual({ verified: false, reason: 'No self-signing key' });
+    });
+  }
+});
+
+describe('admin third-wave IdP updated / deleted / test soft after #275', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`idp PUT updated message soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/idp/providers/idp1',
+        jsonInit('PUT', { name: `GitHub-${i}`, enabled: true }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, message: 'Identity provider updated' });
+      expect(db.updates.some((u) => String(u.sql).includes('UPDATE idp_providers SET'))).toBe(true);
+      const upd = db.updates.find((u) => String(u.sql).includes('UPDATE idp_providers SET'));
+      expect(upd?.args).toContain(`GitHub-${i}`);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp DELETE success message soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/idp/providers/idp1',
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, message: 'Identity provider deleted' });
+      expect(db.idpProviders.some((p) => p.id === 'idp1')).toBe(false);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp test Connection successful soft-${i}`, async () => {
+      const res = await jsonReq('/admin/api/idp/providers/idp1/test', {
+        method: 'POST',
+        headers: AUTH,
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toBe('Connection successful');
+      const discovery = res.body.discovery as Record<string, string>;
+      expect(discovery.issuer).toBe('https://idp.example.com');
+      expect(discovery.authorization_endpoint).toBe('https://idp.example.com/authorize');
+      expect(discovery.token_endpoint).toBe('https://idp.example.com/token');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp test discovery-fail soft-${i}`, async () => {
+      const db = createAdminDb({
+        idpProviders: [
+          {
+            id: 'badidp',
+            name: 'Bad',
+            issuer_url: `https://bad-issuer-test-${i}.example.com`,
+            client_id: 'cid',
+            client_secret_encrypted: 'enc:secret',
+            scopes: 'openid',
+            enabled: 1,
+            auto_create_users: 0,
+            username_claim: 'sub',
+            display_order: 0,
+            icon_url: null,
+            created_at: 1,
+            updated_at: 1,
+          },
+        ],
+      });
+      const res = await jsonReq(
+        '/admin/api/idp/providers/badidp/test',
+        { method: 'POST', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(String(res.body.error)).toMatch(/discovery failed/);
+    });
+  }
+});
+
+describe('admin third-wave exact forbid / deactivated / registration soft after #275', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`remove-admin self exact string soft-${i}`, async () => {
+      const res = await jsonReq('/admin/api/remove-admin', jsonInit('POST', { user_id: ADMIN }));
+      expect(res.status).toBe(403);
+      expect(res.body.errcode).toBe('M_FORBIDDEN');
+      expect(res.body.error).toBe('Cannot remove your own admin privileges');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`self-purge exact string soft-${i}`, async () => {
+      const res = await jsonReq(`/admin/api/users/${encodeURIComponent(ADMIN)}/purge`, {
+        method: 'DELETE',
+        headers: AUTH,
+      });
+      expect(res.status).toBe(403);
+      expect(res.body.errcode).toBe('M_FORBIDDEN');
+      expect(res.body.error).toBe('Cannot delete your own account');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`whois non-admin exact forbid soft-${i}`, async () => {
+      authState.userId = BOB;
+      const res = await jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(ADMIN)}`);
+      expect(res.status).toBe(403);
+      expect(res.body.errcode).toBe('M_FORBIDDEN');
+      expect(res.body.error).toBe('Admin privileges required to query other users');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`login-token deactivated exact string soft-${i}`, async () => {
+      const db = createAdminDb({
+        users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+      });
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        jsonInit('POST', { ttl_minutes: 5 }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({
+        errcode: 'M_USER_DEACTIVATED',
+        error: 'User is deactivated',
+      });
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`registration missing enabled boolean soft-${i}`, async () => {
+      const body = i % 2 === 0 ? {} : { enabled: 'true' };
+      const res = await jsonReq('/admin/api/registration', jsonInit('PUT', body));
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+      expect(res.body.error).toBe('Missing required parameter: enabled (boolean) required');
     });
   }
 });

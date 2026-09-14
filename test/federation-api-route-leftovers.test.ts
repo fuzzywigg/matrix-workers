@@ -1,10 +1,11 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
- * / residual after #265 / second-wave residual after tip #271 (post-#270) —
- * federation S2S soft/edge/reliability (non-catchup). Complements
- * federation-api-routes.test.ts and federation-api-concurrent-race leftovers
- * (#239/#248/#265/#270). Tests-only — no product inventing. Fixtures use
- * example.com only. Skips FederationCatchupWorkflow (#249/#250).
+ * / residual after #265 / second-wave residual after tip #271 (post-#270) /
+ * third-wave residual after tip #275 (post-#276 tip) — federation S2S soft/edge/
+ * reliability (non-catchup). Complements federation-api-routes.test.ts and
+ * federation-api-concurrent-race leftovers (#239/#248/#265/#270/#275). Tests-only
+ * — no product inventing. Fixtures use example.com only. Skips
+ * FederationCatchupWorkflow (#249/#250).
  *
  * Deepen after #241: hierarchy, timestamp_to_event, event_auth, backfill,
  * get_missing_events, media/thumbnail soft floods — present in federation.ts /
@@ -26,6 +27,11 @@
  * Event authorization failed / DB Auth failed; pdus.unknown; openid success
  * sub+token-retained; missing federationOrigin 401; hierarchy suggested_only
  * absent returns non-suggested children.
+ *
+ * Third-wave residual after tip #275 (post-#276 tip, skip catchup): legacy v2
+ * accept; timestamp empty-room No event found; hierarchy empty-via skip +
+ * next_batch; thumbnail method=crop soft; content-hash verification error soft
+ * variants.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -3904,6 +3910,192 @@ describe('soft second-wave openid retained / missing-origin / hierarchy nonsugge
       const childIds = body.children.map((c) => c.room_id);
       expect(childIds).toContain('!sug:example.com');
       expect(childIds).not.toContain('!plain:example.com');
+    });
+  }
+});
+
+// third-wave residual soft floods after tip #275 (post-#276 tip, skip catchup)
+
+describe('soft third-wave legacy-v2 / timestamp no-event / hierarchy / crop soft after #275', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    verifyContentHash.mockReset();
+    verifyContentHash.mockResolvedValue(true);
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`legacy room_version=2 accept soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '2', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$legv2_${i}`;
+      const { status, body } = await req('PUT', `/_matrix/federation/v1/send/txn-legv2-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'ok' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      });
+      expect(status).toBe(200);
+      expect((body as { pdus: Record<string, unknown> }).pdus[eid]).toEqual({});
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`timestamp empty-room No event found soft-${i}`, async () => {
+      const dir = i % 2 === 0 ? 'f' : 'b';
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+        events: [],
+      });
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1500&dir=${dir}`,
+        makeEnv(db)
+      );
+      expect(r.status).toBe(404);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_NOT_FOUND');
+      expect((r.body as { error: string }).error).toBe('No event found near timestamp');
+    });
+  }
+
+  function seedHierarchyPaging() {
+    const children = Array.from({ length: 3 }, (_, n) => `!c${n}:example.com`);
+    const emptyVia = '!emptyvia:example.com';
+    const childEvts = children.map((cid, n) =>
+      makeEvent({
+        event_id: `$clink${n}`,
+        event_type: 'm.space.child',
+        state_key: cid,
+        content: JSON.stringify({ via: [SERVER], suggested: n === 0 }),
+      })
+    );
+    const emptyEvt = makeEvent({
+      event_id: '$emptyvia',
+      event_type: 'm.space.child',
+      state_key: emptyVia,
+      content: JSON.stringify({ via: [] }),
+    });
+    const name = makeEvent({
+      event_id: '$spname3',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'PagedSpace' }),
+    });
+    const childNames = children.map((cid, n) =>
+      makeEvent({
+        event_id: `$cname${n}`,
+        room_id: cid,
+        event_type: 'm.room.name',
+        content: JSON.stringify({ name: `Child${n}` }),
+      })
+    );
+    const roomState = new Map<string, string>([
+      [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+      ...children.map((cid, n) => [stateKey(ROOM, 'm.space.child', cid), childEvts[n].event_id] as [string, string]),
+      [stateKey(ROOM, 'm.space.child', emptyVia), emptyEvt.event_id],
+      ...children.map((cid, n) => [stateKey(cid, 'm.room.name', ''), childNames[n].event_id] as [string, string]),
+    ]);
+    return createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        ...children.map((cid, n) => ({
+          room_id: cid,
+          room_version: '10',
+          is_public: 1,
+          created_at: 2 + n,
+        })),
+        { room_id: emptyVia, room_version: '10', is_public: 1, created_at: 99 },
+      ],
+      events: [name, emptyEvt, ...childEvts, ...childNames],
+      roomState,
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`hierarchy empty-via skipped soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=20`,
+        makeEnv(seedHierarchyPaging())
+      );
+      expect(r.status).toBe(200);
+      const body = r.body as { children: Array<{ room_id: string }> };
+      const childIds = body.children.map((c) => c.room_id);
+      expect(childIds).toContain('!c0:example.com');
+      expect(childIds).not.toContain('!emptyvia:example.com');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`hierarchy next_batch soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=1`,
+        makeEnv(seedHierarchyPaging())
+      );
+      expect(r.status).toBe(200);
+      const body = r.body as { children: Array<{ room_id: string }>; next_batch?: string };
+      expect(body.children.length).toBe(1);
+      expect(body.next_batch).toBe('offset_1');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`thumbnail method=crop soft-${i}`, async () => {
+      const MEDIA_ID = 'fed_media_crop_tw';
+      const w = 64;
+      const h = 64;
+      const thumbKey = `thumb_${MEDIA_ID}_${w}x${h}_crop`;
+      const media = mockR2({
+        [MEDIA_ID]: new Uint8Array([1, 2, 3]),
+        [thumbKey]: new Uint8Array([9, 9, 9, i]),
+      });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'c.png' }],
+      });
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=${w}&height=${h}&method=crop`,
+        makeEnv(db, { media })
+      );
+      expect(r.status).toBe(200);
+      expect(r.headers.get('Content-Type')).toBe('image/jpeg');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`content hash verification error soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      verifyContentHash.mockRejectedValue(new Error(`tw-hash-${i}`));
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$hasherr${i}`;
+      const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-hasherr-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            hashes: { sha256: 'abc' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      });
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
+        'Content hash verification error'
+      );
     });
   }
 });

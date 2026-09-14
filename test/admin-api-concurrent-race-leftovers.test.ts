@@ -1,10 +1,11 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
  * / residual after #252 / residual after #265 / second-wave residual after tip
- * #271 (post-#270) — admin concurrent race / TOCTOU for leftover admin-api
- * routes that only had serial soft floods (#157 leftover) or mutate races
- * (#189). Distinct from admin-mutate-concurrent-race-leftovers (writes) and
- * admin-api-route-leftovers (serial GET floods).
+ * #271 (post-#270) / third-wave residual after tip #275 (post-#276 tip) — admin
+ * concurrent race / TOCTOU for leftover admin-api routes that only had serial
+ * soft floods (#157 leftover) or mutate races (#189). Distinct from
+ * admin-mutate-concurrent-race-leftovers (writes) and admin-api-route-leftovers
+ * (serial GET floods).
  *
  * Distinct from tip #241 (devices+keybackups residual) and #239 (this file's
  * prior deepen). Residual after #241: sessions list∥revoke; login-token∥sessions;
@@ -24,6 +25,11 @@
  * registration success∥GET; create invalid∥success; zero-device notice∥sessions;
  * unresolve 404∥reports; PUT deactivated:true∥sessions; discovery-fail∥list;
  * reset omit-logout∥sessions.
+ *
+ * Third-wave residual after tip #275 (post-#276 tip): Verified∥No-self-signing;
+ * IdP updated∥No-changes; DELETE success∥list; test-ok∥test-fail;
+ * self-demote∥self-purge; whois-forbid∥whois-self; deactivated∥mint-ok;
+ * registration missing-param∥GET.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -3585,6 +3591,208 @@ describe('race second-wave notice0∥sessions / unresolve404∥reports / deactiv
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
       expect(results[0].body.devices_notified).toBe(0);
+    });
+  }
+});
+
+// third-wave residual concurrent races after tip #275 (post-#276 tip soft niches not raced)
+
+describe('race third-wave Verified∥No-self-signing / IdP updated∥No-changes after #275', () => {
+  it('keys Verified∥No self-signing isolation', async () => {
+    const dbVerified = createAdminDb();
+    const dbNoSs = createAdminDb({
+      crossSigningKeys: [
+        {
+          user_id: BOB,
+          key_type: 'master',
+          key_id: 'ed25519:master',
+          key_data: JSON.stringify({ keys: { 'ed25519:master': 'AAAA' } }),
+        },
+      ],
+      crossSigningSigs: [],
+    });
+    const bobEnc = encodeURIComponent(BOB);
+    const [ok, noSs] = await Promise.all([
+      jsonReq(`/admin/api/users/${bobEnc}/keys`, {}, createEnv({ db: dbVerified })),
+      jsonReq(`/admin/api/users/${bobEnc}/keys`, {}, createEnv({ db: dbNoSs })),
+    ]);
+    expect(ok.status).toBe(200);
+    expect(
+      (ok.body.verification_status as Record<string, { reason: string }>).BOBDEVICE.reason
+    ).toBe('Verified');
+    expect(noSs.status).toBe(200);
+    expect(
+      (noSs.body.verification_status as Record<string, { reason: string }>).BOBDEVICE.reason
+    ).toBe('No self-signing key');
+  });
+
+  it('idp PUT updated∥No-changes isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [updated, noChanges] = await Promise.all([
+      jsonReq('/admin/api/idp/providers/idp1', jsonInit('PUT', { name: 'Renamed', enabled: true }), env),
+      jsonReq('/admin/api/idp/providers/idp1', jsonInit('PUT', {}), env),
+    ]);
+    expect(updated.status).toBe(200);
+    expect(updated.body.message).toBe('Identity provider updated');
+    expect(noChanges.status).toBe(200);
+    expect(noChanges.body.message).toBe('No changes');
+  });
+
+  it('idp DELETE success∥list isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [del, list] = await Promise.all([
+      jsonReq('/admin/api/idp/providers/idp1', { method: 'DELETE', headers: AUTH }, env),
+      jsonReq('/admin/api/idp/providers', {}, env),
+    ]);
+    expect(del.status).toBe(200);
+    expect(del.body.message).toBe('Identity provider deleted');
+    expect(list.status).toBe(200);
+    expect(Array.isArray(list.body.providers)).toBe(true);
+  });
+
+  it('idp test-ok∥test-fail isolation', async () => {
+    const db = createAdminDb({
+      idpProviders: [
+        {
+          id: 'idp1',
+          name: 'GitHub',
+          issuer_url: 'https://idp.example.com',
+          client_id: 'cid',
+          client_secret_encrypted: 'enc:secret',
+          scopes: 'openid',
+          enabled: 1,
+          auto_create_users: 1,
+          username_claim: 'email',
+          display_order: 0,
+          icon_url: null,
+          created_at: 1,
+          updated_at: 1,
+        },
+        {
+          id: 'badidp',
+          name: 'Bad',
+          issuer_url: 'https://bad-issuer-race.example.com',
+          client_id: 'cid',
+          client_secret_encrypted: 'enc:secret',
+          scopes: 'openid',
+          enabled: 1,
+          auto_create_users: 0,
+          username_claim: 'sub',
+          display_order: 1,
+          icon_url: null,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const [ok, fail] = await Promise.all([
+      jsonReq('/admin/api/idp/providers/idp1/test', { method: 'POST', headers: AUTH }, env),
+      jsonReq('/admin/api/idp/providers/badidp/test', { method: 'POST', headers: AUTH }, env),
+    ]);
+    expect(ok.status).toBe(200);
+    expect(ok.body.message).toBe('Connection successful');
+    expect(fail.status).toBe(400);
+    expect(fail.body.success).toBe(false);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`keys/idp third-wave flood-${i}`, async () => {
+      const db = createAdminDb();
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/keys`, {}, env),
+        jsonReq('/admin/api/idp/providers/idp1', jsonInit('PUT', {}), env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(
+        (results[0].body.verification_status as Record<string, { reason: string }>).BOBDEVICE.reason
+      ).toBe('Verified');
+      expect(results[1].body.message).toBe('No changes');
+    });
+  }
+});
+
+describe('race third-wave self-demote∥purge / whois / deactivated / registration after #275', () => {
+  it('self-demote∥self-purge exact forbid dual', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [demote, purge] = await Promise.all([
+      jsonReq('/admin/api/remove-admin', jsonInit('POST', { user_id: ADMIN }), env),
+      jsonReq(`/admin/api/users/${encodeURIComponent(ADMIN)}/purge`, { method: 'DELETE', headers: AUTH }, env),
+    ]);
+    expect(demote.status).toBe(403);
+    expect(demote.body.error).toBe('Cannot remove your own admin privileges');
+    expect(purge.status).toBe(403);
+    expect(purge.body.error).toBe('Cannot delete your own account');
+  });
+
+  it('whois-forbid∥whois-self isolation', async () => {
+    authState.userId = BOB;
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [forbid, self] = await Promise.all([
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(ADMIN)}`, {}, env),
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(BOB)}`, {}, env),
+    ]);
+    expect(forbid.status).toBe(403);
+    expect(forbid.body.error).toBe('Admin privileges required to query other users');
+    expect(self.status).toBe(200);
+    expect(self.body.user_id).toBe(BOB);
+  });
+
+  it('login-token deactivated∥mint-ok isolation', async () => {
+    const dbDeact = createAdminDb({
+      users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+    });
+    const dbOk = createAdminDb();
+    const sessions = mockKv();
+    const bobEnc = encodeURIComponent(BOB);
+    const [deact, ok] = await Promise.all([
+      jsonReq(
+        `/admin/api/users/${bobEnc}/login-token`,
+        jsonInit('POST', { ttl_minutes: 5 }),
+        createEnv({ db: dbDeact })
+      ),
+      jsonReq(
+        `/admin/api/users/${bobEnc}/login-token`,
+        jsonInit('POST', { ttl_minutes: 5 }),
+        createEnv({ db: dbOk, sessions })
+      ),
+    ]);
+    expect(deact.status).toBe(400);
+    expect(deact.body.error).toBe('User is deactivated');
+    expect(ok.status).toBe(200);
+    expect(ok.body.token).toBe('mlt_pinned_login_token');
+  });
+
+  it('registration missing-param∥GET isolation', async () => {
+    const adminDO = createAdminDO({ config: { registration_enabled: true } });
+    const db = createAdminDb();
+    const env = createEnv({ adminDO, db });
+    const [bad, get] = await Promise.all([
+      jsonReq('/admin/api/registration', jsonInit('PUT', {}), env),
+      jsonReq('/admin/api/registration', {}, env),
+    ]);
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toBe('Missing required parameter: enabled (boolean) required');
+    expect(get.status).toBe(200);
+    expect(typeof get.body.enabled).toBe('boolean');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`forbid/whois/reg third-wave flood-${i}`, async () => {
+      const db = createAdminDb();
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq('/admin/api/remove-admin', jsonInit('POST', { user_id: ADMIN }), env),
+        jsonReq(`/admin/api/users/${encodeURIComponent(ADMIN)}/purge`, { method: 'DELETE', headers: AUTH }, env),
+      ]);
+      expect(statusesOf(results)).toEqual([403, 403]);
+      expect(results[0].body.error).toBe('Cannot remove your own admin privileges');
+      expect(results[1].body.error).toBe('Cannot delete your own account');
     });
   }
 });
