@@ -1,14 +1,19 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
- * — federation-api *concurrent race / TOCTOU* for leftover S2S routes that
- * only had serial soft floods (#157 leftover). Distinct from
- * federation-keys-membership-account-data concurrent-race (OTK / make_join)
- * and federation-api-route-leftovers (serial floods). Distinct from tip #241
- * (devices+keybackups) and #239 (this file's prior deepen).
+ * / residual after #252 — federation-api concurrent race / TOCTOU for leftover
+ * S2S routes (non-catchup) that only had serial soft floods (#157 leftover).
+ * Distinct from federation-keys-membership-account-data concurrent-race
+ * (OTK / make_join) and federation-api-route-leftovers (serial floods).
+ * Distinct from tip #241 and #239 (this file's prior deepen). Skip catchup
+ * residual covered by #249/#250.
  *
  * Residual after #241: hierarchy∥timestamp∥backfill triple; thumbnail∥download;
  * event_auth∥get_missing isolation; version∥publicRooms — soft-flooded in
  * route leftovers deepen but not additional Promise.all races after #239.
+ *
+ * Residual after #252 (post-#248): send hash-mismatch∥prev-rejected;
+ * download disposition∥octet-stream; thumbnail clamp∥non-image;
+ * openid expired∥invalid; presence EDU∥noop EDU.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -65,6 +70,20 @@ const checkEventAuth = vi.fn(() => ({ allowed: true }));
 vi.mock('../src/services/event-auth', () => ({
   checkEventAuth: (...args: unknown[]) => checkEventAuth(...args),
 }));
+
+const verifyContentHash = vi.hoisted(() => vi.fn());
+vi.mock('../src/utils/crypto', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/utils/crypto')>();
+  verifyContentHash.mockImplementation(
+    (content: Record<string, unknown>, expectedHash: string) =>
+      actual.verifyContentHash(content, expectedHash)
+  );
+  return {
+    ...actual,
+    verifyContentHash: (...args: unknown[]) =>
+      verifyContentHash(...(args as [Record<string, unknown>, string])),
+  };
+});
 
 import federation from '../src/api/federation';
 import { generateSigningKeyPair } from '../src/utils/crypto';
@@ -2212,6 +2231,263 @@ describe('race residual event_auth∥get_missing∥version after #241', () => {
           env
         ),
         req('GET', '/_matrix/federation/v1/version', env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+// residual concurrent races after #252 (non-catchup soft niches not raced post-#248)
+
+const REMOTE_USER = `@remote:${FED_ORIGIN}`;
+const MEDIA_DISP = 'fed_media_race';
+
+describe('race residual send hash∥prev-rejected after #252', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    verifyContentHash.mockReset();
+    verifyContentHash.mockResolvedValue(false);
+  });
+
+  it('content-hash mismatch∥previously-rejected isolation', async () => {
+    verifyRemoteSignature.mockResolvedValue(true);
+    const eidMiss = '$racehash';
+    const eidPrev = '$raceprev';
+    const db = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      processedPdus: { [eidPrev]: { accepted: 0, rejection_reason: null } },
+    });
+    const env = makeEnv(db);
+    const [miss, prev] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-race-hash', env, {
+        pdus: [
+          {
+            event_id: eidMiss,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            hashes: { sha256: 'bad' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-race-prev', env, {
+        pdus: [
+          {
+            event_id: eidPrev,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'y' },
+          },
+        ],
+      }),
+    ]);
+    expect(miss.status).toBe(200);
+    expect(prev.status).toBe(200);
+    expect((miss.body as { pdus: Record<string, { error: string }> }).pdus[eidMiss].error).toBe(
+      'Content hash mismatch'
+    );
+    expect((prev.body as { pdus: Record<string, { error: string }> }).pdus[eidPrev].error).toBe(
+      'Previously rejected'
+    );
+  });
+
+  it('origin-sig∥auth-throw accept isolation', async () => {
+    const db = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+    });
+    const env = makeEnv(db);
+    verifyRemoteSignature.mockResolvedValueOnce(false).mockResolvedValue(true);
+    verifyContentHash.mockResolvedValue(true);
+    checkEventAuth.mockImplementation(() => {
+      throw new Error('auth-race');
+    });
+    const [sig, accept] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-race-sig', env, {
+        pdus: [
+          {
+            event_id: '$racesig',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'bad' } },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-race-accept', env, {
+        pdus: [
+          {
+            event_id: '$raceaccept',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'y' },
+            hashes: { sha256: 'ok' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+    ]);
+    expect(sig.status).toBe(200);
+    expect(accept.status).toBe(200);
+    expect((sig.body as { pdus: Record<string, { error: string }> }).pdus['$racesig'].error).toBe(
+      'PDU from origin server without valid signature'
+    );
+    expect((accept.body as { pdus: Record<string, unknown> }).pdus['$raceaccept']).toEqual({});
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`send residual flood-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      verifyContentHash.mockResolvedValue(false);
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+        processedPdus: { [`$prev${i}`]: { accepted: 0, rejection_reason: null } },
+      });
+      const env = makeEnv(db);
+      const results = await Promise.all([
+        req('PUT', `/_matrix/federation/v1/send/txn-rf-h-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$hm${i}`,
+              room_id: ROOM,
+              sender: REMOTE_USER,
+              type: 'm.room.message',
+              content: { body: 'x' },
+              hashes: { sha256: 'bad' },
+              signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+            },
+          ],
+        }),
+        req('PUT', `/_matrix/federation/v1/send/txn-rf-p-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$prev${i}`,
+              room_id: ROOM,
+              sender: REMOTE_USER,
+              type: 'm.room.message',
+              content: { body: 'y' },
+            },
+          ],
+        }),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual media disposition∥openid∥edu after #252', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+  });
+
+  it('download disposition∥octet-stream dual', async () => {
+    const media = mockR2({
+      [MEDIA_DISP]: new Uint8Array([1, 2, 3]),
+      orphan_race: new Uint8Array([9, 9, 9]),
+    });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_DISP, content_type: 'image/png', filename: 'race.png' }],
+    });
+    const env = makeEnv(db, { media });
+    const [withName, orphan] = await Promise.all([
+      req('GET', `/_matrix/federation/v1/media/download/${MEDIA_DISP}`, env),
+      req('GET', '/_matrix/federation/v1/media/download/orphan_race', env),
+    ]);
+    expect(statusesOf([withName, orphan])).toEqual([200, 200]);
+    expect(withName.headers.get('Content-Disposition')).toBe('inline; filename="race.png"');
+    expect(orphan.headers.get('Content-Type')).toBe('application/octet-stream');
+  });
+
+  it('thumbnail clamp∥non-image isolation', async () => {
+    const thumbKey = `thumb_${MEDIA_DISP}_1920x64_scale`;
+    const media = mockR2({
+      [MEDIA_DISP]: new Uint8Array([1, 2, 3]),
+      [thumbKey]: new Uint8Array([8, 8, 8]),
+      pdf_race: new Uint8Array([4, 5, 6]),
+    });
+    const db = createFedDb({
+      media: [
+        { media_id: MEDIA_DISP, content_type: 'image/png', filename: 'a.png' },
+        { media_id: 'pdf_race', content_type: 'application/pdf', filename: 'a.pdf' },
+      ],
+    });
+    const env = makeEnv(db, { media });
+    const [clamp, pdf] = await Promise.all([
+      req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA_DISP}?width=99999&height=64&method=scale`,
+        env
+      ),
+      req('GET', '/_matrix/federation/v1/media/thumbnail/pdf_race?width=64&height=64', env),
+    ]);
+    expect(statusesOf([clamp, pdf])).toEqual([200, 200]);
+    expect(clamp.headers.get('Content-Type')).toBe('image/jpeg');
+    expect(pdf.headers.get('X-Thumbnail-Generated')).toBeNull();
+  });
+
+  it('openid expired∥invalid text dual', async () => {
+    const sessions = mockKv({
+      'openid:exp_race': JSON.stringify({ user_id: LOCAL_USER, expires_at: Date.now() - 5000 }),
+    });
+    const env = makeEnv(createFedDb(), { sessions });
+    const [expired, invalid] = await Promise.all([
+      req('GET', '/_matrix/federation/v1/openid/userinfo?access_token=exp_race', env),
+      req('GET', '/_matrix/federation/v1/openid/userinfo?access_token=nope_race', env),
+    ]);
+    expect(statusesOf([expired, invalid])).toEqual([401, 401]);
+    expect((expired.body as { error: string }).error).toBe('OpenID token has expired');
+    expect((invalid.body as { error: string }).error).toBe('Invalid or expired OpenID token');
+  });
+
+  it('presence EDU∥noop EDU dual record', async () => {
+    const db = createFedDb();
+    const env = makeEnv(db);
+    const [pres, noop] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-race-pres', env, {
+        pdus: [],
+        edus: [
+          {
+            edu_type: 'm.presence',
+            content: {
+              push: [{ user_id: `@p:${FED_ORIGIN}`, presence: 'online', currently_active: true }],
+            },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-race-noop', env, {
+        pdus: [],
+        edus: [{ edu_type: 'm.receipt', content: { n: 1 } }],
+      }),
+    ]);
+    expect(statusesOf([pres, noop])).toEqual([200, 200]);
+    expect(db.inserts.some((ins) => String(ins.sql).includes('INSERT INTO presence'))).toBe(true);
+    expect(
+      db.inserts.filter((ins) => String(ins.sql).includes('INSERT OR REPLACE INTO processed_edus')).length
+    ).toBeGreaterThanOrEqual(2);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`media/openid residual flood-${i}`, async () => {
+      const media = mockR2({
+        [MEDIA_DISP]: new Uint8Array([i, i + 1, i + 2]),
+      });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_DISP, content_type: 'image/png', filename: `f${i}.png` }],
+      });
+      const sessions = mockKv({
+        [`openid:ok${i}`]: JSON.stringify({ user_id: LOCAL_USER, expires_at: Date.now() + 60_000 }),
+      });
+      const env = makeEnv(db, { media, sessions });
+      const results = await Promise.all([
+        req('GET', `/_matrix/federation/v1/media/download/${MEDIA_DISP}`, env),
+        req('GET', `/_matrix/federation/v1/openid/userinfo?access_token=ok${i}`, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
     });
