@@ -16,59 +16,11 @@
  * No product inventing. Reversible by deleting this file.
  */
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
-import { generateSigningKeyPair } from '../src/utils/crypto';
 
 const FED_ORIGIN = 'remote.example.com';
 let federationOrigin: string | undefined = FED_ORIGIN;
-
-/** Remap Cloudflare NODE-ED25519 → Node Ed25519 for unit tests. */
-function installNodeEd25519Shim() {
-  const subtle = crypto.subtle;
-  const origGenerateKey = subtle.generateKey.bind(subtle);
-  const origImportKey = subtle.importKey.bind(subtle);
-  const origSign = subtle.sign.bind(subtle);
-  const origVerify = subtle.verify.bind(subtle);
-
-  const mapAlg = (
-    alg: AlgorithmIdentifier | EcKeyGenParams | EcKeyImportParams | EcdsaParams | unknown
-  ): AlgorithmIdentifier => {
-    if (typeof alg === 'string') {
-      return alg === 'NODE-ED25519' ? 'Ed25519' : alg;
-    }
-    if (alg && typeof alg === 'object' && (alg as { name?: string }).name === 'NODE-ED25519') {
-      return 'Ed25519';
-    }
-    return alg as AlgorithmIdentifier;
-  };
-
-  subtle.generateKey = ((alg: AlgorithmIdentifier, extractable: boolean, usages: KeyUsage[]) =>
-    origGenerateKey(mapAlg(alg), extractable, usages)) as typeof subtle.generateKey;
-  subtle.importKey = ((
-    format: KeyFormat,
-    keyData: BufferSource | JsonWebKey,
-    alg: AlgorithmIdentifier,
-    extractable: boolean,
-    usages: KeyUsage[]
-  ) =>
-    origImportKey(format, keyData, mapAlg(alg), extractable, usages)) as typeof subtle.importKey;
-  subtle.sign = ((alg: AlgorithmIdentifier, key: CryptoKey, data: BufferSource) =>
-    origSign(mapAlg(alg), key, data)) as typeof subtle.sign;
-  subtle.verify = ((
-    alg: AlgorithmIdentifier,
-    key: CryptoKey,
-    signature: BufferSource,
-    data: BufferSource
-  ) => origVerify(mapAlg(alg), key, signature, data)) as typeof subtle.verify;
-
-  return () => {
-    subtle.generateKey = origGenerateKey;
-    subtle.importKey = origImportKey;
-    subtle.sign = origSign;
-    subtle.verify = origVerify;
-  };
-}
 
 vi.mock('../src/middleware/federation-auth', () => ({
   requireFederationAuth: () => {
@@ -904,23 +856,6 @@ async function req(
   return { status: res.status, body: parsed, headers: res.headers };
 }
 
-function makeEvent(overrides: Partial<EventRow> & Pick<EventRow, 'event_id' | 'event_type'>): EventRow {
-  return {
-    room_id: ROOM,
-    sender: LOCAL_USER,
-    state_key: '',
-    content: '{}',
-    origin_server_ts: 1_700_000_000_000,
-    depth: 1,
-    auth_events: '[]',
-    prev_events: '[]',
-    hashes: null,
-    signatures: null,
-    ...overrides,
-  };
-}
-
-
 type R2Store = {
   data: Record<string, { body: Uint8Array }>;
   get: (key: string) => Promise<{ body: ReadableStream; arrayBuffer: () => Promise<ArrayBuffer> } | null>;
@@ -966,9 +901,6 @@ function mockR2(
 }
 
 
-
-const MEDIA_ID = 'mxc_media_abc';
-const REMOTE_USER = `@remote:${FED_ORIGIN}`;
 
 function statusesOf(results: Array<{ status: number }>): number[] {
   return results.map((r) => r.status).sort((a, b) => a - b);

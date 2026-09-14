@@ -1866,13 +1866,6 @@ async function jsonReq(
   return { status: res.status, body };
 }
 
-function nonAdminEnv() {
-  const db = createAdminDb({
-    users: [{ ...defaultAdmin(), admin: 0 }, defaultBob()],
-  });
-  return createEnv({ db });
-}
-
 beforeEach(() => {
   authState.userId = ADMIN;
   authState.deviceId = 'ADMINDEVICE';
