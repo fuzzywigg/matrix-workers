@@ -1,7 +1,13 @@
 /**
- * TOKENMAXX HEAVY leftovers after #157 — federation S2S soft/edge/reliability.
- * Complements federation-api-routes.test.ts. Tests-only — no product inventing.
+ * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 — federation S2S
+ * soft/edge/reliability. Complements federation-api-routes.test.ts and
+ * federation-api-concurrent-race leftovers (#239). Tests-only — no product inventing.
  * Fixtures use example.com only.
+ *
+ * Deepen after #241: hierarchy, timestamp_to_event, event_auth, backfill,
+ * get_missing_events, media/thumbnail soft floods — present in federation.ts /
+ * federation-api-routes base but unsaturated in this leftovers soft flood after
+ * #157/#161 (concurrent races covered those paths; serial soft floods did not).
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -2673,6 +2679,365 @@ describe('soft-extra publicRooms pagination charset', () => {
     const r = await req('GET', '/_matrix/federation/v1/publicRooms?limit=1&since=offset_' + 9, makeEnv(createFedDb({ rooms })));
     expect(r.status).toBe(200);
   });
+});
+
+// deepen federation-api route leftovers after #241 (unsaturated soft floods)
+
+describe('soft hierarchy leftover flood after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  function seedSpace() {
+    const childRoom = '!child:example.com';
+    const childEvt = makeEvent({
+      event_id: '$childlink',
+      event_type: 'm.space.child',
+      state_key: childRoom,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const name = makeEvent({
+      event_id: '$spname',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Space' }),
+    });
+    const childName = makeEvent({
+      event_id: '$cname',
+      room_id: childRoom,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Child' }),
+    });
+    return createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: childRoom, room_version: '10', is_public: 1, created_at: 2 },
+      ],
+      events: [childEvt, name, childName],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', childRoom), childEvt.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+        [stateKey(childRoom, 'm.room.name', ''), childName.event_id],
+      ]),
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`hierarchy suggested soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?suggested_only=true&limit=${1 + (i % 8)}`,
+        makeEnv(seedSpace())
+      );
+      expect(r.status).toBe(200);
+      const body = r.body as { room: { room_id: string } | null; children: unknown[] };
+      expect(body.room?.room_id).toBe(ROOM);
+      expect(body.children.length).toBeGreaterThanOrEqual(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`hierarchy missing soft-${i}`, async () => {
+      const r = await req('GET', '/_matrix/federation/v1/hierarchy/%21no%3Ax', makeEnv(createFedDb()));
+      expect(r.status).toBe(404);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`hierarchy from offset soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?from=offset_${i % 3}`,
+        makeEnv(seedSpace())
+      );
+      expect(r.status).toBe(200);
+    });
+  }
+});
+
+describe('soft timestamp_to_event leftover flood after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  function seedTs() {
+    return createFedDb({
+      events: [
+        makeEvent({
+          event_id: '$t1',
+          event_type: 'm.room.message',
+          content: '{}',
+          origin_server_ts: 1000,
+        }),
+        makeEvent({
+          event_id: '$t2',
+          event_type: 'm.room.message',
+          content: '{}',
+          origin_server_ts: 2000,
+          depth: 2,
+        }),
+      ],
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`timestamp dir soft-${i}`, async () => {
+      const dir = i % 2 === 0 ? 'f' : 'b';
+      const ts = 1500 + (i % 5) * 10;
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=${ts}&dir=${dir}`,
+        makeEnv(seedTs())
+      );
+      expect(r.status).toBe(200);
+      expect((r.body as { event_id: string }).event_id).toBeTruthy();
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`timestamp missing ts soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}`,
+        makeEnv(seedTs())
+      );
+      expect(r.status).toBe(400);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`timestamp missing room soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        '/_matrix/federation/v1/timestamp_to_event/%21no%3Ax?ts=1500',
+        makeEnv(seedTs())
+      );
+      expect(r.status).toBe(404);
+    });
+  }
+});
+
+describe('soft event_auth leftover flood after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  function seedAuth() {
+    const create = makeEvent({
+      event_id: '$c:example.com',
+      event_type: 'm.room.create',
+      content: JSON.stringify({ creator: LOCAL_USER }),
+      auth_events: '[]',
+    });
+    const child = makeEvent({
+      event_id: '$child:example.com',
+      event_type: 'm.room.member',
+      state_key: LOCAL_USER,
+      content: JSON.stringify({ membership: 'join' }),
+      auth_events: JSON.stringify(['$c:example.com']),
+      depth: 2,
+    });
+    return {
+      child,
+      db: createFedDb({
+        events: [create, child],
+        rooms: [{ room_id: ROOM, room_version: '10' }],
+      }),
+    };
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`event_auth chain soft-${i}`, async () => {
+      const { child, db } = seedAuth();
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(child.event_id)}`,
+        makeEnv(db)
+      );
+      expect(r.status).toBe(200);
+      expect((r.body as { auth_chain: unknown[] }).auth_chain.length).toBeGreaterThanOrEqual(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`event_auth missing soft-${i}`, async () => {
+      const { db } = seedAuth();
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/%24missing${i}`,
+        makeEnv(db)
+      );
+      expect(r.status).toBe(404);
+    });
+  }
+});
+
+describe('soft backfill leftover flood after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  function seedBackfill() {
+    const events = [1, 2, 3, 4, 5].map((d) =>
+      makeEvent({
+        event_id: `$d${d}:example.com`,
+        event_type: 'm.room.message',
+        content: JSON.stringify({ body: String(d) }),
+        depth: d,
+      })
+    );
+    return createFedDb({
+      events,
+      memberships: [{ room_id: ROOM, user_id: `@m:${FED_ORIGIN}`, membership: 'join' }],
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`backfill recent soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=${1 + (i % 5)}`,
+        makeEnv(seedBackfill())
+      );
+      expect(r.status).toBe(200);
+      expect((r.body as { pdus: unknown[] }).pdus.length).toBeLessThanOrEqual(1 + (i % 5));
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`backfill depth-filter soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=10&v=%24d5%3Aexample.com`,
+        makeEnv(seedBackfill())
+      );
+      expect(r.status).toBe(200);
+      expect(
+        (r.body as { pdus: Array<{ depth: number }> }).pdus.every((p) => p.depth < 5)
+      ).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`backfill forbid non-member soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}`,
+        makeEnv(createFedDb({ memberships: [] }))
+      );
+      expect(r.status).toBe(403);
+    });
+  }
+});
+
+describe('soft get_missing_events leftover flood after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  function seedMissing() {
+    const e1 = makeEvent({
+      event_id: '$m1:example.com',
+      event_type: 'm.room.message',
+      content: '{}',
+      depth: 1,
+      prev_events: '[]',
+    });
+    const e2 = makeEvent({
+      event_id: '$m2:example.com',
+      event_type: 'm.room.message',
+      content: '{}',
+      depth: 2,
+      prev_events: JSON.stringify(['$m1:example.com']),
+    });
+    return createFedDb({
+      events: [e1, e2],
+      memberships: [{ room_id: ROOM, user_id: `@m:${FED_ORIGIN}`, membership: 'join' }],
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`get_missing soft-${i}`, async () => {
+      const r = await req(
+        'POST',
+        `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`,
+        makeEnv(seedMissing()),
+        { earliest_events: [], latest_events: ['$m2:example.com'], limit: 10 }
+      );
+      expect(r.status).toBe(200);
+      expect(Array.isArray((r.body as { events: unknown[] }).events)).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`get_missing bad json soft-${i}`, async () => {
+      const r = await req(
+        'POST',
+        `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`,
+        makeEnv(seedMissing()),
+        '{'
+      );
+      expect(r.status).toBe(400);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`get_missing forbid soft-${i}`, async () => {
+      const r = await req(
+        'POST',
+        `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`,
+        makeEnv(createFedDb({ memberships: [] })),
+        { earliest_events: [], latest_events: ['$m2:example.com'], limit: 10 }
+      );
+      expect(r.status).toBe(403);
+    });
+  }
+});
+
+describe('soft media thumbnail leftover flood after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  const MEDIA_ID = 'fed_media_thumb';
+
+  for (let i = 0; i < 12; i++) {
+    it(`thumbnail pre-generated soft-${i}`, async () => {
+      const w = 32 + (i % 4) * 16;
+      const h = 32;
+      const method = i % 2 === 0 ? 'scale' : 'crop';
+      const thumbKey = `thumb_${MEDIA_ID}_${w}x${h}_${method}`;
+      const media = mockR2({
+        [MEDIA_ID]: new Uint8Array([1, 2, 3]),
+        [thumbKey]: new Uint8Array([9, 9, 9]),
+      });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'a.png' }],
+      });
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=${w}&height=${h}&method=${method}`,
+        makeEnv(db, { media })
+      );
+      expect(r.status).toBe(200);
+      expect(r.headers.get('Content-Type')).toBe('image/jpeg');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`thumbnail fallback original soft-${i}`, async () => {
+      const media = mockR2({ [MEDIA_ID]: new Uint8Array([4, 5, 6, 7]) });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'b.png' }],
+      });
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=64&height=64`,
+        makeEnv(db, { media })
+      );
+      expect(r.status).toBe(200);
+      expect(r.headers.get('Content-Type')).toBe('image/png');
+      expect(r.headers.get('X-Thumbnail-Generated')).toBe('false');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`thumbnail missing soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/nope-${i}`,
+        makeEnv(createFedDb())
+      );
+      expect(r.status).toBe(404);
+    });
+  }
 });
 
 afterEach(() => { federationOrigin = FED_ORIGIN; vi.clearAllMocks(); });

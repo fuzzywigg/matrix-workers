@@ -1,14 +1,14 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 — federation-api
- * *concurrent race / TOCTOU* for leftover S2S routes that only had serial
- * soft floods (#157 leftover). Distinct from federation-keys-membership-account-data
- * concurrent-race (OTK / make_join) and federation-api-route-leftovers (serial
- * floods). Distinct from tip #232 (room-cache) and catchup/consumer (#231).
+ * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
+ * — federation-api *concurrent race / TOCTOU* for leftover S2S routes that
+ * only had serial soft floods (#157 leftover). Distinct from
+ * federation-keys-membership-account-data concurrent-race (OTK / make_join)
+ * and federation-api-route-leftovers (serial floods). Distinct from tip #241
+ * (devices+keybackups) and #239 (this file's prior deepen).
  *
- * Focus (this deepen): key/v2/server/:keyId; notary query own-server;
- * thumbnail R2 thumb-key barrier; event_auth chain; backfill membership;
- * timestamp_to_event dir=f∥b; hierarchy; send cached∥miss isolation;
- * openid already-expired delete; get_missing_events; leftover 404 isolation.
+ * Residual after #241: hierarchy∥timestamp∥backfill triple; thumbnail∥download;
+ * event_auth∥get_missing isolation; version∥publicRooms — soft-flooded in
+ * route leftovers deepen but not additional Promise.all races after #239.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -1979,6 +1979,241 @@ describe('race leftover send cache∥openid expired after #232', () => {
         req('GET', `/_matrix/federation/v1/openid/userinfo?access_token=gone-${i}`, env),
       ]);
       expect(results.map((r) => r.status).sort((a, b) => a - b)).toEqual([200, 401]);
+    });
+  }
+});
+
+// residual concurrent races after #241 (route-leftover soft niches not raced post-#239)
+
+describe('race residual hierarchy∥timestamp∥backfill triple after #241', () => {
+  function seedSpace() {
+    const childRoom = '!child:example.com';
+    const childEvt = makeEvent({
+      event_id: '$childlink',
+      event_type: 'm.space.child',
+      state_key: childRoom,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const name = makeEvent({
+      event_id: '$spname',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Space' }),
+    });
+    const childName = makeEvent({
+      event_id: '$cname',
+      room_id: childRoom,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Child' }),
+    });
+    const t1 = makeEvent({
+      event_id: '$t1',
+      event_type: 'm.room.message',
+      content: '{}',
+      origin_server_ts: 1000,
+    });
+    const t2 = makeEvent({
+      event_id: '$t2',
+      event_type: 'm.room.message',
+      content: '{}',
+      origin_server_ts: 2000,
+      depth: 2,
+    });
+    const depthEvents = [1, 2, 3, 4, 5].map((d) =>
+      makeEvent({
+        event_id: `$d${d}:example.com`,
+        event_type: 'm.room.message',
+        content: JSON.stringify({ body: String(d) }),
+        depth: d,
+      })
+    );
+    return createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: childRoom, room_version: '10', is_public: 1, created_at: 2 },
+      ],
+      events: [childEvt, name, childName, t1, t2, ...depthEvents],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', childRoom), childEvt.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+        [stateKey(childRoom, 'm.room.name', ''), childName.event_id],
+      ]),
+      memberships: [{ room_id: ROOM, user_id: `@m:${FED_ORIGIN}`, membership: 'join' }],
+    });
+  }
+
+  it('hierarchy∥timestamp∥backfill triple 200', async () => {
+    const env = makeEnv(seedSpace());
+    const results = await Promise.all([
+      req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?suggested_only=true&limit=10`,
+        env
+      ),
+      req(
+        'GET',
+        `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1500&dir=f`,
+        env
+      ),
+      req('GET', `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=3`, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200, 200]);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`hierarchy/timestamp/backfill residual flood-${i}`, async () => {
+      const env = makeEnv(seedSpace());
+      const dir = i % 2 === 0 ? 'f' : 'b';
+      const results = await Promise.all([
+        req(
+          'GET',
+          `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?from=offset_0`,
+          env
+        ),
+        req(
+          'GET',
+          `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1500&dir=${dir}`,
+          env
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual thumbnail∥download after #241', () => {
+  it('thumbnail pre-gen∥download isolation', async () => {
+    const thumbKey = `thumb_${MEDIA_ID}_96x96_scale`;
+    const media = mockR2({
+      [MEDIA_ID]: new Uint8Array([1, 2, 3]),
+      [thumbKey]: new Uint8Array([9, 9, 9]),
+    });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'pic.png' }],
+    });
+    const env = makeEnv(db, { media });
+    const results = await Promise.all([
+      req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=96&height=96&method=scale`,
+        env
+      ),
+      req('GET', `/_matrix/federation/v1/media/download/${MEDIA_ID}`, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results[0].headers.get('Content-Type')).toBe('image/jpeg');
+  });
+
+  it('thumbnail missing∥download missing dual 404', async () => {
+    const env = makeEnv(createFedDb());
+    const results = await Promise.all([
+      req('GET', '/_matrix/federation/v1/media/thumbnail/nope', env),
+      req('GET', '/_matrix/federation/v1/media/download/nope', env),
+    ]);
+    expect(statusesOf(results)).toEqual([404, 404]);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`thumbnail/download residual flood-${i}`, async () => {
+      const media = mockR2({ [MEDIA_ID]: new Uint8Array([i, i + 1, i + 2]) });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: `p${i}.png` }],
+      });
+      const env = makeEnv(db, { media });
+      const results = await Promise.all([
+        req('GET', `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=32&height=32`, env),
+        req('GET', `/_matrix/federation/v1/media/download/${MEDIA_ID}`, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual event_auth∥get_missing∥version after #241', () => {
+  function seedAuthMissing() {
+    const create = makeEvent({
+      event_id: '$c:example.com',
+      event_type: 'm.room.create',
+      content: JSON.stringify({ creator: LOCAL_USER }),
+      auth_events: '[]',
+    });
+    const child = makeEvent({
+      event_id: '$child:example.com',
+      event_type: 'm.room.member',
+      state_key: LOCAL_USER,
+      content: JSON.stringify({ membership: 'join' }),
+      auth_events: JSON.stringify(['$c:example.com']),
+      depth: 2,
+    });
+    const e1 = makeEvent({
+      event_id: '$m1:example.com',
+      event_type: 'm.room.message',
+      content: '{}',
+      depth: 1,
+      prev_events: '[]',
+    });
+    const e2 = makeEvent({
+      event_id: '$m2:example.com',
+      event_type: 'm.room.message',
+      content: '{}',
+      depth: 2,
+      prev_events: JSON.stringify(['$m1:example.com']),
+    });
+    return {
+      child,
+      db: createFedDb({
+        events: [create, child, e1, e2],
+        rooms: [{ room_id: ROOM, room_version: '10' }],
+        memberships: [{ room_id: ROOM, user_id: `@m:${FED_ORIGIN}`, membership: 'join' }],
+      }),
+    };
+  }
+
+  it('event_auth∥get_missing isolation', async () => {
+    const { child, db } = seedAuthMissing();
+    const env = makeEnv(db);
+    const results = await Promise.all([
+      req(
+        'GET',
+        `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(child.event_id)}`,
+        env
+      ),
+      req(
+        'POST',
+        `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`,
+        env,
+        { earliest_events: [], latest_events: ['$m2:example.com'], limit: 10 }
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect((results[0].body as { auth_chain: unknown[] }).auth_chain.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('version∥publicRooms residual dual', async () => {
+    const env = makeEnv(
+      createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1000 }],
+      })
+    );
+    const results = await Promise.all([
+      req('GET', '/_matrix/federation/v1/version', env),
+      req('GET', '/_matrix/federation/v1/publicRooms?limit=5', env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`event_auth/get_missing/version residual flood-${i}`, async () => {
+      const { child, db } = seedAuthMissing();
+      const env = makeEnv(db);
+      const results = await Promise.all([
+        req(
+          'GET',
+          `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(child.event_id)}`,
+          env
+        ),
+        req('GET', '/_matrix/federation/v1/version', env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
     });
   }
 });

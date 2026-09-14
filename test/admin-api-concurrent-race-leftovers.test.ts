@@ -1,17 +1,15 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 — admin *GET
- * concurrent race / TOCTOU* for leftover admin-api routes that only had serial
- * soft floods (#157 leftover) or mutate races (#189). Distinct from
- * admin-mutate-concurrent-race-leftovers (writes) and admin-api-route-leftovers
- * (serial GET floods).
+ * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
+ * — admin *GET concurrent race / TOCTOU* for leftover admin-api routes that
+ * only had serial soft floods (#157 leftover) or mutate races (#189). Distinct
+ * from admin-mutate-concurrent-race-leftovers (writes) and
+ * admin-api-route-leftovers (serial GET floods).
  *
- * Distinct from tip #232 (room-cache KV generation) and #226 (rate-limit DO).
- *
- * Focus (this deepen): federation/status CACHE mutate mid-flight; DEVICE_KEYS
- * get-barrier keys debug; IdP GET by id; synapse user/room detail; whois
- * non-admin self∥other; users search∥guests filter; audit/report query
- * isolation; room events before=; history invalid period pin; federation/test
- * fetch fail; 404 isolation; destinations next_token; keys corrupt JSON.
+ * Distinct from tip #241 (devices+keybackups residual) and #239 (this file's
+ * prior deepen). Residual after #241: sessions list∥revoke; login-token∥sessions;
+ * quarantine∥media list; reactivate∥user detail; make-admin∥whois;
+ * analytics∥destinations isolation — soft-flooded in route leftovers but not
+ * raced under Promise.all after #239.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -2833,6 +2831,202 @@ describe('race leftover GET charset + HEAD/OPTIONS after #232', () => {
       const results = await Promise.all([
         jsonReq('/admin/api/media?limit=1', init, env),
         jsonReq('/admin/api/audit?limit=1', init, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+// residual concurrent races after #241 (route-leftover soft niches not raced post-#239)
+
+describe('race residual sessions list∥revoke after #241', () => {
+  it('sessions GET∥DELETE-all under race', async () => {
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const [list, revoke] = await Promise.all([
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, { method: 'DELETE', headers: AUTH }, env),
+    ]);
+    expect(list.status).toBe(200);
+    expect(revoke.status).toBe(200);
+    expect(revoke.body.success).toBe(true);
+    expect(db.tokens.every((t) => t.user_id !== BOB)).toBe(true);
+  });
+
+  it('session id revoke∥list isolation', async () => {
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const [rev, list] = await Promise.all([
+      jsonReq('/admin/api/sessions/tok-bob', { method: 'DELETE', headers: AUTH }, env),
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+    ]);
+    expect(rev.status).toBe(200);
+    expect(list.status).toBe(200);
+    expect(db.tokens.find((t) => t.token_id === 'tok-bob')).toBeUndefined();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`sessions residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const bobEnc = encodeURIComponent(BOB);
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+        jsonReq(`/admin/api/users/${bobEnc}/sessions`, { method: 'DELETE', headers: AUTH }, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual login-token∥sessions after #241', () => {
+  it('login-token mint∥sessions list dual 200', async () => {
+    const sessions = mockKv();
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db, sessions });
+    const [token, list] = await Promise.all([
+      jsonReq(`/admin/api/users/${bobEnc}/login-token`, jsonInit('POST', { ttl_minutes: 5 }), env),
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+    ]);
+    expect(token.status).toBe(200);
+    expect(list.status).toBe(200);
+    expect(token.body.token).toBe('mlt_pinned_login_token');
+    expect(sessions.puts.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('login-token deactivated∥missing isolation', async () => {
+    const db = createAdminDb({
+      users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+    });
+    const env = createEnv({ db });
+    const [deact, missing] = await Promise.all([
+      jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        jsonInit('POST', { ttl_minutes: 2 }),
+        env
+      ),
+      jsonReq(
+        `/admin/api/users/${encodeURIComponent('@nope:example.com')}/login-token`,
+        jsonInit('POST', {}),
+        env
+      ),
+    ]);
+    expect(deact.status).toBe(400);
+    expect(deact.body.errcode).toBe('M_USER_DEACTIVATED');
+    expect(missing.status).toBe(404);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`login-token residual flood-${i}`, async () => {
+      const sessions = mockKv();
+      const env = createEnv({ sessions });
+      const results = await Promise.all([
+        jsonReq(
+          `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+          jsonInit('POST', { ttl_minutes: 1 + (i % 3) }),
+          env
+        ),
+        jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/sessions`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual quarantine∥media∥reactivate after #241', () => {
+  it('quarantine∥media list isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [q, list] = await Promise.all([
+      jsonReq(`/admin/api/media/${MEDIA_ID}/quarantine`, { method: 'POST', headers: AUTH }, env),
+      jsonReq('/admin/api/media?limit=10', {}, env),
+    ]);
+    expect(q.status).toBe(200);
+    expect(list.status).toBe(200);
+    expect(db.media.find((m) => m.media_id === MEDIA_ID)?.quarantined).toBe(1);
+  });
+
+  it('reactivate∥user detail dual', async () => {
+    const db = createAdminDb({
+      users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+    });
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const [react, detail] = await Promise.all([
+      jsonReq(`/admin/api/users/${bobEnc}/reactivate`, { method: 'POST', headers: AUTH }, env),
+      jsonReq(`/admin/api/users/${bobEnc}`, {}, env),
+    ]);
+    expect(react.status).toBe(200);
+    expect(detail.status).toBe(200);
+    expect(db.users.find((u) => u.user_id === BOB)?.is_deactivated).toBe(0);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`quarantine/reactivate residual flood-${i}`, async () => {
+      const db = createAdminDb({
+        users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+      });
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq(`/admin/api/media/${MEDIA_ID}/quarantine`, { method: 'POST', headers: AUTH }, env),
+        jsonReq(
+          `/admin/api/users/${encodeURIComponent(BOB)}/reactivate`,
+          { method: 'POST', headers: AUTH },
+          env
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual make-admin∥whois∥analytics after #241', () => {
+  it('make-admin∥whois isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [make, whois] = await Promise.all([
+      jsonReq('/admin/api/make-admin', jsonInit('POST', { user_id: BOB }), env),
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(BOB)}`, {}, env),
+    ]);
+    expect(make.status).toBe(200);
+    expect(whois.status).toBe(200);
+    expect(db.users.find((u) => u.user_id === BOB)?.admin).toBe(1);
+  });
+
+  it('remove-admin self-demote∥make-admin isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [self, make] = await Promise.all([
+      jsonReq('/admin/api/remove-admin', jsonInit('POST', { user_id: ADMIN }), env),
+      jsonReq('/admin/api/make-admin', jsonInit('POST', { user_id: BOB }), env),
+    ]);
+    expect(self.status).toBe(403);
+    expect(make.status).toBe(200);
+  });
+
+  it('analytics requests∥federation∥destinations residual', async () => {
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq('/_matrix/client/v3/admin/analytics/requests?period=7d', {}, env),
+      jsonReq('/_matrix/client/v3/admin/analytics/federation?period=1h', {}, env),
+      jsonReq('/_synapse/admin/v1/federation/destinations?limit=5&from=0', {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200, 200]);
+    expect(results[0].body.period).toBe('7d');
+    expect(results[1].body.period).toBe('1h');
+    expect(Array.isArray(results[2].body.destinations)).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`make-admin/analytics residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq('/admin/api/make-admin', jsonInit('POST', { user_id: BOB }), env),
+        jsonReq(`/_matrix/client/v3/admin/analytics/requests?period=${i % 2 === 0 ? '1h' : '24h'}`, {}, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
     });
