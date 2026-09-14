@@ -20,8 +20,7 @@
  * No product inventing. Does not touch auth.ts source (HITL).
  * Reversible by deleting this file.
  */
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Env } from '../src/types';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppServiceRegistration } from '../src/services/appservice';
 import {
   getAppServices,
@@ -31,187 +30,15 @@ import {
   isExclusiveAppServiceUser,
   sendAppServiceTransaction,
 } from '../src/services/appservice';
-import { extractAccessToken } from '../src/middleware/auth';
+import {
+  extractAccessToken,
+  requireAuth,
+} from '../src/middleware/auth';
 import { hashToken } from '../src/utils/crypto';
 
-// Real requireAuth/optionalAuth loaded via importActual in auth suites below
-// (filter routes use the mocked requireAuth from vi.mock).
-
-// ---------------------------------------------------------------------------
-// Filters harness (mocked requireAuth — mirrors tertiary/second-wave)
-// ---------------------------------------------------------------------------
-
-vi.mock('../src/middleware/rate-limit', () => ({
-  rateLimitMiddleware: async (_c: unknown, next: () => Promise<void>) => next(),
-  getRateLimitType: () => 'default',
-  getClientId: () => 'unknown',
-  RATE_LIMITS: {},
-}));
-
-vi.mock('hono/logger', () => ({
-  logger: () => async (_c: unknown, next: () => Promise<void>) => next(),
-}));
-
-vi.mock('../src/middleware/analytics', () => ({
-  analyticsMiddleware: () => async (_c: unknown, next: () => Promise<void>) => next(),
-}));
-
-const authState = vi.hoisted(() => ({
-  userId: '@alice:example.com' as string | undefined,
-  deviceId: 'DEVICEA' as string,
-}));
-
-vi.mock('../src/middleware/auth', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/middleware/auth')>();
-  return {
-    ...actual,
-    requireAuth: () => {
-      return async (c: { set: (k: string, v: unknown) => void }, next: () => Promise<void>) => {
-        c.set('userId', authState.userId);
-        c.set('deviceId', authState.deviceId);
-        await next();
-      };
-    },
-    optionalAuth: () => {
-      return async (c: { set: (k: string, v: unknown) => void }, next: () => Promise<void>) => {
-        if (authState.userId) c.set('userId', authState.userId);
-        c.set('deviceId', authState.deviceId);
-        await next();
-      };
-    },
-  };
-});
-
-vi.mock('../src/durable-objects', () => ({
-  RoomDurableObject: class {},
-  SyncDurableObject: class {},
-  FederationDurableObject: class {},
-  CallRoomDurableObject: class {},
-  AdminDurableObject: class {},
-  UserKeysDurableObject: class {},
-  PushDurableObject: class {},
-  RateLimitDurableObject: class {},
-}));
-
-vi.mock('../src/workflows', () => ({
-  RoomJoinWorkflow: class {},
-  PushNotificationWorkflow: class {},
-  FederationCatchupWorkflow: class {},
-  MediaCleanupWorkflow: class {},
-  StateCompactionWorkflow: class {},
-}));
-
-import app from '../src/index';
-
-const USER = '@alice:example.com';
-const CAROL = '@carol:example.com';
-const BOB = '@bob:example.com';
-const USER_ENC = encodeURIComponent(USER);
-const CAROL_ENC = encodeURIComponent(CAROL);
-const BOB_ENC = encodeURIComponent(BOB);
-const AUTH = { Authorization: 'Bearer test-token' };
-const FILTER_SERVER = 'example.com';
 const AS_SERVER = 'example.com';
 const AS_ESC = AS_SERVER.replace(/\./g, '\\.');
 const AUTH_SERVER = 'matrix.example.com';
-
-type KvPut = { key: string; value: string; options?: { expirationTtl?: number } };
-
-function mockCache(initial: Record<string, string> = {}) {
-  const data: Record<string, string> = { ...initial };
-  const puts: KvPut[] = [];
-  let putCount = 0;
-  let getCount = 0;
-  return {
-    data,
-    puts,
-    get putCount() {
-      return putCount;
-    },
-    get getCount() {
-      return getCount;
-    },
-    get: async (key: string) => {
-      getCount += 1;
-      return data[key] ?? null;
-    },
-    put: async (key: string, value: string, options?: { expirationTtl?: number }) => {
-      putCount += 1;
-      data[key] = value;
-      puts.push({ key, value, options });
-    },
-    delete: async (key: string) => {
-      delete data[key];
-    },
-  };
-}
-
-type RaceCache = ReturnType<typeof mockCache>;
-
-function stubDb() {
-  return {
-    prepare(_sql: string) {
-      return {
-        bind(..._args: unknown[]) {
-          return {
-            async first() {
-              return null;
-            },
-            async all() {
-              return { results: [] };
-            },
-            async run() {
-              return { success: true, meta: { changes: 0 } };
-            },
-          };
-        },
-      };
-    },
-  };
-}
-
-function createEnv(cache?: RaceCache) {
-  const kv = cache ?? mockCache();
-  return {
-    SERVER_NAME: FILTER_SERVER,
-    SERVER_VERSION: 'test',
-    DB: stubDb() as unknown as D1Database,
-    CACHE: kv,
-    SESSIONS: mockCache(),
-    DEVICE_KEYS: mockCache(),
-    ONE_TIME_KEYS: mockCache(),
-    CROSS_SIGNING_KEYS: mockCache(),
-    ACCOUNT_DATA: mockCache(),
-    MEDIA: {
-      put: async () => {},
-      get: async () => null,
-      delete: async () => {},
-    },
-    _cache: kv,
-  } as unknown as Env & { _cache: RaceCache };
-}
-
-async function request(env: Env, path: string, init: RequestInit = {}) {
-  const res = await app.request(`http://localhost${path}`, init, env);
-  let body: unknown = null;
-  const text = await res.text();
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
-    }
-  }
-  return { status: res.status, body, headers: res.headers };
-}
-
-function filterCollection(userEnc = USER_ENC) {
-  return `/_matrix/client/v3/user/${userEnc}/filter`;
-}
-
-function sampleFilter(n: number) {
-  return { room: { timeline: { limit: n } } };
-}
 
 function registration(
   id: string,
@@ -231,7 +58,6 @@ function registration(
   };
 }
 
-// Auth harness (real requireAuth via partial mock above)
 type TokenRow = { user_id: string; device_id: string | null };
 type AsRow = {
   id: string;
@@ -334,8 +160,6 @@ async function jsonBody(
 }
 
 beforeEach(() => {
-  authState.userId = USER;
-  authState.deviceId = 'DEVICEA';
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -348,20 +172,12 @@ afterEach(() => {
 });
 
 // ===========================================================================
-// FILTERS — other-user POST + bad JSON → 403 before parse, zero puts
+// AUTH — protocols whitespace / users:{} / dup access_token
 // ===========================================================================
 
 describe('race senary auth after #286 (real requireAuth)', () => {
-  let realRequireAuth: typeof import('../src/middleware/auth').requireAuth;
-  let realOptionalAuth: typeof import('../src/middleware/auth').optionalAuth;
-
-  beforeAll(async () => {
-    const actual = await vi.importActual<typeof import('../src/middleware/auth')>(
-      '../src/middleware/auth'
-    );
-    realRequireAuth = actual.requireAuth;
-    realOptionalAuth = actual.optionalAuth;
-  });
+  // requireAuth is the real export (no filter mock in this file)
+  const realRequireAuth = requireAuth;
 
   describe('protocols whitespace throws under race', () => {
     for (let i = 0; i < 8; i++) {
@@ -1232,15 +1048,6 @@ describe('race senary appservice multi-event txn body + path-prefix after #286',
 });
 
 describe('race senary auth restrictive ns + sender outside after #286', () => {
-  let realRequireAuth: typeof import('../src/middleware/auth').requireAuth;
-
-  beforeAll(async () => {
-    const actual = await vi.importActual<typeof import('../src/middleware/auth')>(
-      '../src/middleware/auth'
-    );
-    realRequireAuth = actual.requireAuth;
-  });
-
   for (let i = 0; i < 8; i++) {
     it(`no user_id → @otherbot ok ∥ user_id=@otherbot forbid flood-${i}`, async () => {
       const tok = `as_restrict_${i}`;
@@ -1284,9 +1091,9 @@ describe('race senary auth restrictive ns + sender outside after #286', () => {
       });
 
       const [senderRes, forbidRes, allowRes] = await Promise.all([
-        realRequireAuth()(senderCtx, vi.fn(async () => 'sender')),
-        realRequireAuth()(forbidCtx, vi.fn()),
-        realRequireAuth()(allowCtx, vi.fn(async () => 'allow')),
+        requireAuth()(senderCtx, vi.fn(async () => 'sender')),
+        requireAuth()(forbidCtx, vi.fn()),
+        requireAuth()(allowCtx, vi.fn(async () => 'allow')),
       ]);
 
       // Namespace gate only when user_id is set — sender fallback skips it
@@ -1304,15 +1111,6 @@ describe('race senary auth restrictive ns + sender outside after #286', () => {
 });
 
 describe('race senary auth users:[null,good] .some OR after #286', () => {
-  let realRequireAuth: typeof import('../src/middleware/auth').requireAuth;
-
-  beforeAll(async () => {
-    const actual = await vi.importActual<typeof import('../src/middleware/auth')>(
-      '../src/middleware/auth'
-    );
-    realRequireAuth = actual.requireAuth;
-  });
-
   for (let i = 0; i < 8; i++) {
     it(`[null, good] allow ∥ [null] forbid under race flood-${i}`, async () => {
       const esc = AUTH_SERVER.replace(/\./g, '\\.');
@@ -1356,7 +1154,7 @@ describe('race senary auth users:[null,good] .some OR after #286', () => {
 
       const uid = `@null_or_${i}:${AUTH_SERVER}`;
       const [orRes, nullRes] = await Promise.all([
-        realRequireAuth()(
+        requireAuth()(
           makeAuthCtx({
             db: dbOr,
             url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent(uid)}`,
@@ -1364,7 +1162,7 @@ describe('race senary auth users:[null,good] .some OR after #286', () => {
           }),
           vi.fn(async () => 'allowed')
         ),
-        realRequireAuth()(
+        requireAuth()(
           makeAuthCtx({
             db: dbNull,
             url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent(uid)}`,
@@ -1374,7 +1172,7 @@ describe('race senary auth users:[null,good] .some OR after #286', () => {
         ),
       ]);
 
-      // null element → RegExp(undefined) or throw → false; good entry allows
+      // null element → throw on ns.regex → false; good entry allows
       expect(orRes).toBe('allowed');
       expect(await jsonBody(nullRes as Response)).toMatchObject({
         errcode: 'M_FORBIDDEN',
