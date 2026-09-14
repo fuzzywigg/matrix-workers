@@ -1,8 +1,10 @@
 /**
- * TOKENMAXX HEAVY leftovers after #226 — analyticsMiddleware edges not covered by
- * test/analytics-middleware.test.ts (clock-pinned latency / 5-segment index / write throw).
+ * TOKENMAXX HEAVY leftovers after #226 / deepen after #232 — analyticsMiddleware
+ * edges not covered by test/analytics-middleware.test.ts (clock-pinned latency /
+ * 5-segment index / write throw) or the first leftovers pass (#227).
  *
- * Distinct from rate-limit concurrent-race (#226), oidc-auth (#223), federation-auth (#222).
+ * Distinct from room-cache (#232), catchup/consumer (#231), rate-limit (#226),
+ * oidc-auth (#223), federation-auth (#222).
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -24,7 +26,7 @@ function makeAnalyticsCtx(opts: {
       url: opts.url ?? 'https://matrix.example.com/_matrix/client/v3/sync',
       method: opts.method ?? 'GET',
     },
-    res: { status: opts.status ?? 200 },
+    res: { status: 'status' in opts ? (opts.status as number) : 200 },
     env: {
       ANALYTICS:
         analytics === undefined || analytics === null
@@ -340,4 +342,273 @@ describe('analyticsMiddleware leftovers after #226', () => {
     expect(writeOk).toHaveBeenCalledOnce();
     expect(writeBoom).toHaveBeenCalledOnce();
   });
+});
+
+describe('analyticsMiddleware leftovers deepen after #232', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('payload shape contract: only blobs/doubles/indexes keys', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({ analytics: { writeDataPoint } }),
+      vi.fn(async () => undefined)
+    );
+    expect(Object.keys(writeDataPoint.mock.calls[0][0]).sort()).toEqual([
+      'blobs',
+      'doubles',
+      'indexes',
+    ]);
+  });
+
+  it('ignores writeDataPoint return value — middleware still resolves undefined', async () => {
+    const writeDataPoint = vi.fn(() => ({ queued: true }));
+    const next = vi.fn(async () => 'handler');
+    await expect(
+      analyticsMiddleware()(makeAnalyticsCtx({ analytics: { writeDataPoint } }), next)
+    ).resolves.toBeUndefined();
+    expect(writeDataPoint).toHaveBeenCalledOnce();
+  });
+
+  it('strips query and hash together from pathname blob', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({
+        analytics: { writeDataPoint },
+        url: 'https://matrix.example.com/_matrix/client/v3/sync?access_token=secret#frag',
+      }),
+      vi.fn(async () => undefined)
+    );
+    expect(writeDataPoint.mock.calls[0][0].blobs[0]).toBe('/_matrix/client/v3/sync');
+    expect(JSON.stringify(writeDataPoint.mock.calls[0][0])).not.toContain('secret');
+    expect(JSON.stringify(writeDataPoint.mock.calls[0][0])).not.toContain('frag');
+  });
+
+  it('preserves host port / IPv6 — pathname only in blobs', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({
+        analytics: { writeDataPoint },
+        url: 'https://[2001:db8::1]:8448/_matrix/client/v3/login',
+      }),
+      vi.fn(async () => undefined)
+    );
+    expect(writeDataPoint.mock.calls[0][0].blobs[0]).toBe('/_matrix/client/v3/login');
+    expect(writeDataPoint.mock.calls[0][0].indexes[0]).toBe('/_matrix/client/v3/login');
+  });
+
+  it('keeps double-slash path segments in blob (not normalized)', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({
+        analytics: { writeDataPoint },
+        url: 'https://matrix.example.com/_matrix//client/v3/sync',
+      }),
+      vi.fn(async () => undefined)
+    );
+    expect(writeDataPoint.mock.calls[0][0].blobs[0]).toBe('/_matrix//client/v3/sync');
+    // split: '', '_matrix', '', 'client', 'v3', 'sync' → first 5 → '/_matrix//client/v3'
+    expect(writeDataPoint.mock.calls[0][0].indexes[0]).toBe('/_matrix//client/v3');
+  });
+
+  it('unicode path segments stay percent-encoded in blob (URL.pathname)', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({
+        analytics: { writeDataPoint },
+        url: 'https://matrix.example.com/_matrix/client/v3/rooms/!café:example.com/messages',
+      }),
+      vi.fn(async () => undefined)
+    );
+    // new URL(...).pathname percent-encodes non-ASCII
+    expect(writeDataPoint.mock.calls[0][0].blobs[0]).toBe(
+      '/_matrix/client/v3/rooms/!caf%C3%A9:example.com/messages'
+    );
+    expect(writeDataPoint.mock.calls[0][0].indexes[0]).toBe('/_matrix/client/v3/rooms');
+  });
+
+  it('index segment-count boundary soft: 3 / 4 / 5 / 6 segments', async () => {
+    const writeDataPoint = vi.fn();
+    const cases: Array<[string, string]> = [
+      ['https://matrix.example.com/a/b', '/a/b'],
+      ['https://matrix.example.com/a/b/c', '/a/b/c'],
+      ['https://matrix.example.com/a/b/c/d', '/a/b/c/d'],
+      ['https://matrix.example.com/a/b/c/d/e', '/a/b/c/d'],
+      ['https://matrix.example.com/a/b/c/d/e/f', '/a/b/c/d'],
+    ];
+    for (const [url, index] of cases) {
+      writeDataPoint.mockClear();
+      await analyticsMiddleware()(
+        makeAnalyticsCtx({ analytics: { writeDataPoint }, url }),
+        vi.fn(async () => undefined)
+      );
+      expect(writeDataPoint.mock.calls[0][0].indexes[0]).toBe(index);
+    }
+  });
+
+  it('stringifies status 301 / 302 / 418 / 503 as blobs[2]', async () => {
+    const writeDataPoint = vi.fn();
+    for (const status of [301, 302, 418, 503]) {
+      writeDataPoint.mockClear();
+      await analyticsMiddleware()(
+        makeAnalyticsCtx({ analytics: { writeDataPoint }, status }),
+        vi.fn(async () => undefined)
+      );
+      expect(writeDataPoint.mock.calls[0][0].blobs[2]).toBe(String(status));
+    }
+  });
+
+  it('records HEAD / TRACE methods as blob[1]', async () => {
+    const writeDataPoint = vi.fn();
+    for (const method of ['HEAD', 'TRACE', 'CONNECT']) {
+      writeDataPoint.mockClear();
+      await analyticsMiddleware()(
+        makeAnalyticsCtx({ analytics: { writeDataPoint }, method }),
+        vi.fn(async () => undefined)
+      );
+      expect(writeDataPoint.mock.calls[0][0].blobs[1]).toBe(method);
+    }
+  });
+
+  it('admin / _matrix/client/unstable path prefixes truncate at 5 segments', async () => {
+    const writeDataPoint = vi.fn();
+    const cases: Array<[string, string]> = [
+      ['https://matrix.example.com/admin/api/v1/users/list', '/admin/api/v1/users'],
+      [
+        'https://matrix.example.com/_matrix/client/unstable/org.matrix.msc3575/sync',
+        '/_matrix/client/unstable/org.matrix.msc3575',
+      ],
+      [
+        'https://matrix.example.com/_matrix/client/v3/account/whoami',
+        '/_matrix/client/v3/account',
+      ],
+    ];
+    for (const [url, index] of cases) {
+      writeDataPoint.mockClear();
+      await analyticsMiddleware()(
+        makeAnalyticsCtx({ analytics: { writeDataPoint }, url }),
+        vi.fn(async () => undefined)
+      );
+      expect(writeDataPoint.mock.calls[0][0].indexes).toEqual([index]);
+    }
+  });
+
+  it('eight-way Promise.all isolates path/method/status tuples', async () => {
+    const writeDataPoint = vi.fn();
+    const specs = Array.from({ length: 8 }, (_, i) => ({
+      url: `https://matrix.example.com/_matrix/client/v3/path${i}`,
+      method: i % 2 === 0 ? 'GET' : 'POST',
+      status: 200 + (i % 3),
+    }));
+    await Promise.all(
+      specs.map((s) =>
+        analyticsMiddleware()(
+          makeAnalyticsCtx({ analytics: { writeDataPoint }, ...s }),
+          vi.fn(async () => undefined)
+        )
+      )
+    );
+    expect(writeDataPoint).toHaveBeenCalledTimes(8);
+    const paths = writeDataPoint.mock.calls
+      .map((c) => c[0].blobs[0] as string)
+      .sort();
+    expect(paths).toEqual(specs.map((s) => new URL(s.url).pathname).sort());
+    expect(writeDataPoint.mock.calls.every((c) => c[0].doubles[0] === 0)).toBe(true);
+  });
+
+  it('Promise.allSettled: next throw rejects only that lane; siblings write', async () => {
+    const writeOk = vi.fn();
+    const writeSkip = vi.fn();
+    const results = await Promise.allSettled([
+      analyticsMiddleware()(
+        makeAnalyticsCtx({ analytics: { writeDataPoint: writeSkip } }),
+        vi.fn(async () => {
+          throw new Error('boom-lane');
+        })
+      ),
+      analyticsMiddleware()(
+        makeAnalyticsCtx({
+          analytics: { writeDataPoint: writeOk },
+          url: 'https://matrix.example.com/_matrix/client/v3/login',
+          method: 'POST',
+          status: 200,
+        }),
+        vi.fn(async () => 'ok')
+      ),
+      analyticsMiddleware()(makeAnalyticsCtx({ analytics: undefined }), vi.fn(async () => 'skip')),
+    ]);
+    expect(results[0].status).toBe('rejected');
+    expect(results[1].status).toBe('fulfilled');
+    expect(results[2].status).toBe('fulfilled');
+    expect(writeSkip).not.toHaveBeenCalled();
+    expect(writeOk).toHaveBeenCalledOnce();
+  });
+
+  it('stringifies undefined/null status under leftovers deepen', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({
+        analytics: { writeDataPoint },
+        status: undefined as unknown as number,
+      }),
+      vi.fn(async () => undefined)
+    );
+    expect(writeDataPoint.mock.calls[0][0].blobs[2]).toBe('undefined');
+  });
+
+  it('pins large positive then large negative latency sequentially', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({ analytics: { writeDataPoint } }),
+      vi.fn(async () => {
+        vi.setSystemTime(NOW + 50_000);
+      })
+    );
+    vi.setSystemTime(NOW);
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({ analytics: { writeDataPoint } }),
+      vi.fn(async () => {
+        vi.setSystemTime(NOW - 50_000);
+      })
+    );
+    expect(writeDataPoint.mock.calls[0][0].doubles[0]).toBe(50_000);
+    expect(writeDataPoint.mock.calls[1][0].doubles[0]).toBe(-50_000);
+  });
+
+  it('empty method string is recorded as blob[1]', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({ analytics: { writeDataPoint }, method: '' }),
+      vi.fn(async () => undefined)
+    );
+    expect(writeDataPoint.mock.calls[0][0].blobs[1]).toBe('');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`path-prefix leftover soft-${i}`, async () => {
+      const writeDataPoint = vi.fn();
+      const url = `https://matrix.example.com/_matrix/client/v3/rooms/!r${i}:example.com/event/$e${i}`;
+      await analyticsMiddleware()(
+        makeAnalyticsCtx({
+          analytics: { writeDataPoint },
+          url,
+          method: i % 2 === 0 ? 'GET' : 'PUT',
+          status: 200 + i,
+        }),
+        vi.fn(async () => {
+          vi.setSystemTime(NOW + i);
+        })
+      );
+      expect(writeDataPoint.mock.calls[0][0].indexes[0]).toBe('/_matrix/client/v3/rooms');
+      expect(writeDataPoint.mock.calls[0][0].doubles[0]).toBe(i);
+      expect(writeDataPoint.mock.calls[0][0].blobs[2]).toBe(String(200 + i));
+      vi.setSystemTime(NOW);
+    });
+  }
 });

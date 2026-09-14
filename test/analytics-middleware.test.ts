@@ -15,7 +15,7 @@ function makeAnalyticsCtx(opts: {
       url: opts.url ?? 'https://matrix.example.com/_matrix/client/v3/sync?access_token=x',
       method: opts.method ?? 'GET',
     },
-    res: { status: opts.status ?? 200 },
+    res: { status: 'status' in opts ? opts.status! : 200 },
     env: {
       ANALYTICS: writeDataPoint ? { writeDataPoint } : undefined,
     },
@@ -128,5 +128,76 @@ describe('analyticsMiddleware clock-pinned latency', () => {
 
     expect(writeDataPoint.mock.calls[0][0].doubles[0]).toBe(99);
     expect(writeDataPoint.mock.calls[1][0].doubles[0]).toBe(100);
+  });
+});
+
+describe('analyticsMiddleware clock-pinned deepen after #232', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('pins large latency (1_000_000ms) without clamping', async () => {
+    const writeDataPoint = vi.fn();
+    const next = vi.fn(async () => {
+      vi.setSystemTime(NOW + 1_000_000);
+    });
+    await analyticsMiddleware()(makeAnalyticsCtx({ analytics: { writeDataPoint } }), next);
+    expect(writeDataPoint.mock.calls[0][0].doubles[0]).toBe(1_000_000);
+  });
+
+  it('payload shape is exactly blobs + doubles + indexes (no extras)', async () => {
+    const writeDataPoint = vi.fn();
+    const next = vi.fn(async () => {
+      vi.setSystemTime(NOW + 3);
+    });
+    await analyticsMiddleware()(makeAnalyticsCtx({ analytics: { writeDataPoint } }), next);
+    expect(Object.keys(writeDataPoint.mock.calls[0][0]).sort()).toEqual([
+      'blobs',
+      'doubles',
+      'indexes',
+    ]);
+    expect(writeDataPoint.mock.calls[0][0].blobs).toHaveLength(3);
+    expect(writeDataPoint.mock.calls[0][0].doubles).toHaveLength(1);
+    expect(writeDataPoint.mock.calls[0][0].indexes).toHaveLength(1);
+  });
+
+  it('stringifies undefined / null status as blobs[2]', async () => {
+    const writeDataPoint = vi.fn();
+    const next = vi.fn(async () => undefined);
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({ analytics: { writeDataPoint }, status: undefined as unknown as number }),
+      next
+    );
+    expect(writeDataPoint.mock.calls[0][0].blobs[2]).toBe('undefined');
+    writeDataPoint.mockClear();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({ analytics: { writeDataPoint }, status: null as unknown as number }),
+      next
+    );
+    expect(writeDataPoint.mock.calls[0][0].blobs[2]).toBe('null');
+  });
+
+  it('rewind then forward across two sequential calls pins independently', async () => {
+    const writeDataPoint = vi.fn();
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({ analytics: { writeDataPoint } }),
+      vi.fn(async () => {
+        vi.setSystemTime(NOW - 5);
+      })
+    );
+    vi.setSystemTime(NOW);
+    await analyticsMiddleware()(
+      makeAnalyticsCtx({ analytics: { writeDataPoint } }),
+      vi.fn(async () => {
+        vi.setSystemTime(NOW + 11);
+      })
+    );
+    expect(writeDataPoint.mock.calls[0][0].doubles[0]).toBe(-5);
+    expect(writeDataPoint.mock.calls[1][0].doubles[0]).toBe(11);
   });
 });
