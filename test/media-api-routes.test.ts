@@ -1,8 +1,6 @@
 /**
- * TOKENMAXX HEAVY deepen after #100/#101/#102/#103/#105/#107 — different slice:
- * media API routes (media/v3 + MSC3916 client/v1).
- * Avoids push (#107), presence/report/receipts/typing/to-device/account-data (#105),
- * account (#103), admin (#102), login/register (#101), devices/aliases/relations/tags/profile (#100).
+ * TOKENMAXX HEAVY deepen after #109/#111 — media API route edges (media/v3 + MSC3916 client/v1).
+ * Continues the media route slice from #109; avoids identity/federation (#111), oauth (#106), push (#107).
  * Helper-only coverage lives in media-helpers.test.ts — this file exercises Hono app.request().
  * Tests-only — no product inventing.
  */
@@ -1740,5 +1738,648 @@ describe('media API TOKENMAXX cross-cutting edges after #107', () => {
     expect(fetchMock.mock.calls[1][1]).toMatchObject({
       cf: { image: { fit: 'contain' } },
     });
+  });
+});
+
+
+// ============================================
+// TOKENMAXX HEAVY media route edges after #109/#111
+// Fresh deepen from latest main (PR #110 closed conflicting).
+// ============================================
+
+describe('media API TOKENMAXX edges after #109/#111 — upload MIME matrix', () => {
+  const accepted = [
+    'image/gif',
+    'image/svg+xml',
+    'video/webm',
+    'audio/mp3',
+    'audio/mpeg',
+    'audio/wav',
+    'audio/webm',
+    'application/json',
+    'text/plain',
+    'application/octet-stream',
+  ];
+
+  it.each(accepted)('accepts whitelist MIME %s on v3 upload', async (contentType) => {
+    opaqueSeq = 0;
+    const body = bytesOf('x');
+    const res = await request('/_matrix/media/v3/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': contentType, 'Content-Length': String(body.byteLength) },
+      body,
+    });
+    expect(res.status).toBe(200);
+    expect(res.db.rows[0].content_type).toBe(contentType);
+  });
+
+  it.each([
+    'text/css',
+    'text/javascript',
+    'application/javascript',
+    'image/bmp',
+    'image/tiff',
+    'audio/flac',
+    'video/avi',
+    'multipart/form-data',
+    'application/zip',
+  ])('rejects non-whitelist MIME %s', async (contentType) => {
+    const res = await request('/_matrix/media/v3/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': contentType, 'Content-Length': '1' },
+      body: bytesOf('x'),
+    });
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+    expect(res.media.puts).toHaveLength(0);
+  });
+
+  it('rejects uppercase IMAGE/PNG as case-sensitive whitelist miss', async () => {
+    const res = await request('/_matrix/media/v3/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'IMAGE/PNG', 'Content-Length': '1' },
+      body: bytesOf('x'),
+    });
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('trims whitespace around base MIME before whitelist check', async () => {
+    const body = bytesOf('x');
+    const res = await request('/_matrix/media/v3/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': '  image/png ; charset=binary',
+        'Content-Length': String(body.byteLength),
+      },
+      body,
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects leading-semicolon Content-Type that parses to empty base', async () => {
+    const res = await request('/_matrix/media/v3/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': ';charset=utf-8', 'Content-Length': '1' },
+      body: bytesOf('x'),
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('media API TOKENMAXX edges after #109/#111 — filename + disposition', () => {
+  it('truncates filenames longer than 255 chars on upload', async () => {
+    const long = `${'a'.repeat(300)}.png`;
+    const body = bytesOf('x');
+    const res = await request(`/_matrix/media/v3/upload?filename=${encodeURIComponent(long)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png', 'Content-Length': '1' },
+      body,
+    });
+    expect(res.status).toBe(200);
+    expect(res.db.rows[0].filename).toHaveLength(255);
+    expect(
+      (res.media.puts[0].options as { customMetadata: { filename: string } }).customMetadata.filename
+    ).toHaveLength(255);
+  });
+
+  it('sanitizes unicode and spaces in download-with-filename disposition', async () => {
+    const mediaId = 'fn1';
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({ [mediaId]: { body: 'x' } });
+    const res = await request(
+      `/_matrix/media/v3/download/${SERVER}/${mediaId}/${encodeURIComponent('写真 file.png')}`,
+      {},
+      { db, media }
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Disposition')).toBe('inline; filename="___file.png"');
+  });
+
+  it('applies security headers on v3 download-with-filename', async () => {
+    const mediaId = 'secfn';
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({ [mediaId]: { body: 'x' } });
+    const res = await request(
+      `/_matrix/media/v3/download/${SERVER}/${mediaId}/a.png`,
+      {},
+      { db, media }
+    );
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(res.headers.get('X-Frame-Options')).toBe('DENY');
+    expect(res.headers.get('Content-Security-Policy')).toContain("default-src 'none'");
+    expect(res.headers.get('Cache-Control')).toContain('immutable');
+  });
+
+  it('v1 download-with-filename also sets security + cache headers', async () => {
+    const mediaId = 'v1sec';
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({ [mediaId]: { body: 'x' } });
+    const res = await request(
+      `/_matrix/client/v1/media/download/${SERVER}/${mediaId}/b.png`,
+      {},
+      { db, media }
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(res.headers.get('Cache-Control')).toContain('max-age=31536000');
+  });
+});
+
+describe('media API TOKENMAXX edges after #109/#111 — serverName gates', () => {
+  it('treats SERVER_NAME comparison as exact (case-sensitive) on v3 download', async () => {
+    const mediaId = 'case';
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({ [mediaId]: { body: 'x' } });
+    const res = await request(
+      `/_matrix/media/v3/download/Example.Com/${mediaId}`,
+      {},
+      { db, media, serverName: 'example.com' }
+    );
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND' });
+  });
+
+  it('rejects remote serverName on v1 thumbnail', async () => {
+    const res = await request(`/_matrix/client/v1/media/thumbnail/${REMOTE}/x`);
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND' });
+  });
+
+  it('rejects remote serverName on v1 download-with-filename', async () => {
+    const res = await request(`/_matrix/client/v1/media/download/${REMOTE}/x/a.png`);
+    expect(res.status).toBe(404);
+  });
+
+  it('forbids placeholder PUT to mismatched serverName', async () => {
+    const mediaId = 'remoteput';
+    const db = createMediaDb({
+      rows: [seedRow({ media_id: mediaId, content_length: 0 })],
+    });
+    const res = await request(
+      `/_matrix/client/v1/media/upload/${REMOTE}/${mediaId}`,
+      { method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: bytesOf('x') },
+      { db }
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+});
+
+describe('media API TOKENMAXX edges after #109/#111 — thumbnail clamps + methods', () => {
+  it('defaults missing width/height to 96 in cache key', async () => {
+    const mediaId = 'def96';
+    const thumbKey = `thumb_${mediaId}_96x96_scale`;
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({
+      [mediaId]: { body: 'O' },
+      [thumbKey]: { body: 'T' },
+    });
+    const res = await request(`/_matrix/media/v3/thumbnail/${SERVER}/${mediaId}`, {}, { db, media });
+    expect(res.text).toBe('T');
+    expect(media.gets).toContain(thumbKey);
+  });
+
+  it('clamps negative and NaN dimension strings via parseInt fallback', async () => {
+    const mediaId = 'nan';
+    // width=-5 → parseInt truthy → Math.max(1,-5)=1; height=abc → NaN → fallback 96
+    const thumbKey = `thumb_${mediaId}_1x96_scale`;
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({
+      [mediaId]: { body: 'O' },
+      [thumbKey]: { body: 'CACHED' },
+    });
+    const res = await request(
+      `/_matrix/media/v3/thumbnail/${SERVER}/${mediaId}?width=-5&height=abc`,
+      {},
+      { db, media }
+    );
+    expect(res.text).toBe('CACHED');
+  });
+
+  it('maps method=crop to cover and unknown methods to contain on v3', async () => {
+    const mediaId = 'fitmap';
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({ [mediaId]: { body: 'PNG' } });
+    const fetchMock = vi.fn(async () => new Response(bytesOf('J'), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await request(
+      `/_matrix/media/v3/thumbnail/${SERVER}/${mediaId}?width=2&height=2&method=crop`,
+      {},
+      { db, media }
+    );
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      cf: { image: { fit: 'cover', width: 2, height: 2, format: 'jpeg', quality: 85 } },
+    });
+
+    await request(
+      `/_matrix/media/v3/thumbnail/${SERVER}/${mediaId}?width=2&height=2&method=SCALE`,
+      {},
+      { db, media }
+    );
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({
+      cf: { image: { fit: 'contain' } },
+    });
+  });
+
+  it('does not set X-Thumbnail-Generated when serving cached thumb', async () => {
+    const mediaId = 'cachedhdr';
+    const thumbKey = `thumb_${mediaId}_32x32_scale`;
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({
+      [mediaId]: { body: 'O' },
+      [thumbKey]: { body: 'JPEG' },
+    });
+    const res = await request(
+      `/_matrix/media/v3/thumbnail/${SERVER}/${mediaId}?width=32&height=32`,
+      {},
+      { db, media }
+    );
+    expect(res.headers.get('Content-Type')).toBe('image/jpeg');
+    expect(res.headers.get('X-Thumbnail-Generated')).toBeNull();
+  });
+
+  it('v1 thumbnail clamps width=99999 to 1920 in generated key', async () => {
+    const mediaId = 'v1clamp';
+    const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
+    const media = createMediaBucket({ [mediaId]: { body: 'PNG' } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(bytesOf('J'), { status: 200 })));
+    const res = await request(
+      `/_matrix/client/v1/media/thumbnail/${SERVER}/${mediaId}?width=99999&height=1&method=scale`,
+      {},
+      { db, media }
+    );
+    expect(res.headers.get('X-Thumbnail-Generated')).toBe('true');
+    expect(media.store.has(`thumb_${mediaId}_1920x1_scale`)).toBe(true);
+  });
+});
+
+describe('media API TOKENMAXX edges after #109/#111 — preview_url SSRF + OG', () => {
+  it.each([
+    'http://[::1]/',
+    'http://169.254.169.254/latest/meta-data/',
+    'http://10.0.0.1/',
+    'http://172.16.5.5/',
+    'http://192.168.100.1/',
+    'http://metadata.google.internal/',
+    'https://example.org:22/',
+    'https://example.org:3306/',
+    'ftp://example.org/x',
+    'file:///etc/passwd',
+  ])('rejects SSRF / blocked preview url %s', async (url) => {
+    const res = await request(`/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`);
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_UNKNOWN' });
+  });
+
+  it('allows public https and caches og:site_name + og:type', async () => {
+    const url = 'https://public.example.org/article';
+    const html = `
+      <html><head>
+        <meta property="og:title" content="T" />
+        <meta property="og:site_name" content="Site &amp; Co" />
+        <meta property="og:type" content="article" />
+      </head></html>`;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(html, { status: 200, headers: { 'Content-Type': 'text/html' } }))
+    );
+    const res = await request(`/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`);
+    expect(res.body).toMatchObject({
+      'og:title': 'T',
+      'og:site_name': 'Site & Co',
+      'og:type': 'article',
+    });
+    expect(res.cache.puts[0]?.key).toBe(`preview:${url}`);
+  });
+
+  it('leaves absolute http(s) og:image unchanged', async () => {
+    const url = 'https://public.example.org/p';
+    const html =
+      '<meta property="og:image" content="https://cdn.example.org/a.png" />';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(html, { status: 200, headers: { 'Content-Type': 'text/html' } }))
+    );
+    const res = await request(`/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`);
+    expect(res.body).toEqual({ 'og:image': 'https://cdn.example.org/a.png' });
+  });
+
+  it('absolutizes root-relative og:image against request host', async () => {
+    const url = 'https://blog.example.org/posts/1';
+    const html = '<meta property="og:image" content="/static/hero.png" />';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(html, { status: 200, headers: { 'Content-Type': 'text/html' } }))
+    );
+    const res = await request(`/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`);
+    expect(res.body).toEqual({ 'og:image': 'https://blog.example.org/static/hero.png' });
+  });
+
+  it('reads content-before-property meta attribute order', async () => {
+    const url = 'https://blog.example.org/order';
+    const html = '<meta content="Hello" property="og:title" />';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(html, { status: 200, headers: { 'Content-Type': 'text/html' } }))
+    );
+    const res = await request(`/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`);
+    expect(res.body).toEqual({ 'og:title': 'Hello' });
+  });
+
+  it('v1 preview_url rejects unusual ports even on public hosts', async () => {
+    const res = await request(
+      `/_matrix/client/v1/media/preview_url?url=${encodeURIComponent('https://example.org:9000/')}`
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_UNKNOWN' });
+  });
+
+  it('v1 preview_url does not use BROWSER binding (basic fetch only)', async () => {
+    const url = 'https://spa.example.org/';
+    const browser = {
+      fetch: vi.fn(async () => new Response('<meta property="og:title" content="Browser" />', { status: 200 })),
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('<meta property="og:title" content="Basic" />', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' },
+          })
+      )
+    );
+    const res = await request(
+      `/_matrix/client/v1/media/preview_url?url=${encodeURIComponent(url)}`,
+      {},
+      { browser }
+    );
+    expect(res.body).toEqual({ 'og:title': 'Basic' });
+    expect(browser.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('media API TOKENMAXX edges after #109/#111 — placeholder lifecycle', () => {
+  it('allows content_length === 0 placeholder fill and then blocks overwrite', async () => {
+    const created = await request('/_matrix/client/v1/media/create', { method: 'POST' });
+    const mediaId = (created.body as { content_uri: string }).content_uri.split('/').pop()!;
+    const db = created.db;
+    const media = created.media;
+
+    const first = await request(
+      `/_matrix/client/v1/media/upload/${SERVER}/${mediaId}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/plain' },
+        body: bytesOf('one'),
+      },
+      { db, media }
+    );
+    expect(first.status).toBe(200);
+    expect(db.rows[0].content_length).toBe(3);
+
+    const second = await request(
+      `/_matrix/client/v1/media/upload/${SERVER}/${mediaId}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/plain' },
+        body: bytesOf('two'),
+      },
+      { db, media }
+    );
+    expect(second.status).toBe(409);
+    expect(second.body).toMatchObject({ errcode: 'M_CANNOT_OVERWRITE_MEDIA' });
+  });
+
+  it('forbids filling another user empty placeholder', async () => {
+    const mediaId = 'otherph';
+    const db = createMediaDb({
+      rows: [seedRow({ media_id: mediaId, user_id: OTHER, content_length: 0 })],
+    });
+    const res = await request(
+      `/_matrix/client/v1/media/upload/${SERVER}/${mediaId}`,
+      { method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: bytesOf('x') },
+      { db }
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('returns 404 when filling unknown placeholder id', async () => {
+    const res = await request(
+      `/_matrix/client/v1/media/upload/${SERVER}/missing`,
+      { method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: bytesOf('x') },
+      { db: createMediaDb() }
+    );
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND' });
+  });
+
+  it('create unused_expires_at tracks fake system time', async () => {
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const res = await request('/_matrix/client/v1/media/create', { method: 'POST' });
+    expect((res.body as { unused_expires_at: number }).unused_expires_at).toBe(
+      Date.parse('2026-01-02T00:00:00.000Z')
+    );
+  });
+});
+
+describe('media API TOKENMAXX edges after #109/#111 — cross-route integration', () => {
+  it('v3 upload then v1 thumbnail resize path', async () => {
+    const up = await request('/_matrix/media/v3/upload?filename=x.png', {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png', 'Content-Length': '3' },
+      body: bytesOf('PNG'),
+    });
+    const mediaId = (up.body as { content_uri: string }).content_uri.split('/').pop()!;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(bytesOf('JPG'), { status: 200 })));
+    const thumb = await request(
+      `/_matrix/client/v1/media/thumbnail/${SERVER}/${mediaId}?width=16&height=16&method=crop`,
+      {},
+      { db: up.db, media: up.media }
+    );
+    expect(thumb.status).toBe(200);
+    expect(thumb.headers.get('X-Thumbnail-Generated')).toBe('true');
+    expect(up.media.store.has(`thumb_${mediaId}_16x16_crop`)).toBe(true);
+  });
+
+  it('v1 upload then v3 download preserves content type and disposition', async () => {
+    const up = await request('/_matrix/client/v1/media/upload?filename=note.txt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain', 'Content-Length': '4' },
+      body: bytesOf('note'),
+    });
+    const mediaId = (up.body as { content_uri: string }).content_uri.split('/').pop()!;
+    const dl = await request(`/_matrix/media/v3/download/${SERVER}/${mediaId}`, {}, {
+      db: up.db,
+      media: up.media,
+    });
+    expect(dl.status).toBe(200);
+    expect(dl.headers.get('Content-Type')).toBe('text/plain');
+    expect(dl.headers.get('Content-Disposition')).toBe('inline; filename="note.txt"');
+    expect(dl.text).toBe('note');
+  });
+
+  it('preview cache is shared across v3 and v1 routes', async () => {
+    const url = 'https://share2.example.org/p';
+    const cache = createCache();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('<meta property="og:title" content="Shared2" />', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' },
+          })
+      )
+    );
+    const v3 = await request(
+      `/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`,
+      {},
+      { cache }
+    );
+    expect(v3.body).toEqual({ 'og:title': 'Shared2' });
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    const fetch2 = vi.fn();
+    vi.stubGlobal('fetch', fetch2);
+    const v1 = await request(
+      `/_matrix/client/v1/media/preview_url?url=${encodeURIComponent(url)}`,
+      {},
+      { cache }
+    );
+    expect(v1.body).toEqual({ 'og:title': 'Shared2' });
+    expect(fetch2).not.toHaveBeenCalled();
+  });
+
+  it('v3 and v1 config agree on m.upload.size', async () => {
+    const v3 = await request('/_matrix/media/v3/config');
+    const v1 = await request('/_matrix/client/v1/media/config');
+    expect(v3.body).toEqual(v1.body);
+    expect(v3.body).toEqual({ 'm.upload.size': MAX_UPLOAD_SIZE });
+  });
+
+  it('v1 upload rejects oversized Content-Length like v3', async () => {
+    const res = await request('/_matrix/client/v1/media/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'image/png',
+        'Content-Length': String(MAX_UPLOAD_SIZE + 1),
+      },
+      body: bytesOf('x'),
+    });
+    expect(res.status).toBe(413);
+    expect(res.body).toMatchObject({ errcode: 'M_TOO_LARGE' });
+  });
+
+  it('v1 upload rejects unsupported MIME like v3', async () => {
+    const res = await request('/_matrix/client/v1/media/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/html', 'Content-Length': '1' },
+      body: bytesOf('x'),
+    });
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('empty body upload succeeds with content_length 0', async () => {
+    const res = await request('/_matrix/media/v3/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': '0' },
+      body: new Uint8Array(),
+    });
+    expect(res.status).toBe(200);
+    expect(res.db.rows[0].content_length).toBe(0);
+  });
+
+  it('download omits disposition for empty-string filename stored as empty', async () => {
+    const mediaId = 'emptyfn';
+    // empty string is truthy for disposition in some paths; product stores null when omitted.
+    // When filename is '', safeContentDisposition still runs if truthy — verify null path remains omitted.
+    const db = createMediaDb({
+      rows: [seedRow({ media_id: mediaId, filename: null, content_type: 'image/png' })],
+    });
+    const media = createMediaBucket({ [mediaId]: { body: 'x' } });
+    const res = await request(`/_matrix/client/v1/media/download/${SERVER}/${mediaId}`, {}, { db, media });
+    expect(res.headers.get('Content-Disposition')).toBeNull();
+  });
+});
+
+describe('media API TOKENMAXX edges after #109/#111 — Browser Rendering (v3 only)', () => {
+  it('prefers BROWSER HTML when binding is configured', async () => {
+    const url = 'https://spa2.example.org/';
+    const browser = {
+      fetch: vi.fn(
+        async () =>
+          new Response('<meta property="og:title" content="FromBrowser2" />', { status: 200 })
+      ),
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('<title>Basic2</title>', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' },
+          })
+      )
+    );
+    const res = await request(
+      `/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`,
+      {},
+      { browser }
+    );
+    expect(res.body).toEqual({ 'og:title': 'FromBrowser2' });
+    expect(browser.fetch).toHaveBeenCalled();
+  });
+
+  it('falls back to basic HTML when BROWSER throws', async () => {
+    const url = 'https://spa2.example.org/fallback';
+    const browser = {
+      fetch: vi.fn(async () => {
+        throw new Error('browser down');
+      }),
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('<title>Fallback2</title>', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' },
+          })
+      )
+    );
+    const res = await request(
+      `/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`,
+      {},
+      { browser }
+    );
+    expect(res.body).toEqual({ 'og:title': 'Fallback2' });
+  });
+
+  it('falls back when BROWSER returns non-ok', async () => {
+    const url = 'https://spa2.example.org/busy';
+    const browser = {
+      fetch: vi.fn(async () => new Response('busy', { status: 503 })),
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('<meta property="og:title" content="BasicOk2" />', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' },
+          })
+      )
+    );
+    const res = await request(
+      `/_matrix/media/v3/preview_url?url=${encodeURIComponent(url)}`,
+      {},
+      { browser }
+    );
+    expect(res.body).toEqual({ 'og:title': 'BasicOk2' });
   });
 });
