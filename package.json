@@ -13,6 +13,7 @@
     "db:migrate:local": "wrangler d1 execute matrix-db --local --file=./migrations/schema.sql",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:crypto-db": "vitest run test/crypto.test.ts test/database-crud-helpers.test.ts test/database-notify-authchain.test.ts test/validate-event-size.test.ts test/errors.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/ test/",
     "worker:check": "wrangler deploy --dry-run --outdir=.wrangler-dry-run"

@@ -791,3 +791,86 @@ describe('errors TOKENMAXX residual tertiary leftovers after #290', () => {
     });
   });
 });
+
+describe('errors TOKENMAXX residual quaternary leftovers after #303', () => {
+  it('tooLarge / conflict / limitExceeded default exact bodies stay isolated under race', async () => {
+    const [large, conflict, lim, limRetry] = await Promise.all([
+      Promise.resolve(Errors.tooLarge().toResponse()),
+      Promise.resolve(Errors.conflict().toResponse()),
+      Promise.resolve(Errors.limitExceeded().toResponse()),
+      Promise.resolve(Errors.limitExceeded('slow', 900).toResponse()),
+    ]);
+    expect(new Set([large, conflict, lim, limRetry]).size).toBe(4);
+    expect(large.status).toBe(413);
+    expect(conflict.status).toBe(409);
+    expect(lim.status).toBe(429);
+    expect(limRetry.status).toBe(429);
+    await expect(large.json()).resolves.toEqual({
+      errcode: 'M_TOO_LARGE',
+      error: 'Request too large',
+    });
+    await expect(conflict.json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'State changed concurrently; retry the operation',
+    });
+    await expect(lim.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'Rate limit exceeded',
+    });
+    await expect(limRetry.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'slow',
+      retry_after_ms: 900,
+    });
+  });
+
+  it('withErrorHandler races tooLarge + conflict + limitExceeded(retry)', async () => {
+    const [a, b, c] = await Promise.all([
+      withErrorHandler(async () => {
+        throw Errors.tooLarge('huge');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.conflict('lost');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.limitExceeded('wait', 42);
+      }),
+    ]);
+    expect((a as Response).status).toBe(413);
+    expect((b as Response).status).toBe(409);
+    expect((c as Response).status).toBe(429);
+    await expect((a as Response).json()).resolves.toEqual({
+      errcode: 'M_TOO_LARGE',
+      error: 'huge',
+    });
+    await expect((b as Response).json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'lost',
+    });
+    await expect((c as Response).json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'wait',
+      retry_after_ms: 42,
+    });
+  });
+
+  it('jsonResponse ∥ emptyResponse default/custom statuses stay independent under race', async () => {
+    const [jsonDef, jsonCustom, emptyDef, emptyCustom] = await Promise.all([
+      Promise.resolve(jsonResponse({ ok: true })),
+      Promise.resolve(jsonResponse({ ok: false }, 201)),
+      Promise.resolve(emptyResponse()),
+      Promise.resolve(emptyResponse(204)),
+    ]);
+    expect(new Set([jsonDef, jsonCustom, emptyDef, emptyCustom]).size).toBe(4);
+    expect(jsonDef.status).toBe(200);
+    expect(jsonCustom.status).toBe(201);
+    expect(emptyDef.status).toBe(200);
+    expect(emptyCustom.status).toBe(204);
+    await expect(jsonDef.json()).resolves.toEqual({ ok: true });
+    await expect(jsonCustom.json()).resolves.toEqual({ ok: false });
+    await expect(emptyDef.json()).resolves.toEqual({});
+    await expect(emptyCustom.json()).resolves.toEqual({});
+    expect(jsonDef.headers.get('Content-Type')).toBe('application/json');
+    expect(emptyCustom.headers.get('Content-Type')).toBe('application/json');
+  });
+});

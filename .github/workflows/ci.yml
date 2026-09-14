@@ -50,6 +50,19 @@ jobs:
       - run: npm ci
       - run: npm test
 
+  # Focused gate for crypto + database residual coverage (fast signal vs full suite).
+  crypto-db:
+    name: Crypto + DB residual tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:crypto-db
+
   worker-bundle:
     name: Worker Bundle (dry-run)
     runs-on: ubuntu-latest
