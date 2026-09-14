@@ -1784,4 +1784,239 @@ describe('key-backups round-trip matrix', () => {
     const current = await request('GET', '/_matrix/client/v3/room_keys/version', db);
     expect(current.status).toBe(404);
   });
+
+  it('create MSC3270 → bulk upload → room get → room delete → version get count 0', async () => {
+    const db = createBackupDb();
+    await request('POST', '/_matrix/client/v3/room_keys/version', db, {
+      algorithm: MSC3270,
+      auth_data: { public_key: 'msc' },
+    });
+    await request('PUT', '/_matrix/client/v3/room_keys/keys?version=1', db, {
+      rooms: {
+        [ROOM_A]: { sessions: { s1: session(), s2: session() } },
+        [ROOM_B]: { sessions: { s1: session() } },
+      },
+    });
+    const roomGet = await request(
+      'GET',
+      `/_matrix/client/v3/room_keys/keys/${encodeURIComponent(ROOM_A)}?version=1`,
+      db
+    );
+    expect(Object.keys(roomGet.body.sessions)).toHaveLength(2);
+
+    const roomDel = await request(
+      'DELETE',
+      `/_matrix/client/v3/room_keys/keys/${encodeURIComponent(ROOM_A)}?version=1`,
+      db
+    );
+    expect(roomDel.body.count).toBe(1);
+
+    const ver = await request('GET', '/_matrix/client/v3/room_keys/version/1', db);
+    expect(ver.body.algorithm).toBe(MSC3270);
+    expect(ver.body.count).toBe(1);
+  });
+});
+
+describe('formatBackupVersionResponse auth_data edges', () => {
+  it('preserves nullish nested signature values as parsed', () => {
+    const auth = { public_key: 'pk', signatures: { '@u:s': { 'ed25519:1': '' } } };
+    expect(
+      formatBackupVersionResponse({
+        version: 1,
+        algorithm: MEGOLM,
+        auth_data: JSON.stringify(auth),
+        count: 0,
+        etag: 'e',
+      }).auth_data
+    ).toEqual(auth);
+  });
+
+  it('accepts numeric version 0 stringified', () => {
+    expect(
+      formatBackupVersionResponse({
+        version: 0,
+        algorithm: MEGOLM,
+        auth_data: '{}',
+        count: 0,
+        etag: 'e',
+      }).version
+    ).toBe('0');
+  });
+});
+
+describe('isValidBackupAlgorithm exhaustive negatives', () => {
+  it.each([
+    'm.megolm_backup.v1.curve25519-aes-sha2x',
+    'xm.megolm_backup.v1.curve25519-aes-sha2',
+    'org.matrix.msc3270.v1.aes-hmac-sha2 ',
+    'ORG.MATRIX.MSC3270.V1.AES-HMAC-SHA2',
+    'null',
+    'undefined',
+    'm.megolm_backup.v1.curve25519-aes-sha2\n',
+  ])('rejects %j', (algo) => {
+    expect(isValidBackupAlgorithm(algo)).toBe(false);
+  });
+});
+
+describe('generateEtag length invariant', () => {
+  it('always returns exactly 16 characters even across many samples', () => {
+    for (let i = 0; i < 50; i++) {
+      expect(generateEtag()).toHaveLength(16);
+    }
+  });
+});
+
+describe('groupBackupKeysByRoom large fan-out', () => {
+  it('handles many rooms with one session each', () => {
+    const keys = Array.from({ length: 25 }, (_, i) => ({
+      room_id: `!r${i}:example.com`,
+      session_id: 'only',
+      first_message_index: i,
+      forwarded_count: 0,
+      is_verified: i % 2,
+      session_data: JSON.stringify({ i }),
+    }));
+    const rooms = groupBackupKeysByRoom(keys);
+    expect(Object.keys(rooms)).toHaveLength(25);
+    expect(rooms['!r7:example.com'].sessions.only.first_message_index).toBe(7);
+    expect(rooms['!r7:example.com'].sessions.only.is_verified).toBe(true);
+    expect(rooms['!r8:example.com'].sessions.only.is_verified).toBe(false);
+  });
+});
+
+describe('sessionUpsertValues edge values', () => {
+  it('preserves zero indexes and large forwarded_count', () => {
+    const values = sessionUpsertValues(
+      AUTH_USER,
+      '99',
+      ROOM_B,
+      'sess',
+      session({ first_message_index: 0, forwarded_count: 999999, is_verified: false })
+    );
+    expect(values[4]).toBe(0);
+    expect(values[5]).toBe(999999);
+    expect(values[6]).toBe(0);
+  });
+
+  it('JSON-stringifies arrays and nested objects in session_data', () => {
+    const data = { ciphertext: 'c', extras: [{ n: 1 }, { n: 2 }] };
+    const values = sessionUpsertValues(
+      AUTH_USER,
+      '1',
+      ROOM_A,
+      's',
+      session({ session_data: data })
+    );
+    expect(JSON.parse(values[7] as string)).toEqual(data);
+  });
+});
+
+describe('PUT version auth_data with signatures round-trip via GET', () => {
+  it('stores and returns rotated auth_data including signatures', async () => {
+    const db = createBackupDb({
+      versions: [makeVersion({ user_id: AUTH_USER, version: 1 })],
+      nextVersion: 2,
+    });
+    const auth_data = {
+      public_key: 'newpk',
+      signatures: { [AUTH_USER]: { 'ed25519:DEVICE1': 'sig2' } },
+    };
+    await request('PUT', '/_matrix/client/v3/room_keys/version/1', db, { auth_data });
+    const { body } = await request('GET', '/_matrix/client/v3/room_keys/version/1', db);
+    expect(body.auth_data).toEqual(auth_data);
+  });
+});
+
+describe('bulk upload empty rooms map variants', () => {
+  it('accepts rooms: {} and leaves count at 0 with fresh etag', async () => {
+    const db = createBackupDb({
+      versions: [makeVersion({ user_id: AUTH_USER, version: 1, etag: 'staleetag0000001' })],
+      nextVersion: 2,
+    });
+    const { body } = await request('PUT', '/_matrix/client/v3/room_keys/keys?version=1', db, {
+      rooms: {},
+    });
+    expect(body.count).toBe(0);
+    expect(body.etag).not.toBe('staleetag0000001');
+    expect(db.store.versions[0].etag).toBe(body.etag);
+  });
+
+  it('room with empty sessions inside rooms map is a no-op for that room', async () => {
+    const db = createBackupDb({
+      versions: [makeVersion({ user_id: AUTH_USER, version: 1 })],
+      nextVersion: 2,
+    });
+    const { body } = await request('PUT', '/_matrix/client/v3/room_keys/keys?version=1', db, {
+      rooms: { [ROOM_A]: { sessions: {} }, [ROOM_B]: { sessions: { s1: session() } } },
+    });
+    expect(body.count).toBe(1);
+    expect(db.store.keys.map((k) => k.room_id)).toEqual([ROOM_B]);
+  });
+});
+
+describe('DELETE version does not touch other users\' keys', () => {
+  it('only deletes matching user_id+version keys', async () => {
+    const db = createBackupDb({
+      versions: [
+        makeVersion({ user_id: AUTH_USER, version: 1 }),
+        makeVersion({ user_id: OTHER_USER, version: 1 }),
+      ],
+      keys: [
+        {
+          user_id: AUTH_USER,
+          version: '1',
+          room_id: ROOM_A,
+          session_id: 'mine',
+          first_message_index: 0,
+          forwarded_count: 0,
+          is_verified: 1,
+          session_data: '{}',
+        },
+        {
+          user_id: OTHER_USER,
+          version: '1',
+          room_id: ROOM_A,
+          session_id: 'theirs',
+          first_message_index: 0,
+          forwarded_count: 0,
+          is_verified: 1,
+          session_data: '{}',
+        },
+      ],
+      nextVersion: 2,
+    });
+    await request('DELETE', '/_matrix/client/v3/room_keys/version/1', db);
+    expect(db.store.keys.map((k) => k.session_id)).toEqual(['theirs']);
+    expect(db.store.versions.find((v) => v.user_id === OTHER_USER)?.deleted).toBe(0);
+  });
+});
+
+describe('GET current version when only other-user backups exist', () => {
+  it('returns No backup found', async () => {
+    const db = createBackupDb({
+      versions: [makeVersion({ user_id: OTHER_USER, version: 1 })],
+      nextVersion: 2,
+    });
+    const { status, body } = await request('GET', '/_matrix/client/v3/room_keys/version', db);
+    expect(status).toBe(404);
+    expect(body.error).toBe('No backup found');
+  });
+});
+
+describe('mapKeyRowToSession without session_id field', () => {
+  it('does not require session_id on the input row', () => {
+    expect(
+      mapKeyRowToSession({
+        first_message_index: 1,
+        forwarded_count: 0,
+        is_verified: 1,
+        session_data: JSON.stringify({ ok: true }),
+      })
+    ).toEqual({
+      first_message_index: 1,
+      forwarded_count: 0,
+      is_verified: true,
+      session_data: { ok: true },
+    });
+  });
 });

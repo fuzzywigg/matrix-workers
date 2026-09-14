@@ -99,7 +99,12 @@ export function formatBackupVersionResponse(backup: KeyBackupVersionRow): Backup
 }
 
 /** Map a key_backup_keys row into KeyBackupData (is_verified is stored as 0/1). */
-export function mapKeyRowToSession(key: KeyBackupKeyRow): KeyBackupData {
+export function mapKeyRowToSession(
+  key: Pick<
+    KeyBackupKeyRow,
+    'first_message_index' | 'forwarded_count' | 'is_verified' | 'session_data'
+  >
+): KeyBackupData {
   return {
     first_message_index: key.first_message_index,
     forwarded_count: key.forwarded_count,
