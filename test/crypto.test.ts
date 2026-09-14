@@ -1814,3 +1814,240 @@ describe('federation signing TOKENMAXX residual septenary leftovers after #319',
     });
   }
 });
+
+describe('crypto TOKENMAXX residual octonary leftovers after #330', () => {
+  it('verifyPassword empty-pw ∥ too-few-parts ∥ empty-stored ∥ ok stay isolated under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const real = await hashPassword('octonary-ok-1');
+    const [ok, emptyPw, fewParts, emptyStored, bare] = await Promise.all([
+      verifyPassword('octonary-ok-1', real),
+      verifyPassword('', real),
+      verifyPassword('x', '$pbkdf2-sha256$100000$c2FsdA=='),
+      verifyPassword('x', ''),
+      verifyPassword('x', 'notahash'),
+    ]);
+    expect(ok).toBe(true);
+    expect(emptyPw).toBe(false);
+    expect(fewParts).toBe(false);
+    expect(emptyStored).toBe(false);
+    expect(bare).toBe(false);
+    // malformed length/scheme rejects are silent (no iteration log)
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('timingSafeEqual empty/unicode ∥ sha256 empty string≡bytes ∥ hashToken under race', async () => {
+    const emptyBytes = new Uint8Array();
+    const [eqEmpty, neEmpty, eqUni, neUni, fromStr, fromBytes, tok] = await Promise.all([
+      Promise.resolve(timingSafeEqual('', '')),
+      Promise.resolve(timingSafeEqual('', 'a')),
+      Promise.resolve(timingSafeEqual('café', 'café')),
+      Promise.resolve(timingSafeEqual('café', 'cafe')),
+      sha256(''),
+      sha256(emptyBytes),
+      hashToken(''),
+    ]);
+    expect(eqEmpty).toBe(true);
+    expect(neEmpty).toBe(false);
+    expect(eqUni).toBe(true);
+    expect(neUni).toBe(false);
+    expect(fromStr).toBe(fromBytes);
+    expect(tok).toBe(fromStr);
+    expect(tok).not.toMatch(/[+/=]/);
+    expect(tok.length).toBeGreaterThan(0);
+  });
+
+  it('canonicalJson nested empty / boolean / Date-like plain object race stays deterministic', async () => {
+    const dateLike = { toISOString: () => 'x' };
+    const [nestedEmpty, bools, dateObj, emptyArrNest, keyOrder] = await Promise.all([
+      Promise.resolve(canonicalJson({ a: {}, b: [] })),
+      Promise.resolve(canonicalJson({ t: true, f: false })),
+      Promise.resolve(canonicalJson(dateLike)),
+      Promise.resolve(canonicalJson([[], {}])),
+      Promise.resolve(canonicalJson({ z: {}, a: [] })),
+    ]);
+    expect(nestedEmpty).toBe('{"a":{},"b":[]}');
+    expect(bools).toBe('{"f":false,"t":true}');
+    // Date-like plain object: only own enumerable keys (toISOString function → null)
+    expect(dateObj).toBe('{"toISOString":null}');
+    expect(emptyArrNest).toBe('[[],{}]');
+    expect(keyOrder).toBe('{"a":[],"z":{}}');
+  });
+
+  it('validatePasswordStrength exact-8 ok ∥ exact-1000 ok ∥ 1001 reject under race', async () => {
+    const at8 = 'abcd1234';
+    const at1000 = `${'Ab1!'.repeat(250)}`; // 1000 chars
+    expect(at8).toHaveLength(8);
+    expect(at1000).toHaveLength(1000);
+    const [ok8, ok1000, over, short7, letterOnly] = await Promise.all([
+      Promise.resolve(validatePasswordStrength(at8)),
+      Promise.resolve(validatePasswordStrength(at1000)),
+      Promise.resolve(validatePasswordStrength(`${at1000}x`)),
+      Promise.resolve(validatePasswordStrength('abcd123')),
+      Promise.resolve(validatePasswordStrength('abcdefgh')),
+    ]);
+    expect(ok8).toBeNull();
+    expect(ok1000).toBeNull();
+    expect(over).toBe('Password must be at most 1000 characters long');
+    expect(short7).toBe('Password must be at least 8 characters long');
+    expect(letterOnly).toBe(
+      'Password must contain at least one number or special character'
+    );
+  });
+
+  it('calculateContentHash signatures-only ∥ unsigned-only ∥ empty ≡ under race', async () => {
+    const sigOnly = {
+      signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+    };
+    const unsignedOnly = { unsigned: { age: 1 } };
+    const empty = {};
+    const emptyHash = await calculateContentHash({});
+    const [hSig, hUnsig, hEmpty, vSig, vUnsig, vEmpty, vCross] = await Promise.all([
+      calculateContentHash(sigOnly),
+      calculateContentHash(unsignedOnly),
+      calculateContentHash(empty),
+      verifyContentHash(sigOnly, emptyHash),
+      verifyContentHash(unsignedOnly, emptyHash),
+      verifyContentHash(empty, emptyHash),
+      verifyContentHash({ type: 'm.x' }, emptyHash),
+    ]);
+    expect(hSig).toBe(hEmpty);
+    expect(hUnsig).toBe(hEmpty);
+    expect(hEmpty).toBe(emptyHash);
+    expect(vSig).toBe(true);
+    expect(vUnsig).toBe(true);
+    expect(vEmpty).toBe(true);
+    expect(vCross).toBe(false);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`hashPassword∥verify wrong∥timingSafeEqual∥hashToken flood-${i}`, async () => {
+      const [hash, tok, eq, ne] = await Promise.all([
+        hashPassword(`oct-flood-${i}-1`),
+        hashToken(`syt_oct_${i}`),
+        Promise.resolve(timingSafeEqual(`id-${i}`, `id-${i}`)),
+        Promise.resolve(timingSafeEqual(`id-${i}`, `id-${i}x`)),
+      ]);
+      const [ok, wrong] = await Promise.all([
+        verifyPassword(`oct-flood-${i}-1`, hash),
+        verifyPassword(`oct-flood-${i}-WRONG`, hash),
+      ]);
+      expect(ok).toBe(true);
+      expect(wrong).toBe(false);
+      expect(tok).toBe(await sha256(`syt_oct_${i}`));
+      expect(eq).toBe(true);
+      expect(ne).toBe(false);
+    });
+  }
+});
+
+describe('federation signing TOKENMAXX residual octonary leftovers after #330', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('same-server dual-keyId concurrent sign merges; both verify under race', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const base = { type: 'm.test', content: { path: 'oct-dual' } };
+    const once = await signJson(base, 'ex.com', a.keyId, a.privateKeyJwk);
+    const [merged, hash] = await Promise.all([
+      signJson(once, 'ex.com', b.keyId, b.privateKeyJwk),
+      calculateContentHash(base),
+    ]);
+    const sigs = merged.signatures as Record<string, Record<string, string>>;
+    expect(Object.keys(sigs['ex.com']).sort()).toEqual([a.keyId, b.keyId].sort());
+    const [okA, okB, miss, hashOk] = await Promise.all([
+      verifySignature(merged, 'ex.com', a.keyId, a.publicKey),
+      verifySignature(merged, 'ex.com', b.keyId, b.publicKey),
+      verifySignature(merged, 'ex.com', 'ed25519:deadbeef', a.publicKey),
+      verifyContentHash(base, hash),
+    ]);
+    expect(okA).toBe(true);
+    expect(okB).toBe(true);
+    expect(miss).toBe(false);
+    expect(hashOk).toBe(true);
+  });
+
+  it('verifySignature truncated∥null-signatures∥garbage-key∥valid stay isolated under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.test', content: { ok: true } },
+      'ex.com',
+      keyId,
+      privateKeyJwk
+    );
+    const truncated = {
+      ...signed,
+      signatures: { 'ex.com': { [keyId]: 'AA' } },
+    };
+    const nullSigs = {
+      ...signed,
+      signatures: null as unknown as Record<string, Record<string, string>>,
+    };
+    const [ok, trunc, nulled, garbage] = await Promise.all([
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(truncated, 'ex.com', keyId, publicKey),
+      verifySignature(nullSigs, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'ex.com', keyId, '!!!not-base64!!!'),
+    ]);
+    expect(ok).toBe(true);
+    expect(trunc).toBe(false);
+    expect(nulled).toBe(false);
+    expect(garbage).toBe(false);
+    // truncated/null may return false without throw; garbage pubkey hits catch+log
+    expect(
+      spy.mock.calls.some((c) => String(c[0]).includes('Signature verification failed'))
+    ).toBe(true);
+    spy.mockRestore();
+  });
+
+  it('signJson bad-JSON privateKey reject ∥ valid string-JWK stay isolated under race', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const base = { type: 'm.test', content: { path: 'oct-json' } };
+    const [okSettled, badSettled] = await Promise.allSettled([
+      signJson(base, 'ex.com', keyId, JSON.stringify(privateKeyJwk)),
+      signJson(base, 'ex.com', keyId, '{not-json'),
+    ]);
+    expect(okSettled.status).toBe('fulfilled');
+    expect(badSettled.status).toBe('rejected');
+    if (okSettled.status === 'fulfilled') {
+      expect(await verifySignature(okSettled.value, 'ex.com', keyId, publicKey)).toBe(true);
+    }
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`signJson∥verify truncated∥content-hash flood-${i}`, async () => {
+      const pair = await generateSigningKeyPair();
+      const obj = { type: 'm.test', content: { n: i }, unsigned: { age: i } };
+      const [signed, hash] = await Promise.all([
+        signJson(obj, 'ex.com', pair.keyId, pair.privateKeyJwk),
+        calculateContentHash(obj),
+      ]);
+      const truncated = {
+        ...signed,
+        signatures: {
+          'ex.com': {
+            [pair.keyId]: 'AA',
+          },
+        },
+      };
+      const [ok, trunc, hashOk] = await Promise.all([
+        verifySignature(signed, 'ex.com', pair.keyId, pair.publicKey),
+        verifySignature(truncated, 'ex.com', pair.keyId, pair.publicKey),
+        verifyContentHash(obj, hash),
+      ]);
+      expect(ok).toBe(true);
+      expect(trunc).toBe(false);
+      expect(hashOk).toBe(true);
+      expect(signed.unsigned).toEqual({ age: i });
+    });
+  }
+});

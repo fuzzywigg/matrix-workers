@@ -678,3 +678,115 @@ describe('validateEventSize TOKENMAXX residual quinary leftovers after #319', ()
     expect(JSON.stringify(at)).toBe(beforeAt);
   });
 });
+
+describe('validateEventSize TOKENMAXX residual senary leftovers after #330', () => {
+  it('missing content ∥ soft-over ∥ hard-over triple race pins errcode/status', async () => {
+    const missing = baseEvent({ body: 'x' });
+    delete (missing as { content?: unknown }).content;
+    const overhead = JSON.stringify({ body: '' }).length;
+    const soft = baseEvent({ body: 'z'.repeat(65_536 - overhead + 1) });
+    const hard = baseEvent({ body: 'ok' });
+    hard.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    const softLen = JSON.stringify(soft.content).length;
+    const hardLen = JSON.stringify(hard).length;
+    expect(softLen).toBe(65_537);
+    expect(hardLen).toBeGreaterThan(921_600);
+    const beforeMissing = JSON.stringify(missing);
+    const beforeSoft = JSON.stringify(soft);
+    const beforeHard = JSON.stringify(hard);
+    const [okResult, softResult, hardResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(missing as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => validateEventSize(soft)),
+      Promise.resolve().then(() => validateEventSize(hard)),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(softResult.status).toBe('rejected');
+    expect(hardResult.status).toBe('rejected');
+    if (softResult.status === 'rejected') {
+      const e = softResult.reason as MatrixApiError;
+      expect(e.errcode).toBe('M_TOO_LARGE');
+      expect(e.status).toBe(413);
+      expect(e.message).toBe(`Event content exceeds 65536 byte limit (got ${softLen})`);
+    }
+    if (hardResult.status === 'rejected') {
+      const e = hardResult.reason as MatrixApiError;
+      expect(e.errcode).toBe('M_TOO_LARGE');
+      expect(e.status).toBe(413);
+      expect(e.message).toBe(
+        `Serialized event exceeds 921600 byte D1 row limit (got ${hardLen})`
+      );
+    }
+    expect(JSON.stringify(missing)).toBe(beforeMissing);
+    expect(JSON.stringify(soft)).toBe(beforeSoft);
+    expect(JSON.stringify(hard)).toBe(beforeHard);
+  });
+
+  it('soft exact-boundary ok ∥ soft one-over ∥ hard reject under race', async () => {
+    const overhead = JSON.stringify({ body: '' }).length;
+    const at = baseEvent({ body: 'y'.repeat(65_536 - overhead) });
+    const over = baseEvent({ body: 'z'.repeat(65_536 - overhead + 1) });
+    const hard = baseEvent({ body: 'ok' });
+    hard.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    expect(JSON.stringify(at.content).length).toBe(65_536);
+    expect(JSON.stringify(over.content).length).toBe(65_537);
+    const hardLen = JSON.stringify(hard).length;
+    const beforeAt = JSON.stringify(at);
+    const beforeOver = JSON.stringify(over);
+    const beforeHard = JSON.stringify(hard);
+    const [okResult, softResult, hardResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(at);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => validateEventSize(over)),
+      Promise.resolve().then(() => validateEventSize(hard)),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(softResult.status).toBe('rejected');
+    expect(hardResult.status).toBe('rejected');
+    if (softResult.status === 'rejected') {
+      expect((softResult.reason as MatrixApiError).message).toBe(
+        'Event content exceeds 65536 byte limit (got 65537)'
+      );
+    }
+    if (hardResult.status === 'rejected') {
+      expect((hardResult.reason as MatrixApiError).message).toBe(
+        `Serialized event exceeds 921600 byte D1 row limit (got ${hardLen})`
+      );
+    }
+    expect(JSON.stringify(at)).toBe(beforeAt);
+    expect(JSON.stringify(over)).toBe(beforeOver);
+    expect(JSON.stringify(hard)).toBe(beforeHard);
+  });
+
+  it('string content ok ∥ soft-over exact message neither mutates under race', async () => {
+    const strEvt = baseEvent({ body: 'x' });
+    (strEvt as { content: unknown }).content = 'plain-string-senary';
+    const overhead = JSON.stringify({ body: '' }).length;
+    const bad = baseEvent({ body: 'q'.repeat(65_536 - overhead + 1) });
+    const beforeStr = JSON.stringify(strEvt);
+    const beforeBad = JSON.stringify(bad);
+    const [okResult, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(strEvt as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => validateEventSize(bad)),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      expect((badResult.reason as MatrixApiError).errcode).toBe('M_TOO_LARGE');
+      expect((badResult.reason as MatrixApiError).status).toBe(413);
+      expect((badResult.reason as MatrixApiError).message).toBe(
+        'Event content exceeds 65536 byte limit (got 65537)'
+      );
+    }
+    expect(JSON.stringify(strEvt)).toBe(beforeStr);
+    expect(JSON.stringify(bad)).toBe(beforeBad);
+    expect(strEvt.content).toBe('plain-string-senary');
+  });
+});

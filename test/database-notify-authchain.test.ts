@@ -2191,3 +2191,232 @@ describe('notify / auth-chain TOKENMAXX residual quinary leftovers after #319', 
     expect([1_111, 2_222, 3_333]).toContain(byUser['@u2:example.com'].timestamp);
   });
 });
+
+describe('notify / auth-chain TOKENMAXX residual senary leftovers after #330', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeNotifyEnv(
+    membersByRoom: Record<string, string[]>,
+    opts?: { failUsers?: Set<string>; throwOnRooms?: Set<string> }
+  ) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              const roomId = args[0] as string;
+              return {
+                async all<T>() {
+                  if (opts?.throwOnRooms?.has(roomId)) {
+                    throw new Error('membership boom');
+                  }
+                  if (sql.includes('room_memberships')) {
+                    const members = membersByRoom[roomId] ?? [];
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('empty-members notify ∥ sibling with members: exact zero log stays isolated', async () => {
+    const env = makeNotifyEnv({
+      '!empty:example.com': [],
+      '!full:example.com': ['@a:example.com'],
+    });
+    await Promise.all([
+      notifyUsersOfEvent(env, '!empty:example.com', '$empty', 'm.room.message'),
+      notifyUsersOfEvent(env, '!full:example.com', '$full', 'm.room.member'),
+    ]);
+    expect(env.notifies.map((n: { userId: string }) => n.userId)).toEqual(['@a:example.com']);
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      0,
+      'users of event',
+      '$empty',
+      'users:',
+      ''
+    );
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      1,
+      'users of event',
+      '$full',
+      'users:',
+      '@a:example.com'
+    );
+  });
+
+  it('concurrent getAuthChain MAX_AUTH_CHAIN_SIZE ∥ short sibling isolates warn', async () => {
+    const long = new Map<string, PDU>();
+    for (let i = 0; i < 520; i++) {
+      long.set(`$${i}`, pdu(`$${i}`, i === 0 ? [] : [`$${i - 1}`]));
+    }
+    long.set('$short', pdu('$short', []));
+    const db = createAuthChainDb(long);
+    const [capped, short] = await Promise.all([
+      getAuthChain(db, ['$519']),
+      getAuthChain(db, ['$short']),
+    ]);
+    expect(capped).toHaveLength(500);
+    expect(capped[0].event_id).toBe('$519');
+    expect(short.map((e) => e.event_id)).toEqual(['$short']);
+    expect(console.warn).toHaveBeenCalledWith(
+      '[getAuthChain] reached MAX_AUTH_CHAIN_SIZE cap',
+      500,
+      'aborting traversal'
+    );
+  });
+
+  it('concurrent getStateAtEvent create+member ∥ missing leaf stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$leaf',
+        pdu('$leaf', ['$create', '$member'], {
+          type: 'm.room.message',
+          content: { body: 'x' },
+        }),
+      ],
+      [
+        '$create',
+        pdu('$create', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:example.com' },
+        }),
+      ],
+      [
+        '$member',
+        pdu('$member', [], {
+          type: 'm.room.member',
+          state_key: '@s:example.com',
+          content: { membership: 'join' },
+        }),
+      ],
+    ]);
+    delete (events.get('$leaf') as { state_key?: string }).state_key;
+    const db = createAuthChainDb(events);
+    const [state, missing] = await Promise.all([
+      getStateAtEvent(db, '$leaf'),
+      getStateAtEvent(db, '$nope'),
+    ]);
+    expect(state).toHaveLength(2);
+    expect(state.map((e) => e.type).sort()).toEqual(['m.room.create', 'm.room.member'].sort());
+    expect(missing).toEqual([]);
+  });
+
+  it('getServersInRoomsWithUser null-filtered ∥ multi under race', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare() {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            const subject = args[0] as string;
+            return {
+              async all<T>() {
+                if (subject === '@nulls:example.com') {
+                  return {
+                    results: [
+                      { server_name: null },
+                      { server_name: 'peer.example.com' },
+                      { server_name: null },
+                    ] as T[],
+                  };
+                }
+                if (subject === '@multi:example.com') {
+                  return {
+                    results: [
+                      { server_name: 'a.example.com' },
+                      { server_name: 'b.example.com' },
+                    ] as T[],
+                  };
+                }
+                return { results: [] as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const [withNulls, multi] = await Promise.all([
+      getServersInRoomsWithUser(db, '@nulls:example.com'),
+      getServersInRoomsWithUser(db, '@multi:example.com'),
+    ]);
+    expect(withNulls).toEqual(['peer.example.com']);
+    expect(multi).toEqual(['a.example.com', 'b.example.com']);
+    expect(binds).toHaveLength(2);
+  });
+
+  it('concurrent same-room two events both fan-out with distinct event_ids', async () => {
+    const env = makeNotifyEnv({
+      '!r:example.com': ['@u1:example.com', '@u2:example.com'],
+    });
+    await Promise.all([
+      notifyUsersOfEvent(env, '!r:example.com', '$e1', 'm.room.message'),
+      notifyUsersOfEvent(env, '!r:example.com', '$e2', 'm.room.member'),
+    ]);
+    expect(env.notifies).toHaveLength(4);
+    const byEvent = env.notifies.reduce(
+      (acc: Record<string, string[]>, n: { userId: string; body: { event_id: string } }) => {
+        const id = n.body.event_id;
+        acc[id] = acc[id] ?? [];
+        acc[id].push(n.userId);
+        return acc;
+      },
+      {}
+    );
+    expect(byEvent['$e1'].sort()).toEqual(['@u1:example.com', '@u2:example.com']);
+    expect(byEvent['$e2'].sort()).toEqual(['@u1:example.com', '@u2:example.com']);
+  });
+
+  it('all Sync DO fails in room ∥ success sibling isolates fan-out', async () => {
+    const env = makeNotifyEnv(
+      {
+        '!bad:example.com': ['@x:example.com', '@y:example.com'],
+        '!ok:example.com': ['@z:example.com'],
+      },
+      { failUsers: new Set(['@x:example.com', '@y:example.com']) }
+    );
+    await Promise.all([
+      notifyUsersOfEvent(env, '!bad:example.com', '$bad', 'm.room.message'),
+      notifyUsersOfEvent(env, '!ok:example.com', '$ok', 'm.room.member'),
+    ]);
+    expect(env.notifies.map((n: { userId: string }) => n.userId)).toEqual(['@z:example.com']);
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @x:example.com of event:',
+      expect.any(Error)
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @y:example.com of event:',
+      expect.any(Error)
+    );
+  });
+});
