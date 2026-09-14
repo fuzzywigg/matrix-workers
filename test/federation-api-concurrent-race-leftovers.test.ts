@@ -1,13 +1,14 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 — federation-api *concurrent race / TOCTOU*
- * for leftover S2S routes that only had serial soft floods (#157 leftover).
- * Distinct from federation-keys-membership-account-data concurrent-race (OTK /
- * make_join) and federation-api-route-leftovers (serial floods).
+ * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 — federation-api
+ * *concurrent race / TOCTOU* for leftover S2S routes that only had serial
+ * soft floods (#157 leftover). Distinct from federation-keys-membership-account-data
+ * concurrent-race (OTK / make_join) and federation-api-route-leftovers (serial
+ * floods). Distinct from tip #232 (room-cache) and catchup/consumer (#231).
  *
- * Focus: version coherency; publicRooms GET∥POST; directory∥profile; openid
- * SESSIONS get barrier + expire mid-flight; media download R2; send txn cache
- * TOCTOU; key/v2/server seeded + empty mint; state∥state_ids; event GET;
- * method-matrix concurrent; cross-endpoint isolation.
+ * Focus (this deepen): key/v2/server/:keyId; notary query own-server;
+ * thumbnail R2 thumb-key barrier; event_auth chain; backfill membership;
+ * timestamp_to_event dir=f∥b; hierarchy; send cached∥miss isolation;
+ * openid already-expired delete; get_missing_events; leftover 404 isolation.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -1551,6 +1552,433 @@ describe('race federation leftover isolation + method matrix after #214', () => 
         req('GET', `/_matrix/federation/v1/query/profile?user_id=${encodeURIComponent(LOCAL_USER)}`, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// After #232: leftover S2S TOCTOU — keyId / notary / thumbnail / event_auth /
+// backfill / timestamp / hierarchy / send isolation / openid expired
+// ---------------------------------------------------------------------------
+
+describe('race leftover key/v2/server/:keyId + notary query after #232', () => {
+  let restore: (() => void) | undefined;
+  let serverKeyPair: Awaited<ReturnType<typeof generateSigningKeyPair>>;
+
+  beforeAll(async () => {
+    restore = installNodeEd25519Shim();
+    serverKeyPair = await generateSigningKeyPair();
+  });
+  afterAll(() => restore?.());
+
+  function seededKeysDb() {
+    return createFedDb({
+      serverKeys: [
+        {
+          key_id: serverKeyPair.keyId,
+          public_key: serverKeyPair.publicKey,
+          private_key_jwk: JSON.stringify(serverKeyPair.privateKeyJwk),
+          key_version: 2,
+          valid_from: Date.now() - 1000,
+          valid_until: Date.now() + 86400000,
+          is_current: 1,
+        },
+      ],
+    });
+  }
+
+  it('parallel GET /key/v2/server/:keyId same verify_keys', async () => {
+    const db = seededKeysDb();
+    const env = makeEnv(db);
+    const path = `/_matrix/key/v2/server/${encodeURIComponent(serverKeyPair.keyId)}`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    for (const r of results) {
+      expect((r.body as { server_name: string }).server_name).toBe(SERVER);
+      expect((r.body as { verify_keys: Record<string, unknown> }).verify_keys).toHaveProperty(
+        serverKeyPair.keyId
+      );
+    }
+  });
+
+  it('missing keyId∥seeded keyId isolation', async () => {
+    const env = makeEnv(seededKeysDb());
+    const [miss, hit] = await Promise.all([
+      req('GET', '/_matrix/key/v2/server/ed25519:nope', env),
+      req('GET', `/_matrix/key/v2/server/${encodeURIComponent(serverKeyPair.keyId)}`, env),
+    ]);
+    expect(miss.status).toBe(404);
+    expect(hit.status).toBe(200);
+  });
+
+  it('POST key/v2/query own-server dual 200', async () => {
+    getRemoteKeysWithNotarySignature.mockResolvedValue([]);
+    const env = makeEnv(seededKeysDb());
+    const results = await Promise.all([
+      req('POST', '/_matrix/key/v2/query', env, { server_keys: { [SERVER]: { '': {} } } }),
+      req('POST', '/_matrix/key/v2/query', env, { server_keys: { [SERVER]: { '': {} } } }),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(
+      results.every((r) =>
+        (r.body as { server_keys: Array<{ server_name: string }> }).server_keys.some(
+          (k) => k.server_name === SERVER
+        )
+      )
+    ).toBe(true);
+  });
+
+  it('GET key/v2/query own-server∥invalid hostname isolation', async () => {
+    const env = makeEnv(seededKeysDb());
+    const [own, invalid] = await Promise.all([
+      req('GET', `/_matrix/key/v2/query/${SERVER}`, env),
+      req('GET', '/_matrix/key/v2/query/127.0.0.1', env),
+    ]);
+    expect(own.status).toBe(200);
+    expect(invalid.status).toBe(400);
+  });
+
+  it('POST query missing server_keys∥empty notary 500 isolation', async () => {
+    const [missing, empty] = await Promise.all([
+      req('POST', '/_matrix/key/v2/query', makeEnv(seededKeysDb()), {}),
+      req('POST', '/_matrix/key/v2/query', makeEnv(createFedDb({ serverKeys: [] })), {
+        server_keys: { [SERVER]: { '': {} } },
+      }),
+    ]);
+    expect(missing.status).toBe(400);
+    expect(empty.status).toBe(500);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`keyId leftover flood-${i}`, async () => {
+      const env = makeEnv(seededKeysDb());
+      const results = await Promise.all([
+        req('GET', `/_matrix/key/v2/server/${encodeURIComponent(serverKeyPair.keyId)}`, env),
+        req('GET', '/_matrix/key/v2/server', env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover media thumbnail R2 barrier after #232', () => {
+  it('pre-generated thumb key barrier: both 200 image/jpeg', async () => {
+    const thumbKey = `thumb_${MEDIA_ID}_96x96_scale`;
+    const media = mockR2(
+      {
+        [MEDIA_ID]: new Uint8Array([9, 9, 9]),
+        [thumbKey]: new Uint8Array([1, 2, 3]),
+      },
+      { getBarrier: { count: 2, match: (key) => key === thumbKey } }
+    );
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'pic.png' }],
+    });
+    const env = makeEnv(db, { media });
+    const path = `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=96&height=96&method=scale`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => r.headers.get('Content-Type') === 'image/jpeg')).toBe(true);
+  });
+
+  it('missing thumb falls back to original under race', async () => {
+    const media = mockR2({ [MEDIA_ID]: new Uint8Array([4, 5, 6]) });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'pic.png' }],
+    });
+    const env = makeEnv(db, { media });
+    const path = `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=32&height=32`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => r.headers.get('Content-Type') === 'image/png')).toBe(true);
+    expect(results.every((r) => r.headers.get('X-Thumbnail-Generated') === 'false')).toBe(true);
+  });
+
+  it('thumbnail missing metadata 404∥download missing 404', async () => {
+    const env = makeEnv(createFedDb());
+    const results = await Promise.all([
+      req('GET', '/_matrix/federation/v1/media/thumbnail/nope', env),
+      req('GET', '/_matrix/federation/v1/media/download/nope', env),
+    ]);
+    expect(statusesOf(results)).toEqual([404, 404]);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`thumbnail leftover flood-${i}`, async () => {
+      const media = mockR2({ [MEDIA_ID]: new Uint8Array([i]) });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: `p${i}.png` }],
+      });
+      const env = makeEnv(db, { media });
+      const results = await Promise.all([
+        req('GET', `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=${32 + i}&height=32`, env),
+        req('GET', `/_matrix/federation/v1/media/download/${MEDIA_ID}`, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover event_auth∥backfill∥get_missing_events after #232', () => {
+  it('event_auth dual walks create chain', async () => {
+    const db = seedBasicRoom();
+    const env = makeEnv(db);
+    const path = `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent('$member:example.com')}`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(
+      results.every((r) => (r.body as { auth_chain: unknown[] }).auth_chain.length >= 1)
+    ).toBe(true);
+  });
+
+  it('event_auth missing room∥missing event isolation', async () => {
+    const db = seedBasicRoom();
+    const env = makeEnv(db);
+    const [noRoom, noEvent] = await Promise.all([
+      req(
+        'GET',
+        `/_matrix/federation/v1/event_auth/${encodeURIComponent('!x:example.com')}/${encodeURIComponent('$member:example.com')}`,
+        env
+      ),
+      req(
+        'GET',
+        `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/%24missing`,
+        env
+      ),
+    ]);
+    expect(noRoom.status).toBe(404);
+    expect(noEvent.status).toBe(404);
+  });
+
+  it('backfill dual recent pdus', async () => {
+    const db = seedBasicRoom();
+    const env = makeEnv(db);
+    const path = `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=10`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(
+      results.every((r) => Array.isArray((r.body as { pdus: unknown[] }).pdus) && (r.body as { pdus: unknown[] }).pdus.length > 0)
+    ).toBe(true);
+  });
+
+  it('get_missing_events dual from member event', async () => {
+    const db = seedBasicRoom();
+    const env = makeEnv(db);
+    const body = {
+      earliest_events: [],
+      latest_events: ['$member:example.com'],
+      limit: 10,
+      min_depth: 0,
+    };
+    const path = `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`;
+    const results = await Promise.all([
+      req('POST', path, env, body),
+      req('POST', path, env, body),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => Array.isArray((r.body as { events: unknown[] }).events))).toBe(true);
+  });
+
+  it('backfill 403 when origin has no member∥ok isolation', async () => {
+    const db = seedBasicRoom({
+      memberships: [{ room_id: ROOM, user_id: LOCAL_USER, membership: 'join' }],
+    });
+    const env = makeEnv(db);
+    const path = `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=2`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([403, 403]);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`event_auth leftover flood-${i}`, async () => {
+      const env = makeEnv(seedBasicRoom());
+      const results = await Promise.all([
+        req(
+          'GET',
+          `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent('$member:example.com')}`,
+          env
+        ),
+        req('GET', `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=${(i % 3) + 1}`, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover timestamp_to_event∥hierarchy after #232', () => {
+  it('timestamp dir=f∥dir=b isolation at midpoint', async () => {
+    const e1 = makeEvent({
+      event_id: '$t1',
+      event_type: 'm.room.message',
+      content: '{}',
+      origin_server_ts: 1000,
+    });
+    const e2 = makeEvent({
+      event_id: '$t2',
+      event_type: 'm.room.message',
+      content: '{}',
+      origin_server_ts: 2000,
+      depth: 2,
+    });
+    const db = createFedDb({ events: [e1, e2] });
+    const env = makeEnv(db);
+    const base = `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}`;
+    const [fwd, back] = await Promise.all([
+      req('GET', `${base}?ts=1500&dir=f`, env),
+      req('GET', `${base}?ts=1500&dir=b`, env),
+    ]);
+    expect(fwd.status).toBe(200);
+    expect(back.status).toBe(200);
+    expect((fwd.body as { event_id: string }).event_id).toBe('$t2');
+    expect((back.body as { event_id: string }).event_id).toBe('$t1');
+  });
+
+  it('timestamp missing ts∥missing room isolation', async () => {
+    const env = makeEnv(seedBasicRoom());
+    const [noTs, noRoom] = await Promise.all([
+      req('GET', `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}`, env),
+      req('GET', '/_matrix/federation/v1/timestamp_to_event/%21no%3Ax?ts=1500', env),
+    ]);
+    expect(noTs.status).toBe(400);
+    expect(noRoom.status).toBe(404);
+  });
+
+  it('hierarchy dual suggested_only', async () => {
+    const childRoom = '!child:example.com';
+    const childEvt = makeEvent({
+      event_id: '$childlink',
+      event_type: 'm.space.child',
+      state_key: childRoom,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const name = makeEvent({
+      event_id: '$spname',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Space' }),
+    });
+    const childName = makeEvent({
+      event_id: '$cname',
+      room_id: childRoom,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Child' }),
+    });
+    const db = createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: childRoom, room_version: '10', is_public: 1, created_at: 2 },
+      ],
+      events: [childEvt, name, childName],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', childRoom), childEvt.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+        [stateKey(childRoom, 'm.room.name', ''), childName.event_id],
+      ]),
+    });
+    const env = makeEnv(db);
+    const path = `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?suggested_only=true&limit=10`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(
+      results.every((r) => (r.body as { room: { room_id: string } | null }).room?.room_id === ROOM)
+    ).toBe(true);
+  });
+
+  it('hierarchy 404 missing room concurrent', async () => {
+    const env = makeEnv(createFedDb());
+    const results = await Promise.all([
+      req('GET', '/_matrix/federation/v1/hierarchy/%21no%3Ax', env),
+      req('GET', '/_matrix/federation/v1/hierarchy/%21no%3Ax', env),
+    ]);
+    expect(statusesOf(results)).toEqual([404, 404]);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`timestamp leftover flood-${i}`, async () => {
+      const e = makeEvent({
+        event_id: `$tf-${i}`,
+        event_type: 'm.room.message',
+        content: '{}',
+        origin_server_ts: 1_700_000_000_000,
+      });
+      const env = makeEnv(createFedDb({ events: [e] }));
+      const results = await Promise.all([
+        req(
+          'GET',
+          `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1700000000000&dir=f`,
+          env
+        ),
+        req(
+          'GET',
+          `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1700000000000&dir=b`,
+          env
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover send cache∥openid expired after #232', () => {
+  it('cached txn∥fresh txn isolation under Promise.all', async () => {
+    const cached = JSON.stringify({ pdus: { cached: true } });
+    const db = createFedDb({
+      federationTxns: { [`${FED_ORIGIN}|cached`]: cached },
+    });
+    const env = makeEnv(db);
+    const [hit, miss] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/cached', env, { pdus: [{ event_id: '$x' }] }),
+      req('PUT', '/_matrix/federation/v1/send/fresh-leftover', env, { pdus: [] }),
+    ]);
+    expect(hit.status).toBe(200);
+    expect(miss.status).toBe(200);
+    expect((hit.body as { pdus: { cached: boolean } }).pdus.cached).toBe(true);
+    expect(db.federationTxns[`${FED_ORIGIN}|fresh-leftover`]).toBeDefined();
+  });
+
+  it('already-expired openid both 401 and delete token', async () => {
+    const sessions = mockKv(
+      {
+        'openid:exp': JSON.stringify({
+          user_id: LOCAL_USER,
+          expires_at: Date.now() - 5,
+        }),
+      },
+      { getBarrier: { count: 2, match: (key) => key === 'openid:exp' } }
+    );
+    const env = makeEnv(createFedDb(), { sessions });
+    const results = await Promise.all([
+      req('GET', '/_matrix/federation/v1/openid/userinfo?access_token=exp', env),
+      req('GET', '/_matrix/federation/v1/openid/userinfo?access_token=exp', env),
+    ]);
+    expect(statusesOf(results)).toEqual([401, 401]);
+    expect(sessions.data['openid:exp']).toBeUndefined();
+  });
+
+  it('publicRooms since=offset_0∥POST include_all_networks leftover', async () => {
+    const db = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1000 }],
+    });
+    const env = makeEnv(db);
+    const results = await Promise.all([
+      req('GET', '/_matrix/federation/v1/publicRooms?limit=5&since=offset_0', env),
+      req('POST', '/_matrix/federation/v1/publicRooms', env, {
+        limit: 5,
+        include_all_networks: true,
+        third_party_instance_id: 'ignored',
+      }),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`send/openid leftover flood-${i}`, async () => {
+      const db = createFedDb();
+      const env = makeEnv(db, { sessions: mockKv() });
+      const results = await Promise.all([
+        req('PUT', `/_matrix/federation/v1/send/leftover-${i}`, env, { pdus: [], edus: [] }),
+        req('GET', `/_matrix/federation/v1/openid/userinfo?access_token=gone-${i}`, env),
+      ]);
+      expect(results.map((r) => r.status).sort((a, b) => a - b)).toEqual([200, 401]);
     });
   }
 });
