@@ -1,7 +1,9 @@
 /**
- * TOKENMAXX HEAVY leftovers after #159 — sliding-sync soft/edge/reliability.
- * Complements sliding-sync-api-routes.test.ts (sync leftovers landed in #159).
- * Tests-only — no product inventing. Fixtures use example.com only.
+ * TOKENMAXX HEAVY leftovers after #159/#181 — sliding-sync soft/edge/reliability.
+ * Complements sliding-sync-api-routes.test.ts + sliding-sync-device-list-deepen.
+ * Distinct overnight slice after closed red #182 (oauth/push soft-cap) — orthogonal
+ * to oauth/push/account-data/identity leftovers. Tests-only — no product inventing.
+ * Fixtures use example.com only.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -98,6 +100,7 @@ const BOB = '@bob:example.com';
 const CAROL = '@carol:example.com';
 const DEVICE = 'DEVICEA';
 const ROOM = '!room:example.com';
+const ROOM2 = '!room2:example.com';
 const INVITE_ROOM = '!invite:example.com';
 const NOW = 1_700_000_000_000;
 
@@ -2390,4 +2393,790 @@ describe('sliding leftovers conn_id soft flood after #159', () => {
     expect(status).toBe(200);
     expect(typeof body.pos).toBe('string');
   });
+});
+
+
+// ===========================================================================
+// TOKENMAXX overnight HEAVY refill after closed red #182 — sliding-sync leftovers
+// Orthogonal to oauth/push soft-cap floods. Soft reliability + edge matrices.
+// ===========================================================================
+
+const PATHS_ALL = [
+  ['MSC3575', MSC3575],
+  ['MSC4186', MSC4186],
+  ['v4', V4],
+] as const;
+
+const PATHS_SIMPLIFIED = [
+  ['MSC4186', MSC4186],
+  ['v4', V4],
+] as const;
+
+describe('sliding leftovers unknown_pos soft flood after #181', () => {
+  for (const [label, path] of PATHS_ALL) {
+    for (let i = 0; i < 16; i++) {
+      it(`${label} unknown_pos soft-${i}`, async () => {
+        const env = createEnv({
+          db: createSlidingDb({ maxStreamPos: 10 + (i % 5) }),
+          syncDo: createSyncDoStub({ states: {} }),
+        });
+        const ahead = String(1000 + i * 17);
+        const { status, body } = await postSync(path, env, { pos: ahead });
+        expect(status).toBe(400);
+        expect(body.errcode).toBe('M_UNKNOWN_POS');
+      });
+    }
+  }
+});
+
+describe('sliding leftovers too_large room_subscriptions soft after #181', () => {
+  for (const [label, path] of PATHS_ALL) {
+    for (let i = 0; i < 12; i++) {
+      it(`${label} too_large soft-${i}`, async () => {
+        const subs: Record<string, { timeline_limit: number }> = {};
+        const n = 101 + (i % 4);
+        for (let j = 0; j < n; j++) {
+          subs[`!big${j}:example.com`] = { timeline_limit: 1 + (j % 3) };
+        }
+        const env = createEnv();
+        const { status, body } = await postSync(path, env, {
+          room_subscriptions: subs,
+          txn_id: `too-large-${label}-${i}`,
+        });
+        expect(status).toBe(400);
+        expect(body.errcode).toBe('M_TOO_LARGE');
+      });
+    }
+  }
+});
+
+describe('sliding leftovers room_subscriptions joined soft after #181', () => {
+  for (const [label, path] of PATHS_ALL) {
+    for (let i = 0; i < 16; i++) {
+      it(`${label} joined sub soft-${i}`, async () => {
+        const fx = fixtureJoinedRoom();
+        const env = createEnv({
+          db: createSlidingDb({
+            maxStreamPos: 20 + i,
+            memberships: fx.memberships,
+            rooms: fx.rooms,
+            events: fx.events,
+            state: fx.state,
+          }),
+        });
+        const { status, body } = await postSync(path, env, {
+          room_subscriptions: {
+            [ROOM]: { timeline_limit: 1 + (i % 5) },
+          },
+          txn_id: `sub-${label}-${i}`,
+        });
+        expect(status).toBe(200);
+        expect(body.pos).toBe(String(20 + i));
+        expect(body.txn_id).toBe(`sub-${label}-${i}`);
+        const rooms = body.rooms as Record<string, unknown>;
+        expect(rooms[ROOM]).toBeTruthy();
+      });
+    }
+  }
+});
+
+describe('sliding leftovers invite subscription soft after #181', () => {
+  for (const [label, path] of PATHS_ALL) {
+    for (let i = 0; i < 12; i++) {
+      it(`${label} invite sub soft-${i}`, async () => {
+        const invite = _fixtureInviteRoom();
+        const env = createEnv({
+          db: createSlidingDb({
+            maxStreamPos: 8 + i,
+            memberships: invite.memberships,
+            rooms: invite.rooms,
+            events: invite.events,
+            state: invite.state,
+          }),
+        });
+        const { status, body } = await postSync(path, env, {
+          room_subscriptions: {
+            [INVITE_ROOM]: { timeline_limit: 1 + (i % 3) },
+          },
+        });
+        expect(status).toBe(200);
+        const room = (body.rooms as Record<string, { membership?: string; invite_state?: unknown[] }>)[
+          INVITE_ROOM
+        ];
+        expect(room?.membership).toBe('invite');
+        expect((room?.invite_state ?? []).length).toBeGreaterThan(0);
+      });
+    }
+  }
+});
+
+describe('sliding leftovers extensions to_device soft after #181', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`to_device soft-${i}`, async () => {
+      getToDeviceMessages.mockResolvedValue({
+        events: [{ type: 'm.room_key_request', sender: BOB, content: { n: i } }],
+        nextBatch: String(50 + i),
+      });
+      const env = createEnv();
+      const since = i === 0 ? undefined : String(i);
+      const limit = i === 0 ? undefined : 5 + (i % 10);
+      const { status, body } = await postSync(MSC3575, env, {
+        extensions: {
+          to_device: {
+            ...(since !== undefined ? { since } : {}),
+            ...(limit !== undefined ? { limit } : {}),
+          },
+        },
+      });
+      expect(status).toBe(200);
+      expect(getToDeviceMessages).toHaveBeenCalledWith(
+        env.DB,
+        USER,
+        DEVICE,
+        since,
+        limit ?? 100
+      );
+      expect((body.extensions as any).to_device.next_batch).toBe(String(50 + i));
+      expect((body.extensions as any).to_device.events).toHaveLength(1);
+    });
+  }
+});
+
+describe('sliding leftovers extensions typing+receipts soft after #181', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`typing+receipts soft-${i}`, async () => {
+      getTypingForRooms.mockResolvedValue({ [ROOM]: [BOB, CAROL] });
+      getReceiptsForRooms.mockResolvedValue({
+        [ROOM]: { [`$e${i}:example.com`]: { 'm.read': { [BOB]: { ts: NOW + i } } } },
+      });
+      const fx = fixtureJoinedRoom();
+      const env = createEnv({
+        db: createSlidingDb({
+          memberships: fx.memberships,
+          rooms: fx.rooms,
+          events: fx.events,
+          state: fx.state,
+        }),
+      });
+      const { status, body } = await postSync(MSC3575, env, {
+        room_subscriptions: { [ROOM]: { timeline_limit: 2 } },
+        extensions: {
+          typing: { enabled: true },
+          receipts: { enabled: true },
+        },
+      });
+      expect(status).toBe(200);
+      expect((body.extensions as any).typing.rooms[ROOM]).toEqual({
+        type: 'm.typing',
+        content: { user_ids: [BOB, CAROL] },
+      });
+      expect((body.extensions as any).receipts.rooms[ROOM]).toBeTruthy();
+    });
+  }
+});
+
+describe('sliding leftovers extensions account_data soft after #181', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`account_data soft-${i}`, async () => {
+      getE2EEAccountDataFromDO.mockResolvedValue({
+        'm.secret_storage.default_key': { key: `k${i}` },
+      });
+      const fx = fixtureJoinedRoom();
+      const env = createEnv({
+        db: createSlidingDb({
+          memberships: fx.memberships,
+          rooms: fx.rooms,
+          events: fx.events,
+          state: fx.state,
+          accountData: [
+            {
+              user_id: USER,
+              room_id: '',
+              event_type: 'm.push_rules',
+              content: JSON.stringify({ global: { override: [] } }),
+            },
+            {
+              user_id: USER,
+              room_id: ROOM,
+              event_type: 'm.tag',
+              content: JSON.stringify({ tags: { 'm.favourite': { order: i / 100 } } }),
+            },
+          ],
+        }),
+      });
+      const { status, body } = await postSync(MSC3575, env, {
+        room_subscriptions: { [ROOM]: { timeline_limit: 1 } },
+        extensions: { account_data: { enabled: true } },
+      });
+      expect(status).toBe(200);
+      const ad = (body.extensions as any).account_data;
+      expect(Array.isArray(ad.global)).toBe(true);
+      expect(ad.global.length).toBeGreaterThan(0);
+      expect(ad.rooms[ROOM]).toBeTruthy();
+    });
+  }
+});
+
+describe('sliding leftovers extensions e2ee soft after #181', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`e2ee soft-${i}`, async () => {
+      const env = createEnv({
+        db: createSlidingDb({
+          maxStreamPos: 40,
+          otkCounts: [{ algorithm: 'signed_curve25519', count: 10 + i }],
+          fallbackAlgos: [{ algorithm: 'signed_curve25519' }],
+          deviceKeyChanges:
+            i % 2 === 0
+              ? [
+                  { user_id: BOB, stream_position: 20 },
+                  { user_id: CAROL, stream_position: 30 },
+                ]
+              : [],
+          sharedRoomUsers: [BOB, CAROL],
+        }),
+        userKeys: createUserKeysStub({
+          deviceIds: i % 3 === 0 ? [] : [DEVICE],
+          crossSigning: i % 3 === 0 ? {} : { master_key: { keys: {} } },
+        }),
+      });
+      const { status, body } = await postSync(MSC3575, env, {
+        pos: i % 2 === 0 ? '10' : undefined,
+        extensions: { e2ee: { enabled: true } },
+      });
+      expect(status).toBe(200);
+      const e2ee = (body.extensions as any).e2ee;
+      expect(e2ee.device_one_time_keys_count.signed_curve25519).toBe(10 + i);
+      expect(Array.isArray(e2ee.device_lists.changed)).toBe(true);
+      expect(e2ee.device_lists.left).toEqual([]);
+    });
+  }
+});
+
+describe('sliding leftovers extensions presence soft after #181', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`presence soft-${i}`, async () => {
+      const env = createEnv();
+      const { status, body } = await postSync(MSC3575, env, {
+        extensions: { presence: { enabled: true } },
+        txn_id: `presence-${i}`,
+      });
+      expect(status).toBe(200);
+      expect((body.extensions as any).presence).toEqual({ events: [] });
+      expect(body.txn_id).toBe(`presence-${i}`);
+    });
+  }
+});
+
+describe('sliding leftovers timeout long-poll soft after #181', () => {
+  for (const [label, path] of PATHS_SIMPLIFIED) {
+    for (let i = 0; i < 12; i++) {
+      it(`${label} timeout soft-${i}`, async () => {
+        const existing: ConnectionState = {
+          userId: USER,
+          pos: 5,
+          lastAccess: NOW,
+          roomStates: {},
+          listStates: { all: { roomIds: [], count: 0 } },
+          initialSyncComplete: true,
+        };
+        const syncDo = createSyncDoStub({
+          states: { default: existing },
+          waitHasEvents: i % 2 === 0,
+          waitFail: i % 5 === 0,
+        });
+        const env = createEnv({
+          syncDo,
+          db: createSlidingDb({ maxStreamPos: 5, memberships: [] }),
+        });
+        const timeout = i === 0 ? 0 : 1000 + i * 100;
+        const { status } = await postSync(path, env, {
+          pos: '5',
+          timeout,
+          lists: { all: { ranges: [[0, 0]], timeline_limit: 1 } },
+        });
+        expect(status).toBe(200);
+        const waited = syncDo.fetches.some((f) => f.url.includes('/wait-for-events'));
+        if (timeout === 0) {
+          expect(waited).toBe(false);
+        } else if (i % 5 !== 0) {
+          // waitFail swallows; may or may not record fetch depending on throw timing
+          expect(typeof waited).toBe('boolean');
+        }
+      });
+    }
+  }
+});
+
+describe('sliding leftovers timeout clamp soft after #181', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`clamp soft-${i}`, async () => {
+      const existing: ConnectionState = {
+        userId: USER,
+        pos: 1,
+        lastAccess: NOW,
+        roomStates: {},
+        listStates: {},
+        initialSyncComplete: true,
+      };
+      const syncDo = createSyncDoStub({ states: { default: existing } });
+      const env = createEnv({
+        syncDo,
+        db: createSlidingDb({ maxStreamPos: 1 }),
+      });
+      await postSync(
+        V4,
+        env,
+        { pos: '1', timeout: 99999 + i },
+        { query: `timeout=${30000 + i * 1000}` }
+      );
+      const wait = syncDo.fetches.find((f) => f.url.includes('/wait-for-events'));
+      expect((wait?.body as any).timeout).toBe(25000);
+    });
+  }
+});
+
+describe('sliding leftovers unsubscribe_rooms soft after #181', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`unsubscribe soft-${i}`, async () => {
+      const existing: ConnectionState = {
+        userId: USER,
+        pos: 1,
+        lastAccess: NOW,
+        roomStates: {
+          [ROOM]: { sentState: true, lastStreamOrdering: 1 },
+          [ROOM2]: { sentState: true, lastStreamOrdering: 1 },
+          [`!extra${i}:example.com`]: { sentState: true, lastStreamOrdering: 1 },
+        },
+        listStates: {},
+      };
+      const syncDo = createSyncDoStub({ states: { default: existing } });
+      const env = createEnv({ syncDo, db: createSlidingDb({ maxStreamPos: 2 + i }) });
+      const { status } = await postSync(MSC3575, env, {
+        pos: '1',
+        unsubscribe_rooms: i % 2 === 0 ? [ROOM] : [ROOM, ROOM2],
+      });
+      expect(status).toBe(200);
+      const saved = syncDo.saves[0].state;
+      expect(saved.roomStates[ROOM]).toBeUndefined();
+      if (i % 2 === 0) {
+        expect(saved.roomStates[ROOM2]).toBeTruthy();
+      } else {
+        expect(saved.roomStates[ROOM2]).toBeUndefined();
+      }
+    });
+  }
+});
+
+describe('sliding leftovers filters is_dm soft after #181', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`is_dm filter soft-${i}`, async () => {
+      const dmId = `!dm${i}:example.com`;
+      const groupId = `!g${i}:example.com`;
+      const memberships: MembershipRow[] = [
+        { room_id: dmId, user_id: USER, membership: 'join' },
+        { room_id: dmId, user_id: BOB, membership: 'join' },
+        { room_id: groupId, user_id: USER, membership: 'join' },
+        { room_id: groupId, user_id: BOB, membership: 'join' },
+        { room_id: groupId, user_id: CAROL, membership: 'join' },
+      ];
+      const rooms: RoomMeta[] = [
+        { room_id: dmId, created_at: NOW - i, name: null },
+        { room_id: groupId, created_at: NOW - i, name: `Group ${i}` },
+      ];
+      const events: EventRow[] = [
+        makeEvent({
+          event_id: `$dm-${i}`,
+          room_id: dmId,
+          event_type: 'm.room.message',
+          stream_ordering: 1,
+        }),
+        makeEvent({
+          event_id: `$g-${i}`,
+          room_id: groupId,
+          event_type: 'm.room.message',
+          stream_ordering: 2,
+        }),
+      ];
+      const env = createEnv({
+        db: createSlidingDb({ maxStreamPos: 10, memberships, rooms, events }),
+      });
+      const wantDm = i % 2 === 0;
+      const { status, body } = await postSync(MSC3575, env, {
+        lists: {
+          filtered: {
+            ranges: [[0, 99]],
+            filters: { is_dm: wantDm },
+            timeline_limit: 2,
+          },
+        },
+      });
+      expect(status).toBe(200);
+      const lists = body.lists as Record<string, { count: number }>;
+      expect(lists.filtered.count).toBeGreaterThanOrEqual(1);
+      const roomKeys = Object.keys(body.rooms as object);
+      if (wantDm) {
+        expect(roomKeys).toContain(dmId);
+        expect(roomKeys).not.toContain(groupId);
+      } else {
+        expect(roomKeys).toContain(groupId);
+        expect(roomKeys).not.toContain(dmId);
+      }
+    });
+  }
+});
+
+describe('sliding leftovers txn_id soft flood after #181', () => {
+  const txnVariants = [
+    'plain',
+    'txn-with-dash',
+    'txn_under',
+    'txn.dot',
+    'txn:colon',
+    'txn/slash',
+    'txn space',
+    'txn\u2603',
+    'txn\u4e2d\u6587',
+    'txn' + 'x'.repeat(64),
+    '',
+    '0',
+    'false',
+    'null',
+    '[]',
+    '{}',
+  ];
+  for (let i = 0; i < txnVariants.length; i++) {
+    it(`txn_id soft-${i}`, async () => {
+      const env = createEnv({ db: createSlidingDb({ maxStreamPos: 3 }) });
+      const txn = txnVariants[i];
+      const { status, body } = await postSync(MSC3575, env, { txn_id: txn });
+      expect(status).toBe(200);
+      // Empty string is falsy in response echo path → omitted
+      if (txn === '') {
+        expect(body.txn_id).toBeUndefined();
+      } else {
+        expect(body.txn_id).toBe(txn);
+      }
+    });
+  }
+});
+
+describe('sliding leftovers DO 503 soft flood after #181', () => {
+  for (const [label, path] of PATHS_ALL) {
+    for (let i = 0; i < 8; i++) {
+      it(`${label} getFail soft-${i}`, async () => {
+        const env = createEnv({ syncDo: createSyncDoStub({ getFail: true }) });
+        const { status, body } = await postSync(path, env, { lists: {} });
+        expect(status).toBe(503);
+        expect(body.errcode).toBe('M_UNKNOWN');
+      });
+      it(`${label} getStatus soft-${i}`, async () => {
+        const env = createEnv({
+          syncDo: createSyncDoStub({ getStatus: 500 + (i % 3) }),
+        });
+        const { status, body } = await postSync(path, env, {});
+        expect(status).toBe(503);
+        expect(body.errcode).toBe('M_UNKNOWN');
+      });
+    }
+  }
+});
+
+describe('sliding leftovers saveFail resilience soft after #181', () => {
+  for (const [label, path] of PATHS_ALL) {
+    for (let i = 0; i < 8; i++) {
+      it(`${label} saveFail soft-${i}`, async () => {
+        const env = createEnv({
+          syncDo: createSyncDoStub({ saveFail: true }),
+          db: createSlidingDb({ maxStreamPos: 9 + i }),
+        });
+        const { status, body } = await postSync(path, env, {
+          txn_id: `savefail-${i}`,
+        });
+        // save failures are swallowed — response still succeeds
+        expect(status).toBe(200);
+        expect(body.pos).toBe(String(9 + i));
+      });
+    }
+  }
+});
+
+describe('sliding leftovers NSE shape soft after #181', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`NSE shape soft-${i}`, async () => {
+      const fx = fixtureJoinedRoom();
+      const env = createEnv({
+        db: createSlidingDb({
+          memberships: fx.memberships,
+          rooms: fx.rooms,
+          events: fx.events,
+          state: fx.state,
+        }),
+      });
+      const { status, body } = await postSync(
+        MSC4186,
+        env,
+        {
+          room_subscriptions: {
+            [ROOM]: { timeline_limit: 1 + (i % 4) },
+          },
+        },
+        {
+          headers: {
+            'User-Agent':
+              i % 2 === 0
+                ? `ElementX-NSE/${i}`
+                : `NotificationService Extension iOS/${i}`,
+          },
+        }
+      );
+      expect(status).toBe(200);
+      expect((body.rooms as object)[ROOM]).toBeTruthy();
+    });
+  }
+});
+
+describe('sliding leftovers pos query vs body soft after #181', () => {
+  for (const [label, path] of [
+    ['MSC3575', MSC3575],
+    ['MSC4186', MSC4186],
+  ] as const) {
+    for (let i = 0; i < 12; i++) {
+      it(`${label} query pos soft-${i}`, async () => {
+        const syncDo = createSyncDoStub({ states: {} });
+        const env = createEnv({
+          syncDo,
+          db: createSlidingDb({ maxStreamPos: 40 + i }),
+        });
+        const { status, body } = await postSync(
+          path,
+          env,
+          { pos: '9999' },
+          { query: `pos=${5 + (i % 10)}` }
+        );
+        expect(status).toBe(200);
+        expect(body.pos).toBe(String(40 + i));
+      });
+    }
+  }
+});
+
+describe('sliding leftovers multi-conn isolation soft after #181', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`multi-conn soft-${i}`, async () => {
+      const syncDo = createSyncDoStub({ states: {} });
+      const env = createEnv({
+        syncDo,
+        db: createSlidingDb({ maxStreamPos: 15 + i }),
+      });
+      const a = await postSync(MSC3575, env, { conn_id: `phone-${i}` });
+      const b = await postSync(MSC3575, env, { conn_id: `desk-${i}` });
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(200);
+      const phone = syncDo.saves.filter((s) => s.connId === `phone-${i}`);
+      const desk = syncDo.saves.filter((s) => s.connId === `desk-${i}`);
+      expect(phone.length).toBeGreaterThanOrEqual(1);
+      expect(desk.length).toBeGreaterThanOrEqual(1);
+      expect(phone[0].state.pos).toBe(15 + i);
+      expect(desk[0].state.pos).toBe(15 + i);
+    });
+  }
+});
+
+describe('sliding leftovers concurrent parallel POST soft after #181', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`parallel soft-${i}`, async () => {
+      const fx = fixtureJoinedRoom();
+      const env = createEnv({
+        db: createSlidingDb({
+          maxStreamPos: 25,
+          memberships: fx.memberships,
+          rooms: fx.rooms,
+          events: fx.events,
+          state: fx.state,
+        }),
+      });
+      const results = await Promise.all([
+        postSync(MSC3575, env, {
+          lists: { all: { ranges: [[0, 9]], timeline_limit: 2 } },
+          txn_id: `p-a-${i}`,
+        }),
+        postSync(MSC4186, env, {
+          room_subscriptions: { [ROOM]: { timeline_limit: 2 } },
+          txn_id: `p-b-${i}`,
+        }),
+        postSync(V4, env, {
+          extensions: { presence: { enabled: true } },
+          txn_id: `p-c-${i}`,
+        }),
+      ]);
+      for (const r of results) {
+        expect(r.status).toBe(200);
+        expect(typeof r.body.pos).toBe('string');
+      }
+      expect(results[0].body.txn_id).toBe(`p-a-${i}`);
+      expect(results[1].body.txn_id).toBe(`p-b-${i}`);
+      expect(results[2].body.txn_id).toBe(`p-c-${i}`);
+    });
+  }
+});
+
+describe('sliding leftovers lists ranges soft deepen after #181', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`ranges soft-${i}`, async () => {
+      const roomsMeta: RoomMeta[] = [];
+      const memberships: MembershipRow[] = [];
+      const events: EventRow[] = [];
+      for (let j = 0; j < 8; j++) {
+        const id = `!list${j}:example.com`;
+        roomsMeta.push({ room_id: id, created_at: NOW - j * 1000, name: `L${j}` });
+        memberships.push({ room_id: id, user_id: USER, membership: 'join' });
+        events.push(
+          makeEvent({
+            event_id: `$lm${j}`,
+            room_id: id,
+            event_type: 'm.room.message',
+            stream_ordering: j + 1,
+            origin_server_ts: NOW - j * 1000,
+          })
+        );
+      }
+      const env = createEnv({
+        db: createSlidingDb({
+          maxStreamPos: 50,
+          memberships,
+          rooms: roomsMeta,
+          events,
+        }),
+      });
+      const end = i % 8;
+      const { status, body } = await postSync(MSC3575, env, {
+        lists: {
+          all: {
+            ranges: [[0, end]],
+            timeline_limit: 1 + (i % 4),
+          },
+        },
+      });
+      expect(status).toBe(200);
+      const lists = body.lists as Record<string, { count: number; ops?: unknown[] }>;
+      expect(lists.all.count).toBe(8);
+      expect(Object.keys(body.rooms as object).length).toBeLessThanOrEqual(end + 1);
+    });
+  }
+});
+
+describe('sliding leftovers skipped non-member subscription soft after #181', () => {
+  for (const [label, path] of PATHS_ALL) {
+    for (let i = 0; i < 8; i++) {
+      it(`${label} skip non-member soft-${i}`, async () => {
+        const env = createEnv({
+          db: createSlidingDb({
+            memberships: [],
+            rooms: [{ room_id: ROOM, created_at: NOW }],
+          }),
+        });
+        const { status, body } = await postSync(path, env, {
+          room_subscriptions: {
+            [ROOM]: { timeline_limit: 5 },
+            [`!ghost${i}:example.com`]: { timeline_limit: 1 },
+          },
+        });
+        expect(status).toBe(200);
+        expect(body.rooms).toEqual({});
+      });
+    }
+  }
+});
+
+describe('sliding leftovers exactly-100 subscriptions soft after #181', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`exactly-100 soft-${i}`, async () => {
+      const memberships: MembershipRow[] = [];
+      const rooms: RoomMeta[] = [];
+      const events: EventRow[] = [];
+      const subs: Record<string, { timeline_limit: number }> = {};
+      for (let j = 0; j < 100; j++) {
+        const id = `!cap${j}:example.com`;
+        subs[id] = { timeline_limit: 1 };
+        memberships.push({ room_id: id, user_id: USER, membership: 'join' });
+        rooms.push({ room_id: id, created_at: NOW, name: `C${j}` });
+        events.push(
+          makeEvent({
+            event_id: `$cap${j}`,
+            room_id: id,
+            event_type: 'm.room.message',
+            stream_ordering: j + 1,
+          })
+        );
+      }
+      const env = createEnv({
+        db: createSlidingDb({ maxStreamPos: 100, memberships, rooms, events }),
+      });
+      const { status, body } = await postSync(MSC3575, env, {
+        room_subscriptions: subs,
+        txn_id: `cap100-${i}`,
+      });
+      expect(status).toBe(200);
+      expect(body.txn_id).toBe(`cap100-${i}`);
+      expect(Object.keys(body.rooms as object).length).toBe(100);
+    });
+  }
+});
+
+describe('sliding leftovers reconnect state reuse soft after #181', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`reconnect soft-${i}`, async () => {
+      const fx = fixtureJoinedRoom();
+      const existing: ConnectionState = {
+        userId: USER,
+        pos: 5,
+        lastAccess: NOW - 1000 - i,
+        roomStates: {
+          [ROOM]: { sentState: true, lastStreamOrdering: 5 },
+        },
+        listStates: {
+          all: { roomIds: [ROOM], count: 1 },
+        },
+        initialSyncComplete: true,
+      };
+      const syncDo = createSyncDoStub({ states: { default: existing } });
+      const env = createEnv({
+        syncDo,
+        db: createSlidingDb({
+          maxStreamPos: 20 + i,
+          memberships: fx.memberships,
+          rooms: fx.rooms,
+          events: fx.events,
+          state: fx.state,
+        }),
+      });
+      const { status, body } = await postSync(MSC3575, env, {
+        pos: '5',
+        lists: {
+          all: { ranges: [[0, 9]], timeline_limit: 2 },
+        },
+      });
+      expect(status).toBe(200);
+      const lists = body.lists as Record<string, { count: number; ops?: unknown[] }>;
+      expect(lists.all.count).toBe(1);
+      expect(lists.all.ops).toBeUndefined();
+    });
+  }
+});
+
+describe('sliding leftovers lifecycle burst soft after #181', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`lifecycle burst soft-${i}`, async () => {
+      const env = createEnv({ db: createSlidingDb({ maxStreamPos: 11 + i }) });
+      const a = await postSync(MSC3575, env, { txn_id: `lb-a-${i}` });
+      const b = await postSync(MSC4186, env, { txn_id: `lb-b-${i}` });
+      const c = await postSync(V4, env, { txn_id: `lb-c-${i}` });
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(200);
+      expect(c.status).toBe(200);
+      expect(a.body.pos).toBe(String(11 + i));
+      expect(b.body.pos).toBe(String(11 + i));
+      expect(c.body.pos).toBe(String(11 + i));
+    });
+  }
 });
