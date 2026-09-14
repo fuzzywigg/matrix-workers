@@ -900,3 +900,169 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #232', () => {
     );
   });
 });
+
+describe('notify / auth-chain / servers TOKENMAXX leftovers after #241', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  function makeNotifyEnv(
+    members: string[],
+    opts?: {
+      failUsers?: Set<string>;
+      captureRequests?: Array<{ method: string; contentType: string | null; body: unknown }>;
+    }
+  ) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(..._args: unknown[]) {
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            opts?.captureRequests?.push({
+              method: req.method,
+              contentType: req.headers.get('Content-Type'),
+              body,
+            });
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('notifyUsersOfEvent with zero members still logs a zero-count notify line', async () => {
+    const env = makeNotifyEnv([]);
+    await notifyUsersOfEvent(env, '!r:example.com', '$empty', 'm.room.message');
+    expect(env.notifies).toHaveLength(0);
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      0,
+      'users of event',
+      '$empty',
+      'users:',
+      ''
+    );
+  });
+
+  it('notifyUsersOfEvent partial Sync DO failure still delivers to the other members', async () => {
+    const env = makeNotifyEnv(['@ok:example.com', '@bad:example.com', '@ok2:example.com'], {
+      failUsers: new Set(['@bad:example.com']),
+    });
+    await notifyUsersOfEvent(env, '!r:example.com', '$partial', 'm.room.member');
+    expect(env.notifies.map((n) => n.userId).sort()).toEqual([
+      '@ok2:example.com',
+      '@ok:example.com',
+    ]);
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('@bad:example.com'),
+      expect.anything()
+    );
+  });
+
+  it('getServersInRoomsWithUser keeps empty-string server names from trailing-colon MXIDs', async () => {
+    // SUBSTR after ':' on `@user:` yields '' — filter only drops SQL NULL, not empty string
+    const db = {
+      prepare(_sql: string) {
+        return {
+          bind(..._args: unknown[]) {
+            return {
+              async all<T>() {
+                return {
+                  results: [
+                    { server_name: 'example.com' },
+                    { server_name: '' },
+                    { server_name: null },
+                  ] as T[],
+                };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    await expect(getServersInRoomsWithUser(db, '@alice:example.com')).resolves.toEqual([
+      'example.com',
+      '',
+    ]);
+  });
+
+  it('getAuthChain skips already-seen ids inside a spliced batch (batch.length===0 continue)', async () => {
+    // First 50-id splice marks `$only` seen; the 51st residual duplicate filters
+    // to [] and hits the `batch.length === 0) continue` path.
+    const events = new Map<string, PDU>([['$only', pdu('$only', [])]]);
+    const seeds = Array.from({ length: 51 }, () => '$only');
+    const chain = await getAuthChain(createAuthChainDb(events), seeds);
+    expect(chain.map((e) => e.event_id)).toEqual(['$only']);
+  });
+
+  it('getStateAtEvent last-wins when auth_events list repeats the same (type,state_key)', async () => {
+    const older = pdu('$old', [], {
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'old' },
+    });
+    const newer = pdu('$new', [], {
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'new' },
+    });
+    const leaf = pdu('$leaf', ['$old', '$new']);
+    const events = new Map<string, PDU>([
+      ['$leaf', leaf],
+      ['$old', older],
+      ['$new', newer],
+    ]);
+    // getEventsByIds returns in IN-list order; later duplicate key overwrites map
+    const state = await getStateAtEvent(createAuthChainDb(events), '$leaf');
+    expect(state).toHaveLength(1);
+    expect(state[0].event_id).toBe('$new');
+    expect(state[0].content).toEqual({ name: 'new' });
+  });
+
+  it('parallel notifyUsersOfEvent on disjoint rooms stay isolated', async () => {
+    const envA = makeNotifyEnv(['@a:example.com']);
+    const envB = makeNotifyEnv(['@b:example.com']);
+    await Promise.all([
+      notifyUsersOfEvent(envA, '!a:example.com', '$a', 'm.room.message'),
+      notifyUsersOfEvent(envB, '!b:example.com', '$b', 'm.room.message'),
+    ]);
+    expect(envA.notifies.map((n) => n.userId)).toEqual(['@a:example.com']);
+    expect(envB.notifies.map((n) => n.userId)).toEqual(['@b:example.com']);
+    expect((envA.notifies[0].body as { room_id: string }).room_id).toBe('!a:example.com');
+    expect((envB.notifies[0].body as { room_id: string }).room_id).toBe('!b:example.com');
+  });
+
+  it('getAuthChain returns [] when every seed id is missing', async () => {
+    const chain = await getAuthChain(createAuthChainDb(new Map()), ['$nope', '$also-nope']);
+    expect(chain).toEqual([]);
+  });
+});

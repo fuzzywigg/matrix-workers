@@ -631,3 +631,153 @@ describe('federation signing TOKENMAXX leftovers after #232', () => {
     expect(await verifySignature(merged, 'b.example.com', b.keyId, b.publicKey)).toBe(true);
   });
 });
+
+describe('crypto TOKENMAXX leftovers after #241', () => {
+  it('rejects verifyPassword for wrong-case scheme and logs over-cap iterations', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await verifyPassword('password1', '$PBKDF2-SHA256$100000$c2FsdA$hash')).toBe(false);
+    expect(await verifyPassword('password1', '$pbkdf2-sha256$2000001$c2FsdA$hash')).toBe(false);
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('invalid iteration count: 2000001')
+    );
+    vi.restoreAllMocks();
+  });
+
+  it(
+    'accepts a mid-range iteration count (150000) via crafted PBKDF2 hash',
+    async () => {
+      const hash = await craftPbkdf2Hash('mid-range-1', 150_000);
+      expect(hash).toMatch(/^\$pbkdf2-sha256\$150000\$/);
+      expect(await verifyPassword('mid-range-1', hash)).toBe(true);
+      expect(await verifyPassword('wrong-mid-1', hash)).toBe(false);
+    },
+    30_000
+  );
+
+  it('timingSafeEqual is false when only the first code unit differs', () => {
+    expect(timingSafeEqual('abcdefg1', 'Bbcdefg1')).toBe(false);
+    expect(timingSafeEqual('Zzzzzzzz', 'zzzzzzzz')).toBe(false);
+  });
+
+  it('calculateContentHash does not strip nested content.signatures keys', async () => {
+    const bare = { type: 'm.test', content: { body: 'hi' } };
+    const nestedSig = {
+      type: 'm.test',
+      content: { body: 'hi', signatures: { 'evil.example.com': { 'ed25519:1': 'x' } } },
+    };
+    expect(await calculateContentHash(bare)).not.toBe(await calculateContentHash(nestedSig));
+    expect(await verifyContentHash(nestedSig, await calculateContentHash(bare))).toBe(false);
+  });
+
+  it('generateRandomString rejection-samples bytes >= 248 then still fills length', () => {
+    const orig = crypto.getRandomValues.bind(crypto);
+    let calls = 0;
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(((arr: Uint8Array) => {
+      calls += 1;
+      if (calls === 1) {
+        // All rejected (≥ 248) so the loop must request another batch
+        arr.fill(255);
+        return arr;
+      }
+      // Valid uniform bytes in-range for the 62-char alphabet
+      for (let i = 0; i < arr.length; i++) arr[i] = i % 62;
+      return arr;
+    }) as typeof crypto.getRandomValues);
+
+    const s = generateRandomString(8);
+    expect(s).toHaveLength(8);
+    expect(s).toMatch(/^[A-Za-z0-9]+$/);
+    expect(calls).toBeGreaterThanOrEqual(2);
+    vi.mocked(crypto.getRandomValues).mockImplementation(orig);
+  });
+
+  it('sha256 of a single zero byte differs from empty input', async () => {
+    const empty = await sha256(new Uint8Array());
+    const zero = await sha256(new Uint8Array([0]));
+    expect(zero).not.toBe(empty);
+    expect(zero).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it('validatePasswordStrength rejects nullish and accepts letter+digit at length 8', () => {
+    expect(validatePasswordStrength(null as unknown as string)).toMatch(/at least 8/);
+    expect(validatePasswordStrength(undefined as unknown as string)).toMatch(/at least 8/);
+    expect(validatePasswordStrength('Abcd1234')).toBeNull();
+  });
+});
+
+describe('federation signing TOKENMAXX leftovers after #241', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('verifySignature returns false for a different keypair public key', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test', content: { n: 1 } }, 'ex.com', a.keyId, a.privateKeyJwk);
+    expect(await verifySignature(signed, 'ex.com', a.keyId, b.publicKey)).toBe(false);
+    expect(await verifySignature(signed, 'ex.com', a.keyId, a.publicKey)).toBe(true);
+  });
+
+  it('verifySignature catch path returns false when signatures is a non-object', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, keyId } = await generateSigningKeyPair();
+    expect(
+      await verifySignature(
+        { type: 'm.test', signatures: 1 as unknown as Record<string, Record<string, string>> },
+        'ex.com',
+        keyId,
+        publicKey
+      )
+    ).toBe(false);
+    expect(
+      await verifySignature(
+        { type: 'm.test', signatures: null as unknown as Record<string, Record<string, string>> },
+        'ex.com',
+        keyId,
+        publicKey
+      )
+    ).toBe(false);
+    vi.restoreAllMocks();
+  });
+
+  it('signJson preserves unrelated top-level fields on the returned object', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const obj = {
+      type: 'm.room.message',
+      room_id: '!r:example.com',
+      sender: '@alice:example.com',
+      content: { body: 'hi' },
+      origin_server_ts: 1,
+    };
+    const signed = await signJson(obj, 'example.com', keyId, privateKeyJwk);
+    expect(signed.room_id).toBe('!r:example.com');
+    expect(signed.sender).toBe('@alice:example.com');
+    expect(signed.origin_server_ts).toBe(1);
+    expect(signed.content).toEqual({ body: 'hi' });
+    expect(await verifySignature(signed, 'example.com', keyId, publicKey)).toBe(true);
+  });
+
+  it('parallel verifySignature on the same signed object stays true', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test', content: {} }, 'ex.com', keyId, privateKeyJwk);
+    const results = await Promise.all([
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+    ]);
+    expect(results).toEqual([true, true, true]);
+  });
+
+  it('legacy generateSigningKeyPairLegacy keyId matches ed25519 hex form', async () => {
+    const legacy = await generateSigningKeyPairLegacy();
+    expect(legacy.keyId).toMatch(/^ed25519:[0-9a-f]{8}$/);
+    expect(typeof legacy.privateKey).toBe('string');
+    expect(legacy.publicKey).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+});
