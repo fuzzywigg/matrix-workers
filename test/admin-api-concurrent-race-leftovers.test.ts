@@ -1,10 +1,11 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
  * / residual after #252 / residual after #265 / second-wave residual after tip
- * #271 (post-#270) — admin concurrent race / TOCTOU for leftover admin-api
- * routes that only had serial soft floods (#157 leftover) or mutate races
- * (#189). Distinct from admin-mutate-concurrent-race-leftovers (writes) and
- * admin-api-route-leftovers (serial GET floods).
+ * #271 (post-#270) / tertiary residual after tip #275 (post-#275 second-wave)
+ * — admin concurrent race / TOCTOU for leftover admin-api routes that only had
+ * serial soft floods (#157 leftover) or mutate races (#189). Distinct from
+ * admin-mutate-concurrent-race-leftovers (writes) and admin-api-route-leftovers
+ * (serial GET floods).
  *
  * Distinct from tip #241 (devices+keybackups residual) and #239 (this file's
  * prior deepen). Residual after #241: sessions list∥revoke; login-token∥sessions;
@@ -24,6 +25,10 @@
  * registration success∥GET; create invalid∥success; zero-device notice∥sessions;
  * unresolve 404∥reports; PUT deactivated:true∥sessions; discovery-fail∥list;
  * reset omit-logout∥sessions.
+ *
+ * Tertiary residual after tip #275 (post-#275 second-wave): IdP create∥list;
+ * update∥detail; delete∥list; test-ok∥test-404; create-fail∥create-ok isolation
+ * — success/test soft niches from tertiary route leftovers not dual-raced.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -476,6 +481,7 @@ function createAdminDb(opts: {
   knownServersCount?: number;
   nullCounts?: boolean;
   selectBarrier?: SelectBarrier;
+  failIdpInsert?: boolean;
 } = {}) {
   const users = opts.users ?? [defaultAdmin(), defaultBob()];
   const devices = opts.devices ?? [
@@ -1659,6 +1665,9 @@ function createAdminDb(opts: {
                 }
               }
               if (sql.includes('INSERT INTO idp_providers')) {
+                if (opts.failIdpInsert) {
+                  throw new Error('simulated idp insert failure');
+                }
                 idpProviders.push({
                   id: args[0] as string,
                   name: args[1] as string,
@@ -1734,8 +1743,38 @@ function createAdminDb(opts: {
               if (sql.includes('UPDATE idp_providers SET')) {
                 const id = args[args.length - 1] as string;
                 const p = idpProviders.find((x) => x.id === id);
-                if (p && sql.includes('name = ?')) {
-                  // best-effort: leave as-is; updates tracked in updates[]
+                if (p) {
+                  let ai = 0;
+                  if (sql.includes('name = ?')) {
+                    p.name = args[ai++] as string;
+                  }
+                  if (sql.includes('issuer_url = ?')) {
+                    p.issuer_url = args[ai++] as string;
+                  }
+                  if (sql.includes('client_id = ?')) {
+                    p.client_id = args[ai++] as string;
+                  }
+                  if (sql.includes('client_secret_encrypted = ?')) {
+                    p.client_secret_encrypted = args[ai++] as string;
+                  }
+                  if (sql.includes('scopes = ?')) {
+                    p.scopes = args[ai++] as string;
+                  }
+                  if (sql.includes('enabled = ?')) {
+                    p.enabled = args[ai++] as number;
+                  }
+                  if (sql.includes('auto_create_users = ?')) {
+                    p.auto_create_users = args[ai++] as number;
+                  }
+                  if (sql.includes('username_claim = ?')) {
+                    p.username_claim = args[ai++] as string;
+                  }
+                  if (sql.includes('display_order = ?')) {
+                    p.display_order = args[ai++] as number;
+                  }
+                  if (sql.includes('icon_url = ?')) {
+                    p.icon_url = (args[ai++] as string | null) ?? null;
+                  }
                   p.updated_at = Date.now();
                 }
               }
@@ -3585,6 +3624,186 @@ describe('race second-wave notice0∥sessions / unresolve404∥reports / deactiv
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
       expect(results[0].body.devices_notified).toBe(0);
+    });
+  }
+});
+
+// tertiary residual concurrent races after tip #275 (post-#275 soft niches not raced)
+
+describe('race tertiary IdP create∥list / update∥detail / delete∥list after #275', () => {
+  it('idp create success∥list coherency', async () => {
+    const db = createAdminDb({ idpProviders: [] });
+    const env = createEnv({ db });
+    const [create, list] = await Promise.all([
+      jsonReq(
+        '/admin/api/idp/providers',
+        jsonInit('POST', {
+          name: 'RaceCreate',
+          issuer_url: 'https://idp-race-create.example.com',
+          client_id: 'cid',
+          client_secret: 'sec',
+        }),
+        env
+      ),
+      jsonReq('/admin/api/idp/providers', {}, env),
+    ]);
+    expect(create.status).toBe(200);
+    expect(create.body.message).toBe('Identity provider created successfully');
+    expect(create.body.id).toBe('idp-opaque-12');
+    expect(list.status).toBe(200);
+    expect(Array.isArray(list.body.providers)).toBe(true);
+  });
+
+  it('idp update∥detail coherency', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [upd, detail] = await Promise.all([
+      jsonReq('/admin/api/idp/providers/idp1', jsonInit('PUT', { name: 'RaceUpd' }), env),
+      jsonReq('/admin/api/idp/providers/idp1', {}, env),
+    ]);
+    expect(upd.status).toBe(200);
+    expect(upd.body.message).toBe('Identity provider updated');
+    expect(detail.status).toBe(200);
+    expect(detail.body.id).toBe('idp1');
+  });
+
+  it('idp DELETE deleted∥list isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [del, list] = await Promise.all([
+      jsonReq('/admin/api/idp/providers/idp1', { method: 'DELETE', headers: AUTH }, env),
+      jsonReq('/admin/api/idp/providers', {}, env),
+    ]);
+    expect(del.status).toBe(200);
+    expect(del.body.message).toBe('Identity provider deleted');
+    expect(list.status).toBe(200);
+    expect(Array.isArray(list.body.providers)).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp create/update/delete residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq('/admin/api/idp/providers/idp1', jsonInit('PUT', { name: `Flood-${i}` }), env),
+        jsonReq('/admin/api/idp/providers/idp1', {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(results[0].body.message).toBe('Identity provider updated');
+    });
+  }
+});
+
+describe('race tertiary IdP test-ok∥404 / create-fail∥create-ok after #275', () => {
+  it('idp test Connection successful∥test 404 exact isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [ok, miss] = await Promise.all([
+      jsonReq('/admin/api/idp/providers/idp1/test', { method: 'POST', headers: AUTH }, env),
+      jsonReq('/admin/api/idp/providers/missing-test/test', { method: 'POST', headers: AUTH }, env),
+    ]);
+    expect(ok.status).toBe(200);
+    expect(ok.body.message).toBe('Connection successful');
+    expect(ok.body.discovery.issuer).toBe('https://idp.example.com');
+    expect(miss.status).toBe(404);
+    expect(miss.body.error).toBe('Identity provider not found');
+  });
+
+  it('idp create-fail∥create-ok isolation (separate DBs)', async () => {
+    const failDb = createAdminDb({ idpProviders: [], failIdpInsert: true });
+    const okDb = createAdminDb({ idpProviders: [] });
+    const [fail, ok] = await Promise.all([
+      jsonReq(
+        '/admin/api/idp/providers',
+        jsonInit('POST', {
+          name: 'FailRace',
+          issuer_url: 'https://idp-fail-race.example.com',
+          client_id: 'cid',
+          client_secret: 'sec',
+        }),
+        createEnv({ db: failDb })
+      ),
+      jsonReq(
+        '/admin/api/idp/providers',
+        jsonInit('POST', {
+          name: 'OkRace',
+          issuer_url: 'https://idp-ok-race.example.com',
+          client_id: 'cid',
+          client_secret: 'sec',
+        }),
+        createEnv({ db: okDb })
+      ),
+    ]);
+    expect(fail.status).toBe(500);
+    expect(fail.body.error).toBe('Failed to create identity provider');
+    expect(ok.status).toBe(200);
+    expect(ok.body.message).toBe('Identity provider created successfully');
+    expect(failDb.idpProviders).toHaveLength(0);
+    expect(okDb.idpProviders).toHaveLength(1);
+  });
+
+  it('idp missing-param∥list isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [missing, list] = await Promise.all([
+      jsonReq(
+        '/admin/api/idp/providers',
+        jsonInit('POST', { name: 'only-name' }),
+        env
+      ),
+      jsonReq('/admin/api/idp/providers', {}, env),
+    ]);
+    expect(missing.status).toBe(400);
+    expect(missing.body.errcode).toBe('M_MISSING_PARAM');
+    expect(missing.body.error).toBe(
+      'Missing required parameter: name, issuer_url, client_id, and client_secret are required'
+    );
+    expect(list.status).toBe(200);
+  });
+
+  it('idp test discovery-fail∥GET 404 exact isolation', async () => {
+    const db = createAdminDb({
+      idpProviders: [
+        {
+          id: 'badidp',
+          name: 'Bad',
+          issuer_url: 'https://bad-issuer-race-test.example.com',
+          client_id: 'cid',
+          client_secret_encrypted: 'enc:s',
+          scopes: 'openid',
+          enabled: 1,
+          auto_create_users: 1,
+          username_claim: 'email',
+          display_order: 0,
+          icon_url: null,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const [testFail, getMiss] = await Promise.all([
+      jsonReq('/admin/api/idp/providers/badidp/test', { method: 'POST', headers: AUTH }, env),
+      jsonReq('/admin/api/idp/providers/nope', {}, env),
+    ]);
+    expect(testFail.status).toBe(400);
+    expect(testFail.body.success).toBe(false);
+    expect(String(testFail.body.error)).toContain('discovery failed');
+    expect(getMiss.status).toBe(404);
+    expect(getMiss.body.error).toBe('Identity provider not found');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp test/create residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq('/admin/api/idp/providers/idp1/test', { method: 'POST', headers: AUTH }, env),
+        jsonReq(`/admin/api/idp/providers/missing-${i}/test`, { method: 'POST', headers: AUTH }, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 404]);
+      expect(results[0].body.message).toBe('Connection successful');
+      expect(results[1].body.error).toBe('Identity provider not found');
     });
   }
 });
