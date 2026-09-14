@@ -466,10 +466,6 @@ function hasLoginNoPeriod(htmls: string[]): boolean {
   );
 }
 
-function hasUiaWithPeriod(htmls: string[]): boolean {
-  return htmls.some((h) => h.includes(UIA_INVALID_WITH_PERIOD));
-}
-
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
