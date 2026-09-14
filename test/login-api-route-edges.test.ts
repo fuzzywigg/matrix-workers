@@ -317,7 +317,7 @@ async function request(
   env: Env,
   path: string,
   init: RequestInit = {}
-): Promise<{ status: number; body: any; headers: Headers }> {
+): Promise<{ status: number; body: Record<string, unknown> | unknown; headers: Headers }> {
   const res = await login.request(`http://localhost${path}`, init, env);
   let body: unknown = null;
   const text = await res.text();
