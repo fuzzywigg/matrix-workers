@@ -74,7 +74,6 @@ type CrossSigningStore = {
   self_signing?: unknown;
   user_signing?: unknown;
 };
-type OtkEntry = { keyId: string; keyData: unknown; claimed: boolean };
 type FallbackRow = {
   user_id: string;
   device_id: string;
