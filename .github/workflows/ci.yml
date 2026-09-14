@@ -50,6 +50,21 @@ jobs:
       - run: npm ci
       - run: npm test
 
+  # Focused canary for turn concurrent/residual race suites (KV barrier
+  # TOCTOU). Runs in parallel with full Tests; fails fast on race flakes
+  # without waiting on the whole matrix suite. npm run test:turn-race.
+  turn-race:
+    name: Turn Race (canary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:turn-race
+
   worker-bundle:
     name: Worker Bundle (dry-run)
     runs-on: ubuntu-latest
