@@ -500,3 +500,181 @@ describe('getStateAtEvent / getAuthChain / getServersInRoomsWithUser TOKENMAXX a
     expect(chain[0].event_id).toBe('$tip');
   });
 });
+
+
+describe('notify / auth-chain / servers TOKENMAXX leftovers after #226', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  function makeNotifyEnv(members: string[], opts?: { failUsers?: Set<string> }) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(..._args: unknown[]) {
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('notifyUsersOfEvent fans out in parallel and logs the member count', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const members = Array.from({ length: 12 }, (_, i) => `@u${i}:example.com`);
+    const env = makeNotifyEnv(members);
+    await notifyUsersOfEvent(env, '!r:example.com', '$evt', 'm.room.message');
+    expect(env.notifies).toHaveLength(12);
+    expect(new Set(env.notifies.map((n: { userId: string }) => n.userId)).size).toBe(12);
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      12,
+      'users of event',
+      '$evt',
+      'users:',
+      members.join(', ')
+    );
+  });
+
+  it('notifyUsersOfEvent resolves when every Sync DO fails', async () => {
+    const members = ['@a:example.com', '@b:example.com', '@c:example.com'];
+    const env = makeNotifyEnv(members, { failUsers: new Set(members) });
+    await expect(
+      notifyUsersOfEvent(env, '!r:example.com', '$e', 'm.room.encrypted')
+    ).resolves.toBeUndefined();
+    expect(env.notifies).toEqual([]);
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it('getStateAtEvent skips missing auth ids and never includes the leaf itself', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$leaf',
+        pdu('$leaf', ['$present', '$ghost'], {
+          type: 'm.room.message',
+          state_key: undefined,
+          content: { body: 'hi', msgtype: 'm.text' },
+        }),
+      ],
+      [
+        '$present',
+        pdu('$present', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:ex.com' },
+        }),
+      ],
+    ]);
+    const state = await getStateAtEvent(createAuthChainDb(events), '$leaf');
+    expect(state.map((e) => e.event_id)).toEqual(['$present']);
+    expect(state.find((e) => e.event_id === '$leaf')).toBeUndefined();
+  });
+
+  it('getAuthChain abandons remaining queue once MAX_AUTH_CHAIN_SIZE is reached', async () => {
+    // Linear tip → 600 deep. Cap at 500; remaining queue must not keep growing the chain.
+    const events = new Map<string, PDU>();
+    for (let i = 0; i < 600; i++) {
+      events.set(`$${i}`, pdu(`$${i}`, i === 0 ? [] : [`$${i - 1}`]));
+    }
+    const chain = await getAuthChain(createAuthChainDb(events), ['$599']);
+    expect(chain).toHaveLength(500);
+    expect(chain[0].event_id).toBe('$599');
+    expect(chain[499].event_id).toBe('$100');
+  });
+
+  it('getAuthChain pages a 120-child fan-out across multiple 50-id batches', async () => {
+    const events = new Map<string, PDU>();
+    const children: string[] = [];
+    for (let i = 0; i < 120; i++) {
+      const id = `$c${i}`;
+      children.push(id);
+      events.set(id, pdu(id, []));
+    }
+    events.set('$tip', pdu('$tip', children));
+    const chain = await getAuthChain(createAuthChainDb(events), ['$tip']);
+    expect(chain).toHaveLength(121);
+    expect(chain[0].event_id).toBe('$tip');
+    expect(new Set(chain.map((e) => e.event_id)).size).toBe(121);
+  });
+
+  it('getServersInRoomsWithUser binds the subject userId twice', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            return {
+              async all<T>() {
+                if (sql.includes('room_memberships')) {
+                  return { results: [{ server_name: 'peer.example.com' }] as T[] };
+                }
+                return { results: [] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+
+    const servers = await getServersInRoomsWithUser(db, '@alice:example.com');
+    expect(servers).toEqual(['peer.example.com']);
+    expect(binds).toEqual([['@alice:example.com', '@alice:example.com']]);
+  });
+
+  it('getServersInRoomsWithUser keeps distinct multi-segment server names', async () => {
+    const db = {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async all<T>() {
+                return {
+                  results: [
+                    { server_name: 'a.b.example.com' },
+                    { server_name: 'matrix.org' },
+                    { server_name: 'a.b.example.com' },
+                  ] as T[],
+                };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    // SQL DISTINCT already applied; filter only drops nulls
+    const servers = await getServersInRoomsWithUser(db, '@alice:example.com');
+    expect(servers).toEqual(['a.b.example.com', 'matrix.org', 'a.b.example.com']);
+  });
+});

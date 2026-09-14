@@ -2363,3 +2363,278 @@ describe('database CRUD TOKENMAXX edge paths after #73', () => {
     expect(end).toBe(7);
   });
 });
+
+
+describe('database CRUD TOKENMAXX leftovers after #226', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('updateUserProfile is a quiet no-op when both fields are omitted', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: 'Alice',
+          avatar_url: 'mxc://example.com/a',
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    await updateUserProfile(db, USER);
+    expect(db._state.runs).toEqual([]);
+    expect(db._state.users[0].display_name).toBe('Alice');
+    expect(db._state.users[0].avatar_url).toBe('mxc://example.com/a');
+  });
+
+  it('getUserById maps admin and is_deactivated independently', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: null,
+          display_name: null,
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 1,
+          admin: 1,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    const user = await getUserById(db, USER);
+    expect(user).toMatchObject({
+      is_guest: false,
+      is_deactivated: true,
+      admin: true,
+    });
+  });
+
+  it('createRoom stores is_public=1 when isPublic=true', async () => {
+    const db = createCrudDb();
+    await createRoom(db, ROOM, '10', USER, true);
+    expect(db._state.rooms[0].is_public).toBe(1);
+    const room = await getRoom(db, ROOM);
+    expect(room?.is_public).toBe(true);
+  });
+
+  it('getRoomByAlias / deleteDevice / deleteAccessToken are quiet misses', async () => {
+    const db = createCrudDb();
+    await expect(getRoomByAlias(db, '#missing:example.com')).resolves.toBeNull();
+    await expect(deleteDevice(db, USER, 'DEV')).resolves.toBeUndefined();
+    await expect(deleteAccessToken(db, 'no-hash')).resolves.toBeUndefined();
+    expect(db._state.devices).toEqual([]);
+    expect(db._state.tokens).toEqual([]);
+  });
+
+  it('getRoomEvents on an empty room returns end=0', async () => {
+    const db = createCrudDb();
+    const { events, end } = await getRoomEvents(db, ROOM);
+    expect(events).toEqual([]);
+    expect(end).toBe(0);
+  });
+
+  it('getEventsSince defaults limit to 100', async () => {
+    const db = createCrudDb({
+      events: Array.from({ length: 120 }, (_, i) =>
+        eventRowFromPdu(pdu({ event_id: `$e${i}`, type: 'm.room.message' }), i + 1)
+      ),
+    });
+    const page = await getEventsSince(db, ROOM, 0);
+    expect(page).toHaveLength(100);
+    expect(page[0].event_id).toBe('$e0');
+    expect(page[99].event_id).toBe('$e99');
+  });
+
+  it('getEventsByIds with 250 ids issues three prepares (100/100/50)', async () => {
+    const ids = Array.from({ length: 250 }, (_, i) => `$id${i}`);
+    const db = createCrudDb({
+      events: ids.map((id, i) =>
+        eventRowFromPdu(pdu({ event_id: id, type: 'm.room.message' }), i + 1)
+      ),
+    });
+    db._state.prepares.length = 0;
+    const got = await getEventsByIds(db, ids);
+    expect(got).toHaveLength(250);
+    const inPrepares = db._state.prepares.filter((s) => s.includes('IN ('));
+    expect(inPrepares).toHaveLength(3);
+  });
+
+  it('storeEventIdempotent currently does not invoke validateEventSize (documents gap)', async () => {
+    // Contrast with storeEvent which rejects oversized content. Idempotent path skips the check today.
+    const huge = 'x'.repeat(70_000);
+    const event = pdu({
+      event_id: '$huge',
+      type: 'm.room.message',
+      content: { body: huge, msgtype: 'm.text' },
+    });
+    expect(() => validateEventSize(event)).toThrow(MatrixApiError);
+    const db = createCrudDb();
+    const result = await storeEventIdempotent(db, event);
+    expect(result.inserted).toBe(true);
+    expect(db._state.events).toHaveLength(1);
+  });
+
+  it('tryInsertJoinMembership concurrent double-join collapses to one membership row', async () => {
+    const db = createCrudDb();
+    const [a, b] = await Promise.all([
+      tryInsertJoinMembership(db, ROOM, USER, '$join-a', 'Alice'),
+      tryInsertJoinMembership(db, ROOM, USER, '$join-b', 'Alice2'),
+    ]);
+    expect(db._state.memberships).toHaveLength(1);
+    // First writer wins join event_id; second sees existing join → inserted:false
+    const winners = [a, b].filter((r) => r.inserted);
+    const losers = [a, b].filter((r) => !r.inserted);
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(losers[0].eventId).toBe(winners[0].eventId);
+    expect(db._state.memberships[0].event_id).toBe(winners[0].eventId);
+  });
+
+  it('updateMembership without profile fields stores null display/avatar', async () => {
+    const db = createCrudDb();
+    await updateMembership(db, ROOM, USER, 'invite', '$inv');
+    expect(db._state.memberships[0]).toMatchObject({
+      membership: 'invite',
+      event_id: '$inv',
+      display_name: null,
+      avatar_url: null,
+    });
+  });
+
+  it('getUserRooms without filter returns every membership state', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: '!a:example.com',
+          user_id: USER,
+          membership: 'join',
+          event_id: '$1',
+          display_name: null,
+          avatar_url: null,
+        },
+        {
+          room_id: '!b:example.com',
+          user_id: USER,
+          membership: 'leave',
+          event_id: '$2',
+          display_name: null,
+          avatar_url: null,
+        },
+        {
+          room_id: '!c:example.com',
+          user_id: USER,
+          membership: 'invite',
+          event_id: '$3',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    const rooms = await getUserRooms(db, USER);
+    expect(rooms.sort()).toEqual(['!a:example.com', '!b:example.com', '!c:example.com']);
+  });
+
+  it('getStateEvent returns null for unknown type/key pairs', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$c', type: 'm.room.create', state_key: '' }), 1)],
+      roomState: [
+        { room_id: ROOM, event_type: 'm.room.create', state_key: '', event_id: '$c' },
+      ],
+    });
+    await expect(getStateEvent(db, ROOM, 'm.room.topic')).resolves.toBeNull();
+    await expect(getStateEvent(db, ROOM, 'm.room.create', 'nope')).resolves.toBeNull();
+  });
+
+  it('getRoomState returns multiple distinct state types for one room', async () => {
+    const create = pdu({ event_id: '$c', type: 'm.room.create', state_key: '', content: { creator: USER } });
+    const name = pdu({
+      event_id: '$n',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'Lobby' },
+    });
+    const member = pdu({
+      event_id: '$m',
+      type: 'm.room.member',
+      state_key: USER,
+      content: { membership: 'join' },
+    });
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(create, 1),
+        eventRowFromPdu(name, 2),
+        eventRowFromPdu(member, 3),
+      ],
+      roomState: [
+        { room_id: ROOM, event_type: 'm.room.create', state_key: '', event_id: '$c' },
+        { room_id: ROOM, event_type: 'm.room.name', state_key: '', event_id: '$n' },
+        { room_id: ROOM, event_type: 'm.room.member', state_key: USER, event_id: '$m' },
+      ],
+    });
+    const state = await getRoomState(db, ROOM);
+    expect(state.map((e) => e.type).sort()).toEqual([
+      'm.room.create',
+      'm.room.member',
+      'm.room.name',
+    ]);
+  });
+
+  it('createAccessToken → getUserByTokenHash round-trips nullable device_id', async () => {
+    const db = createCrudDb();
+    await createAccessToken(db, 'tid', 'thash', USER, null);
+    await expect(getUserByTokenHash(db, 'thash')).resolves.toEqual({
+      userId: USER,
+      deviceId: null,
+    });
+  });
+
+  it('storeEvent with empty content object still allocates a stream id', async () => {
+    const db = createCrudDb();
+    const stream = await storeEvent(
+      db,
+      pdu({ event_id: '$empty', type: 'm.room.message', content: {} })
+    );
+    expect(stream).toBe(1);
+    expect(JSON.parse(db._state.events[0].content)).toEqual({});
+  });
+
+  it('getEvent maps null hashes/signatures/unsigned to undefined', async () => {
+    const db = createCrudDb({
+      events: [
+        {
+          event_id: '$bare',
+          room_id: ROOM,
+          sender: USER,
+          event_type: 'm.room.message',
+          state_key: null,
+          content: '{}',
+          origin_server_ts: NOW,
+          unsigned: null,
+          depth: 1,
+          auth_events: '[]',
+          prev_events: '[]',
+          hashes: null,
+          signatures: null,
+          stream_ordering: 1,
+        },
+      ],
+    });
+    const event = await getEvent(db, '$bare');
+    expect(event?.hashes).toBeUndefined();
+    expect(event?.signatures).toBeUndefined();
+    expect(event?.unsigned).toBeUndefined();
+    expect(event?.state_key).toBeUndefined();
+  });
+});
