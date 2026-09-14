@@ -71,10 +71,8 @@ import adminApp from '../src/api/admin';
 
 const ADMIN = '@admin:example.com';
 const BOB = '@bob:example.com';
-const CAROL = '@carol:example.com';
 const SERVER = 'example.com';
 const ROOM = '!room:example.com';
-const ROOM_ENC = encodeURIComponent(ROOM);
 const MEDIA_ID = 'mxc_media_abc';
 
 type SqlCall = { sql: string; args: unknown[] };
@@ -619,7 +617,7 @@ function createAdminDb(opts: {
   ];
   const streamPositions = { ...(opts.streamPositions ?? { to_device: 5 }) };
   let nextReportId = Math.max(0, ...reports.map((r) => r.id)) + 1;
-  let nextLinkId = Math.max(0, ...idpLinks.map((l) => l.id)) + 1;
+  void idpLinks;
   let nextAuditId = Math.max(0, ...audit.map((a) => a.id)) + 1;
 
   const inserts: SqlCall[] = [];

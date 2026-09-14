@@ -63,7 +63,6 @@ import { generateSigningKeyPair } from '../src/utils/crypto';
 const SERVER = 'example.com';
 const ROOM = '!room:example.com';
 const LOCAL_USER = '@alice:example.com';
-const REMOTE_USER = '@bob:remote.example.com';
 
 /** Remap Cloudflare NODE-ED25519 → Node Ed25519 for unit tests. */
 function installNodeEd25519Shim() {
