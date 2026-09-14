@@ -627,14 +627,14 @@ describe('errors TOKENMAXX residual leftovers after #272', () => {
     await expect(i.json()).resolves.toEqual({ errcode: 'M_INVALID_ROOM_STATE', error: 'i' });
   });
 
-  it('emptyResponse() default 200 races with emptyResponse(204)', async () => {
+  it('emptyResponse() default 200 races with emptyResponse(202)', async () => {
     const [def, custom] = await Promise.all([
       Promise.resolve(emptyResponse()),
-      Promise.resolve(emptyResponse(204)),
+      Promise.resolve(emptyResponse(202)),
     ]);
     expect(def).not.toBe(custom);
     expect(def.status).toBe(200);
-    expect(custom.status).toBe(204);
+    expect(custom.status).toBe(202);
     await expect(def.json()).resolves.toEqual({});
     await expect(custom.json()).resolves.toEqual({});
   });
