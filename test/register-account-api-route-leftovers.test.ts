@@ -3691,3 +3691,324 @@ describe('account leftovers openid + registration_token matrix flood', () => {
     }
   });
 });
+
+
+describe('register leftovers dummy login after guest register', () => {
+  it('guest register then dummy login with opaque localpart', async () => {
+    const db = createLoginDb();
+    const env = loginEnv(db);
+    const reg = await loginRequest(
+      env,
+      '/_matrix/client/v3/register?kind=guest',
+      jsonInit('POST', { device_id: 'GDEV' }, '')
+    );
+    expect(reg.status).toBe(200);
+    const userId = reg.body.user_id as string;
+    const localpart = userId.slice(1).split(':')[0];
+
+    const dummy = await loginRequest(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        {
+          type: 'm.login.dummy',
+          identifier: { type: 'm.id.user', user: localpart },
+          device_id: 'GDEV2',
+        },
+        ''
+      )
+    );
+    expect(dummy.status).toBe(200);
+    expect(dummy.body.user_id).toBe(userId);
+  });
+});
+
+describe('register leftovers createUser timestamp binds', () => {
+  it('INSERT users includes created_at and updated_at at frozen NOW', async () => {
+    const db = createLoginDb();
+    const env = loginEnv(db);
+    await loginRequest(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit('POST', registerBody({ username: 'timestamps' }), '')
+    );
+    const ins = db.inserts.find((i) => i.sql.includes('INSERT INTO users'))!;
+    expect(ins.args.length).toBeGreaterThanOrEqual(6);
+    expect(ins.args[4]).toBe(NOW);
+    expect(ins.args[5]).toBe(NOW);
+  });
+
+  it('access_token INSERT binds opaque token_id and hashed token', async () => {
+    const db = createLoginDb();
+    const env = loginEnv(db);
+    const res = await loginRequest(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit('POST', registerBody({ username: 'tokbind' }), '')
+    );
+    const tok = db.inserts.find((i) => i.sql.includes('INSERT INTO access_tokens'))!;
+    expect(typeof tok.args[0]).toBe('string');
+    expect(tok.args[0]).toMatch(/^opaque/);
+    expect(typeof tok.args[1]).toBe('string');
+    expect(tok.args[1]).not.toBe(res.body.access_token);
+    expect(tok.args[2]).toBe(`@tokbind:${SERVER}`);
+  });
+});
+
+describe('account leftovers password UIA session uniqueness', () => {
+  it('issues distinct UIA sessions on successive challenges', async () => {
+    const env = accountEnv();
+    const a = await accountRequest(
+      env,
+      '/_matrix/client/v3/account/password',
+      jsonInit('POST', { new_password: STRONG_PW })
+    );
+    const b = await accountRequest(
+      env,
+      '/_matrix/client/v3/account/password',
+      jsonInit('POST', { new_password: STRONG_PW })
+    );
+    expect(a.status).toBe(401);
+    expect(b.status).toBe(401);
+    expect(a.body.session).not.toBe(b.body.session);
+  });
+
+  it('passes through client auth.session without requiring match', async () => {
+    const env = accountEnv();
+    const res = await accountRequest(
+      env,
+      '/_matrix/client/v3/account/password',
+      jsonInit('POST', {
+        new_password: STRONG_PW,
+        auth: { type: 'm.login.password', session: 'client-chosen-session', password: CURRENT_PW },
+      })
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects new_password null/false/0 as missing', async () => {
+    const env = accountEnv();
+    for (const pw of [null, false, 0]) {
+      const res = await accountRequest(
+        env,
+        '/_matrix/client/v3/account/password',
+        jsonInit('POST', { new_password: pw, auth: passwordAuth() })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    }
+  });
+});
+
+describe('account leftovers 3pid email format accept matrix', () => {
+
+  it('accepts email format case-0', async () => {
+    const env = accountEnv();
+    emailMocks.createVerificationSession.mockResolvedValueOnce({
+      sessionId: 'sid-email-0',
+      token: '9990',
+    });
+    const res = await accountRequest(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', { client_secret: 's', email: "a@b.co", send_attempt: 1 }, '')
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ sid: 'sid-email-0' });
+  });
+
+  it('accepts email format case-1', async () => {
+    const env = accountEnv();
+    emailMocks.createVerificationSession.mockResolvedValueOnce({
+      sessionId: 'sid-email-1',
+      token: '9991',
+    });
+    const res = await accountRequest(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', { client_secret: 's', email: "user.name+tag@example.com", send_attempt: 1 }, '')
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ sid: 'sid-email-1' });
+  });
+
+  it('accepts email format case-2', async () => {
+    const env = accountEnv();
+    emailMocks.createVerificationSession.mockResolvedValueOnce({
+      sessionId: 'sid-email-2',
+      token: '9992',
+    });
+    const res = await accountRequest(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', { client_secret: 's', email: "u_v-w@ex-ample.com", send_attempt: 1 }, '')
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ sid: 'sid-email-2' });
+  });
+
+  it('accepts email format case-3', async () => {
+    const env = accountEnv();
+    emailMocks.createVerificationSession.mockResolvedValueOnce({
+      sessionId: 'sid-email-3',
+      token: '9993',
+    });
+    const res = await accountRequest(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', { client_secret: 's', email: "123@456.789", send_attempt: 1 }, '')
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ sid: 'sid-email-3' });
+  });
+
+  it('accepts email format case-4', async () => {
+    const env = accountEnv();
+    emailMocks.createVerificationSession.mockResolvedValueOnce({
+      sessionId: 'sid-email-4',
+      token: '9994',
+    });
+    const res = await accountRequest(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', { client_secret: 's', email: "a@b.c", send_attempt: 1 }, '')
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ sid: 'sid-email-4' });
+  });
+
+});
+
+describe('register leftovers kind=guest opaque uniqueness', () => {
+  it('successive guests get distinct opaque localparts and tokens', async () => {
+    const db = createLoginDb();
+    const env = loginEnv(db);
+    const ids: string[] = [];
+    const tokens: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const res = await loginRequest(
+        env,
+        '/_matrix/client/v3/register?kind=guest',
+        jsonInit('POST', { device_id: `G${i}` }, '')
+      );
+      expect(res.status).toBe(200);
+      ids.push(res.body.user_id as string);
+      tokens.push(res.body.access_token as string);
+    }
+    expect(new Set(ids).size).toBe(5);
+    expect(new Set(tokens).size).toBe(5);
+    expect(db.users.size).toBe(5);
+  });
+});
+
+describe('register leftovers available after deactivate still in-use', () => {
+  it('deactivated account localpart remains unavailable', async () => {
+    const db = createLoginDb({
+      users: new Map([
+        [
+          `@gone:${SERVER}`,
+          userRow({
+            user_id: `@gone:${SERVER}`,
+            localpart: 'gone',
+            is_deactivated: 1,
+            password_hash: 'mockok:x',
+          }),
+        ],
+      ]),
+    });
+    const env = loginEnv(db);
+    const avail = await loginRequest(env, '/_matrix/client/v3/register/available?username=gone');
+    expect(avail.body.errcode).toBe('M_USER_IN_USE');
+    const reg = await loginRequest(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit('POST', registerBody({ username: 'gone' }), '')
+    );
+    expect(reg.body.errcode).toBe('M_USER_IN_USE');
+  });
+});
+
+describe('account leftovers errcode vocabulary soft-cap', () => {
+  it('collects expected errcodes across register/account stubs', async () => {
+    const lenv = loginEnv(createLoginDb());
+    const aenv = accountEnv();
+    const codes = new Set<string>();
+
+    const push = (body: { errcode?: string }) => {
+      if (body && body.errcode) codes.add(body.errcode);
+    };
+
+    push((await loginRequest(lenv, '/_matrix/client/v3/register/available')).body);
+    push(
+      (
+        await loginRequest(
+          lenv,
+          '/_matrix/client/v3/register',
+          jsonInit('POST', registerBody({ username: 'Bad' }), '')
+        )
+      ).body
+    );
+    push(
+      (
+        await loginRequest(lenv, '/_matrix/client/v3/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{',
+        })
+      ).body
+    );
+    push(
+      (
+        await accountRequest(
+          aenv,
+          '/_matrix/client/v1/register/m.login.registration_token/validity'
+        )
+      ).body
+    );
+    push(
+      (
+        await accountRequest(
+          aenv,
+          '/_matrix/client/v3/account/password',
+          jsonInit('POST', { new_password: 'short' })
+        )
+      ).body
+    );
+    push(
+      (
+        await accountRequest(
+          aenv,
+          '/_matrix/client/v3/account/password/email/requestToken',
+          jsonInit('POST', {}, '')
+        )
+      ).body
+    );
+    push(
+      (
+        await accountRequest(
+          aenv,
+          '/_matrix/client/v3/account/3pid/msisdn/requestToken',
+          jsonInit('POST', {}, '')
+        )
+      ).body
+    );
+    push(
+      (
+        await accountRequest(
+          aenv,
+          '/_matrix/client/v3/user/%40bob%3Aexample.com/openid/request_token',
+          jsonInit('POST', {})
+        )
+      ).body
+    );
+
+    expect(codes.has('M_MISSING_PARAM')).toBe(true);
+    expect(codes.has('M_INVALID_USERNAME')).toBe(true);
+    expect(codes.has('M_BAD_JSON')).toBe(true);
+    expect(codes.has('M_WEAK_PASSWORD')).toBe(true);
+    expect(codes.has('M_THREEPID_NOT_FOUND')).toBe(true);
+    expect(codes.has('M_THREEPID_DENIED')).toBe(true);
+    expect(codes.has('M_FORBIDDEN')).toBe(true);
+  });
+});
