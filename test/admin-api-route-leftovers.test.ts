@@ -1,8 +1,8 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
- * — admin API soft/edge/reliability. Complements admin-api-routes.test.ts and
- * admin-api-concurrent-race leftovers (#239/#248). Tests-only — no product inventing.
- * Fixtures use example.com only.
+ * / residual after #265 — admin API soft/edge/reliability. Complements
+ * admin-api-routes.test.ts and admin-api-concurrent-race leftovers
+ * (#239/#248/#265). Tests-only — no product inventing. Fixtures use example.com only.
  *
  * Deepen after #241: analytics period soft, synapse destinations/event_reports,
  * federation status/servers/test, sessions revoke, make/remove-admin edges,
@@ -14,6 +14,11 @@
  * login-token TTL clamps, federation/test all-green+empty-keys, registration PUT
  * fail/non-bool, bulk-delete deleted:0, synapse rooms query knobs,
  * reset_password logout_devices:false, empty-body user PUT errcode.
+ *
+ * Residual after #265 (post-#252): cleanup; users/create success+errors;
+ * server-notice; reports resolve/unresolve; synapse deactivate; reset_password
+ * logout_devices:true; registration PUT success; bulk-delete deleted:1;
+ * room/user detail GETs — one-shots unsaturated in leftovers soft floods.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -4311,6 +4316,295 @@ describe('admin leftovers registration/bulk/synapse-rooms/reset soft flood after
       expect(res.status).toBe(400);
       expect(res.body.errcode).toBe('M_MISSING_PARAM');
       expect(String(res.body.error)).toMatch(/No fields to update/);
+    });
+  }
+});
+
+// residual soft floods after #265 (post-#252 niches unsaturated in leftovers)
+
+describe('admin leftovers cleanup / create / server-notice soft flood after #265', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`cleanup soft-${i}`, async () => {
+      const db = createAdminDb();
+      const media = mockR2();
+      const res = await jsonReq(
+        '/admin/api/cleanup',
+        jsonInit('POST', {}),
+        createEnv({ db, media })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.users_deleted).toBe(1);
+      expect(res.body.rooms_deleted).toBe(true);
+      expect(db.users.every((u) => u.admin === 1)).toBe(true);
+      expect(db.users.find((u) => u.user_id === BOB)).toBeUndefined();
+      expect(media.deleted).toContain(MEDIA_ID);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`users/create success soft-${i}`, async () => {
+      const db = createAdminDb();
+      const localpart = `carol${i}`;
+      const res = await jsonReq(
+        '/admin/api/users/create',
+        jsonInit('POST', {
+          username: localpart,
+          password: `Secret${i}!`,
+          display_name: `Carol${i}`,
+          admin: i % 2 === 0,
+        }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.user_id).toBe(`@${localpart}:example.com`);
+      expect(db.users.some((u) => u.user_id === `@${localpart}:example.com`)).toBe(true);
+      expect(db.users.find((u) => u.user_id === `@${localpart}:example.com`)?.password_hash).toBe(
+        `hashed:Secret${i}!`
+      );
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`users/create invalid username soft-${i}`, async () => {
+      const res = await jsonReq(
+        '/admin/api/users/create',
+        jsonInit('POST', { username: `Bad Name ${i}!`, password: 'x' })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_INVALID_USERNAME');
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`users/create duplicate soft-${i}`, async () => {
+      const res = await jsonReq(
+        '/admin/api/users/create',
+        jsonInit('POST', { username: 'bob', password: 'x' })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_USER_IN_USE');
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`users/create missing password soft-${i}`, async () => {
+      const res = await jsonReq(
+        '/admin/api/users/create',
+        jsonInit('POST', { username: `nopass${i}` })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`server-notice soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/server-notice',
+        jsonInit('POST', { user_id: BOB, message: `Hello-${i}` }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.devices_notified).toBe(1);
+      expect(db.inserts.some((ins) => String(ins.sql).includes('to_device_messages'))).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`server-notice missing param soft-${i}`, async () => {
+      const body = i % 2 === 0 ? { user_id: BOB } : { message: 'x' };
+      const res = await jsonReq('/admin/api/server-notice', jsonInit('POST', body));
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    });
+  }
+});
+
+describe('admin leftovers reports resolve / deactivate / reset-true soft flood after #265', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`reports resolve soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/reports/1/resolve',
+        jsonInit('POST', { note: `handled-${i}` }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.reports.find((r) => r.id === 1)?.resolved).toBe(1);
+      expect(db.reports.find((r) => r.id === 1)?.resolved_by).toBe(ADMIN);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`reports unresolve soft-${i}`, async () => {
+      const db = createAdminDb();
+      await jsonReq(
+        '/admin/api/reports/1/resolve',
+        jsonInit('POST', { note: 'x' }),
+        createEnv({ db })
+      );
+      const res = await jsonReq(
+        '/admin/api/reports/1/unresolve',
+        { method: 'POST', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.reports.find((r) => r.id === 1)?.resolved).toBe(0);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`reports resolve missing soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/reports/${900 + i}/resolve`,
+        jsonInit('POST', { note: 'x' })
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse deactivate soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/_synapse/admin/v1/deactivate/${encodeURIComponent(BOB)}`,
+        jsonInit('POST', {}),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.id_server_unbind_result).toBe('success');
+      expect(db.users.find((u) => u.user_id === BOB)?.is_deactivated).toBe(1);
+      expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(0);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`synapse deactivate missing soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/_synapse/admin/v1/deactivate/${encodeURIComponent(`@nope${i}:example.com`)}`,
+        jsonInit('POST', {})
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`reset_password logout_devices true soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/_synapse/admin/v1/reset_password/${encodeURIComponent(BOB)}`,
+        jsonInit('POST', { new_password: `Zzz${i}!`, logout_devices: true }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({});
+      expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(0);
+      expect(db.users.find((u) => u.user_id === BOB)?.password_hash).toBe(`hashed:Zzz${i}!`);
+      const audit = db.audit.find((a) => a.action === 'user.reset_password');
+      expect(JSON.parse(String(audit?.details)).logout_devices).toBe(true);
+    });
+  }
+});
+
+describe('admin leftovers registration success / bulk-delete / detail soft flood after #265', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`registration PUT success soft-${i}`, async () => {
+      const enabled = i % 2 === 0;
+      const adminDO = createAdminDO({ config: { registration_enabled: !enabled } });
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/registration',
+        jsonInit('PUT', { enabled }),
+        createEnv({ adminDO, db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.enabled).toBe(enabled);
+      const audit = db.audit.find((a) => a.action === 'config.registration.update');
+      expect(audit?.success).toBe(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`bulk-delete BOB deleted:1 soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/users/bulk-delete',
+        jsonInit('POST', { user_ids: [BOB] }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.deleted).toBe(1);
+      expect(db.users.find((u) => u.user_id === BOB)).toBeUndefined();
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`admin room detail soft-${i}`, async () => {
+      const res = await jsonReq(`/admin/api/rooms/${encodeURIComponent(ROOM)}`);
+      expect(res.status).toBe(200);
+      expect(res.body.name).toBe('General');
+      expect(res.body.topic).toBe('hello');
+      expect(res.body.join_rule).toBe('public');
+      expect(res.body.member_count).toBe(2);
+      expect(res.body.aliases).toContain('#general:example.com');
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`admin room detail missing soft-${i}`, async () => {
+      const res = await jsonReq(`/admin/api/rooms/${encodeURIComponent(`!nope${i}:example.com`)}`);
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse room detail soft-${i}`, async () => {
+      const res = await jsonReq(`/_synapse/admin/v1/rooms/${encodeURIComponent(ROOM)}`);
+      expect(res.status).toBe(200);
+      expect(res.body.room_id).toBe(ROOM);
+      expect(res.body.join_rules).toBe('public');
+      expect(res.body.creator).toBe(ADMIN);
+      expect(res.body.federatable).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse v2 user detail soft-${i}`, async () => {
+      const res = await jsonReq(`/_synapse/admin/v2/users/${encodeURIComponent(BOB)}`);
+      expect(res.status).toBe(200);
+      expect(res.body.name).toBe(BOB);
+      expect(Array.isArray(res.body.threepids)).toBe(true);
+      expect(res.body.locked).toBe(false);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`PUT users with fields soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}`,
+        jsonInit('PUT', {
+          display_name: `Bob-${i}`,
+          admin: false,
+          deactivated: false,
+        }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.updates.some((u) => String(u.sql).includes('UPDATE users SET'))).toBe(true);
+      expect(db.audit.some((a) => a.action === 'user.update')).toBe(true);
     });
   }
 });
