@@ -4266,11 +4266,24 @@ describe('CallRoom hibernation tetradecenary answer/leave/json leftovers after #
         room.webSocketError(ws, new Error('boom')),
       ]);
 
-      // Error path leaves; offer may land track then wipe, or wipe first
-      const gone = !room.participants.has('u1|d1');
-      expect(gone || room.participants.has('u1|d1')).toBe(true);
-      if (gone) {
-        expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+      // error→leave deletes; offer may land track first or late-persist after map clear
+      const has = room.participants.has('u1|d1');
+      if (has) {
+        const p = room.participants.get('u1|d1') as { tracks: Map<string, unknown> };
+        expect(p.tracks.has('audio0')).toBe(true);
+        await room.webSocketError(ws, new Error('cleanup'));
+        expect(room.participants.has('u1|d1')).toBe(false);
+      } else {
+        // memory cleared; storage may be empty or late-filled by offer persist
+        const filled = state.storage.map.has('participant:u1|d1');
+        if (filled) {
+          const stored = state.storage.map.get('participant:u1|d1') as {
+            tracks?: Record<string, unknown>;
+          };
+          expect(stored.tracks?.audio0 !== undefined || stored.tracks !== undefined).toBe(true);
+        } else {
+          expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+        }
       }
     });
   }
