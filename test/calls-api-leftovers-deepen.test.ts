@@ -1,11 +1,16 @@
 /**
- * TOKENMAXX HEAVY leftovers after #226 — Cloudflare Calls SFU Matrix routes.
- * Complements test/calls-api-routes.test.ts + test/calls-api-route-leftovers.test.ts
- * (soft floods) and voip-rtc-calls-concurrent-race (dual cold start / start∥end).
+ * TOKENMAXX HEAVY leftovers after #226 / residual deepen after #241 — Cloudflare
+ * Calls SFU Matrix routes. Complements test/calls-api-routes.test.ts +
+ * test/calls-api-route-leftovers.test.ts (soft floods) and
+ * voip-rtc-calls-concurrent-race (dual cold start / start∥end).
  *
  * This slice: unused failInit stub, dangling room_state without event row,
  * truthy/falsy active JSON, membership case/empty, init throw vs 500-continue,
  * WS type filter, header forward, ON CONFLICT restart after inactive.
+ *
+ * Residual after #241: active/participants null||false coerce, start when
+ * existing active:null, end DO HTTP-500 (non-throw) still updates, end skips
+ * membership check, startedAt/callId null kept.
  *
  * Tests-only via Hono callsApp.request(). Fixtures use example.com only.
  */
@@ -67,7 +72,13 @@ type SqlCall = { sql: string; args: unknown[] };
 type CallFetch = { url: string; method: string; body?: unknown; headers?: Record<string, string> };
 
 function createCallRoomStub(
-  opts: { failInit?: boolean; throwInit?: boolean; failEnd?: boolean; wsStatus?: number } = {}
+  opts: {
+    failInit?: boolean;
+    throwInit?: boolean;
+    failEnd?: boolean;
+    endHttpStatus?: number;
+    wsStatus?: number;
+  } = {}
 ) {
   const fetches: CallFetch[] = [];
   return {
@@ -96,6 +107,9 @@ function createCallRoomStub(
       }
       if (url.includes('/end') && opts.failEnd) {
         throw new Error('end boom');
+      }
+      if (url.includes('/end') && opts.endHttpStatus) {
+        return new Response('end fail', { status: opts.endHttpStatus });
       }
       if (url.includes('/ws')) {
         return new Response('ws-proxy', {
@@ -575,5 +589,168 @@ describe('calls leftovers deepen after #226 — membership / ws / restart', () =
     expect((await request(env, START_PATH, jsonInit('GET'))).status).toBe(404);
     expect((await request(env, END_PATH, jsonInit('GET'))).status).toBe(404);
     expect((await request(env, `/calls/${CALL_ID}/ws`, jsonInit('POST', {}))).status).toBe(404);
+  });
+});
+
+describe('calls residual deepen after #241 — null coerce / end HTTP / membership', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    callsMocks.isCallsConfigured.mockReturnValue(true);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('GET treats active:null as falsy false but keeps callId', async () => {
+    const db = createCallsDb();
+    seedActiveCall(db, { active: null, call_id: 'c-null', participants: ['@bob:example.com'] });
+    const res = await request(createEnv({ db }), GET_PATH, {
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      active: false,
+      callId: 'c-null',
+      participants: ['@bob:example.com'],
+      startedAt: undefined,
+    });
+  });
+
+  it('GET treats participants:false / 0 as [] via || default', async () => {
+    const db = createCallsDb();
+    seedActiveCall(db, { active: true, call_id: 'c-pf', participants: false });
+    const res = await request(createEnv({ db }), GET_PATH, {
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.body).toMatchObject({ active: true, callId: 'c-pf', participants: [] });
+
+    const db2 = createCallsDb();
+    seedActiveCall(db2, { active: true, call_id: 'c-p0', participants: 0 });
+    const res2 = await request(createEnv({ db: db2 }), GET_PATH, {
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res2.body).toMatchObject({ participants: [] });
+  });
+
+  it('GET keeps callId:null and startedAt:null without defaulting', async () => {
+    const db = createCallsDb();
+    seedActiveCall(db, {
+      active: true,
+      call_id: null,
+      started_at: null,
+      participants: [],
+    });
+    const res = await request(createEnv({ db }), GET_PATH, {
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.body).toEqual({
+      active: true,
+      callId: null,
+      participants: [],
+      startedAt: null,
+    });
+  });
+
+  it('POST start proceeds when existing call has active:null (falsy)', async () => {
+    const db = createCallsDb({ memberships: [joinMember()] });
+    seedActiveCall(db, { active: null, call_id: 'old-null' });
+    const res = await request(createEnv({ db }), START_PATH, jsonInit('POST', {}));
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ callId: CALL_ID });
+    expect(db.events.some((e) => e.event_id === `call_${CALL_ID}`)).toBe(true);
+  });
+
+  it('POST end 404 when active is null (falsy, same as inactive)', async () => {
+    const db = createCallsDb();
+    seedActiveCall(db, { active: null, call_id: CALL_ID });
+    const res = await request(createEnv({ db }), END_PATH, jsonInit('POST', {}));
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND' });
+  });
+
+  it('POST end continues when DO /end returns HTTP 500 (status not checked, only throw caught)', async () => {
+    const db = createCallsDb();
+    seedActiveCall(db);
+    const callRoom = createCallRoomStub({ endHttpStatus: 500 });
+    const res = await request(createEnv({ db, callRoom }), END_PATH, jsonInit('POST', {}));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+    expect(JSON.parse(db.events[0].content).active).toBe(false);
+    expect(callRoom.fetches.some((f) => f.url.includes('/end'))).toBe(true);
+  });
+
+  it('POST end does not check membership (unlike start)', async () => {
+    const db = createCallsDb({ memberships: [] });
+    seedActiveCall(db);
+    const res = await request(createEnv({ db }), END_PATH, jsonInit('POST', {}));
+    expect(res.status).toBe(200);
+    expect(JSON.parse(db.events[0].content)).toMatchObject({
+      active: false,
+      ended_by: USER,
+    });
+  });
+
+  it('POST end pins ended_at to Date.now under fake timers', async () => {
+    const db = createCallsDb();
+    seedActiveCall(db);
+    const res = await request(createEnv({ db }), END_PATH, jsonInit('POST', {}));
+    expect(res.status).toBe(200);
+    const content = JSON.parse(db.events[0].content) as {
+      active: boolean;
+      ended_at: number;
+      ended_by: string;
+    };
+    expect(content.active).toBe(false);
+    expect(content.ended_at).toBe(NOW);
+    expect(content.ended_by).toBe(USER);
+  });
+
+  it('POST start forbids ban membership (not === join)', async () => {
+    const db = createCallsDb({
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'ban' }],
+    });
+    const res = await request(createEnv({ db }), START_PATH, jsonInit('POST', {}));
+    expect(res.status).toBe(403);
+    expect(db.runs).toHaveLength(0);
+  });
+
+  it('WS lookup binds event_id as call_${callId} even when call inactive', async () => {
+    const db = createCallsDb();
+    seedActiveCall(db, { ...activeCall(), active: false });
+    const callRoom = createCallRoomStub();
+    const res = await request(createEnv({ db, callRoom }), `/calls/${CALL_ID}/ws`);
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('ws-proxy');
+    const lookup = db.selects.find((s) => s.sql.includes('FROM events'));
+    expect(lookup?.args[0]).toBe(`call_${CALL_ID}`);
+  });
+
+  it('GET∥start concurrent with active:null existing — start may win', async () => {
+    const db = createCallsDb({ memberships: [joinMember()] });
+    seedActiveCall(db, { active: null, call_id: 'stale' });
+    const env = createEnv({ db });
+    const [getRes, startRes] = await Promise.all([
+      request(env, GET_PATH, { headers: { Authorization: 'Bearer t' } }),
+      request(env, START_PATH, jsonInit('POST', {})),
+    ]);
+    expect(getRes.status).toBe(200);
+    expect(startRes.status).toBe(200);
+    expect(typeof (getRes.body as { active?: boolean }).active).toBe('boolean');
+  });
+
+  it('end∥end concurrent both may succeed (idempotent active=false write)', async () => {
+    const db = createCallsDb();
+    seedActiveCall(db);
+    const env = createEnv({ db });
+    const [a, b] = await Promise.all([
+      request(env, END_PATH, jsonInit('POST', {})),
+      request(env, END_PATH, jsonInit('POST', {})),
+    ]);
+    // First ends (200); second may 200 (saw active) or 404 (saw inactive) depending on race
+    expect([a.status, b.status].every((s) => s === 200 || s === 404)).toBe(true);
+    expect([a.status, b.status].some((s) => s === 200)).toBe(true);
+    expect(JSON.parse(db.events[0].content).active).toBe(false);
   });
 });
