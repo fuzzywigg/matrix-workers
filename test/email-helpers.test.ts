@@ -1229,3 +1229,474 @@ describe('email helpers TOKENMAXX leftover edges after #92/#103', () => {
     expect(db.store.has('cd'.repeat(16))).toBe(true);
   });
 });
+
+describe('email helpers TOKENMAXX HEAVY leftovers after #226', () => {
+  const NOW = 1_700_000_600_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('maps getRandomValues(0xFFFFFFFF) via % 900000 to a pinned 6-digit token', () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 0xffff_ffff;
+      return arr;
+    });
+    expect(generateVerificationToken()).toBe(String((0xffff_ffff % 900_000) + 100_000));
+    expect(generateVerificationToken()).toBe('267295');
+  });
+
+  it('maps getRandomValues(899998) → "999998" (last interior wrap boundary)', () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 899_998;
+      return arr;
+    });
+    expect(generateVerificationToken()).toBe('999998');
+  });
+
+  it('treats whitespace-only EMAIL_FROM as truthy (does not fall back to noreply@)', async () => {
+    const send = vi.fn(async () => ({ messageId: 'mid-ws' }));
+    const env = {
+      EMAIL_FROM: ' ',
+      EMAIL: { send },
+    } as unknown as Env;
+    await sendVerificationEmail(env, 'u@ex.com', '123456', 'homeserver.test');
+    expect(send.mock.calls[0][0].from).toBe(' ');
+  });
+
+  it('treats EMAIL: null the same as missing (service not configured)', async () => {
+    const env = { EMAIL: null, EMAIL_FROM: 'from@ex.com' } as unknown as Env;
+    expect(await sendVerificationEmail(env, 'u@ex.com', '1', 'ex.com')).toEqual({
+      success: false,
+      error: 'Email service not configured',
+    });
+  });
+
+  it('returns TypeError.message when EMAIL is present but send is not a function', async () => {
+    const env = { EMAIL: {} } as unknown as Env;
+    const result = await sendVerificationEmail(env, 'u@ex.com', '1', 'ex.com');
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/is not a function|send/i);
+  });
+
+  it('interpolates raw token/serverName into HTML (no escaping)', async () => {
+    const send = vi.fn(async () => ({}));
+    const env = { EMAIL: { send } } as unknown as Env;
+    await sendVerificationEmail(env, 'u@ex.com', '<script>1</script>', 'srv<x>');
+    const html = send.mock.calls[0][0].html as string;
+    const text = send.mock.calls[0][0].text as string;
+    expect(html).toContain('<div class="code"><script>1</script></div>');
+    expect(html).toContain('Your verification code for srv<x> is:');
+    expect(text).toContain('Your verification code for srv<x> is: <script>1</script>');
+  });
+
+  it('discards pre-generated sessionId/token on already-validated create path', async () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 1;
+      if (arr instanceof Uint8Array) arr.fill(0x11);
+      return arr;
+    });
+    const db = createEmailDb();
+    db.store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '123456',
+      send_attempt: 1,
+      validated: 1,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 9)).toEqual({
+      error: 'Email already validated for this session',
+    });
+    expect(db.store.has('11'.repeat(16))).toBe(false);
+    expect(db.store.size).toBe(1);
+    expect(db.store.get('old')!.token).toBe('123456');
+  });
+
+  it('discards pre-generated sessionId/token on same-or-lower sendAttempt retry', async () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 2;
+      if (arr instanceof Uint8Array) arr.fill(0x22);
+      return arr;
+    });
+    const db = createEmailDb();
+    db.store.set('keep', {
+      session_id: 'keep',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '555555',
+      send_attempt: 4,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 4)).toEqual({
+      sessionId: 'keep',
+      token: '',
+    });
+    expect(db.store.has('22'.repeat(16))).toBe(false);
+    expect(db.store.get('keep')!.token).toBe('555555');
+  });
+
+  it('returns error when INSERT throws after a successful DELETE on higher sendAttempt', async () => {
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind(..._args: unknown[]) {
+            return {
+              async first<T>() {
+                if (sql.includes('WHERE email = ? AND client_secret = ?')) {
+                  return {
+                    session_id: 'old',
+                    send_attempt: 1,
+                    validated: 0,
+                  } as T;
+                }
+                return null;
+              },
+              async run() {
+                if (sql.includes('DELETE FROM email_verification_sessions')) {
+                  return { meta: { changes: 1 } };
+                }
+                if (sql.includes('INSERT INTO email_verification_sessions')) {
+                  throw new Error('insert boom');
+                }
+                return { meta: { changes: 0 } };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 2)).toEqual({
+      error: 'Failed to create verification session',
+    });
+  });
+
+  it('treats emails that differ only by case as independent sessions', async () => {
+    const db = createEmailDb();
+    const a = await createVerificationSession(db, 'User@ex.com', 'sec', 1);
+    const b = await createVerificationSession(db, 'user@ex.com', 'sec', 1);
+    expect('sessionId' in a && 'sessionId' in b).toBe(true);
+    if ('error' in a || 'error' in b) throw new Error('unexpected');
+    expect(a.sessionId).not.toBe(b.sessionId);
+    expect(db.store.size).toBe(2);
+  });
+
+  it('jumps send_attempt from 1 to 100 (any strictly greater attempt replaces)', async () => {
+    const db = createEmailDb();
+    db.store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '111111',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 100,
+      expires_at: NOW + 1000,
+    });
+    const result = await createVerificationSession(db, 'a@b.c', 'secret', 100);
+    expect('sessionId' in result).toBe(true);
+    if ('error' in result) throw new Error(result.error);
+    expect(db.store.has('old')).toBe(false);
+    expect([...db.store.values()][0].send_attempt).toBe(100);
+  });
+
+  it('getValidatedSession requires validated === 1 (validated: 2 is create-truthy but SQL-miss)', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: '@u:ex.com',
+      client_secret: 'secret',
+      token: '1',
+      send_attempt: 1,
+      validated: 2,
+      created_at: 1,
+      expires_at: 2,
+    });
+    // create path: truthy validated rejects
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 9)).toEqual({
+      error: 'Email already validated for this session',
+    });
+    // validate path: truthy validated short-circuits success
+    expect(await validateEmailToken(db, 'sid', 'wrong', 'wrong')).toEqual({ success: true });
+    // getValidatedSession SQL is validated = 1 → miss
+    expect(await getValidatedSession(db, 'sid', 'secret')).toBeNull();
+  });
+
+  it('validateEmailToken is exact-string on token/secret (whitespace mismatch is invalid)', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '654321',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 60_000,
+    });
+    expect(await validateEmailToken(db, 'sid', 'secret ', '654321')).toEqual({
+      success: false,
+      error: 'Invalid client_secret',
+    });
+    expect(await validateEmailToken(db, 'sid', 'secret', '654321 ')).toEqual({
+      success: false,
+      error: 'Invalid token',
+    });
+    expect(db.store.get('sid')!.validated).toBe(0);
+  });
+
+  it('getValidatedSession is exact-string on client_secret (leading/trailing space fails)', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: '@u:ex.com',
+      client_secret: 'secret',
+      token: '1',
+      send_attempt: 1,
+      validated: 1,
+      created_at: 1,
+      expires_at: 2,
+    });
+    expect(await getValidatedSession(db, 'sid', ' secret')).toBeNull();
+    expect(await getValidatedSession(db, 'sid', 'secret\t')).toBeNull();
+    expect(await getValidatedSession(db, 'sid', 'secret')).toEqual({
+      email: 'a@b.c',
+      userId: '@u:ex.com',
+    });
+  });
+
+  it('concurrent first-create TOCTOU can insert two rows for the same email+secret', async () => {
+    vi.useRealTimers();
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstWaiters = 0;
+    const store = new Map<string, SessionRow>();
+
+    const db = {
+      store,
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async first<T>() {
+                if (sql.includes('WHERE email = ? AND client_secret = ?')) {
+                  firstWaiters += 1;
+                  if (firstWaiters <= 2) await firstGate;
+                  const [email, clientSecret] = args as [string, string];
+                  const rows = [...store.values()]
+                    .filter((r) => r.email === email && r.client_secret === clientSecret)
+                    .sort((a, b) => b.created_at - a.created_at);
+                  return (rows[0] as T) ?? null;
+                }
+                return null;
+              },
+              async run() {
+                if (sql.includes('INSERT INTO email_verification_sessions')) {
+                  const [
+                    sessionId,
+                    email,
+                    userId,
+                    clientSecret,
+                    token,
+                    sendAttempt,
+                    createdAt,
+                    expiresAt,
+                  ] = args as [
+                    string,
+                    string,
+                    string | null,
+                    string,
+                    string,
+                    number,
+                    number,
+                    number,
+                  ];
+                  store.set(sessionId, {
+                    session_id: sessionId,
+                    email,
+                    user_id: userId,
+                    client_secret: clientSecret,
+                    token,
+                    send_attempt: sendAttempt,
+                    validated: 0,
+                    created_at: createdAt,
+                    expires_at: expiresAt,
+                    validated_at: null,
+                  });
+                  return { meta: { changes: 1 } };
+                }
+                return { meta: { changes: 0 } };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database & { store: Map<string, SessionRow> };
+
+    const p1 = createVerificationSession(db, 'race@ex.com', 'sec', 1);
+    const p2 = createVerificationSession(db, 'race@ex.com', 'sec', 1);
+    await vi.waitFor(() => {
+      expect(firstWaiters).toBe(2);
+    });
+    releaseFirst!();
+    const [a, b] = await Promise.all([p1, p2]);
+    expect('sessionId' in a && 'sessionId' in b).toBe(true);
+    if ('error' in a || 'error' in b) throw new Error('unexpected error');
+    expect(a.sessionId).not.toBe(b.sessionId);
+    expect(store.size).toBe(2);
+  });
+
+  it('concurrent validateEmailToken both read unvalidated and both mark success (lost-update OK)', async () => {
+    vi.useRealTimers();
+    const wall = Date.now();
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '654321',
+      send_attempt: 1,
+      validated: 0,
+      created_at: wall - 1000,
+      expires_at: wall + 60_000,
+    });
+
+    const [x, y] = await Promise.all([
+      validateEmailToken(db, 'sid', 'secret', '654321'),
+      validateEmailToken(db, 'sid', 'secret', '654321'),
+    ]);
+    expect(x).toEqual({ success: true });
+    expect(y).toEqual({ success: true });
+    expect(db.store.get('sid')!.validated).toBe(1);
+    expect(db.store.get('sid')!.validated_at).toBeGreaterThanOrEqual(wall);
+  });
+
+  it('concurrent getValidatedSession is isolated across matching and mismatching secrets', async () => {
+    vi.useRealTimers();
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: '@u:ex.com',
+      client_secret: 'secret',
+      token: '1',
+      send_attempt: 1,
+      validated: 1,
+      created_at: 1,
+      expires_at: 2,
+    });
+    const results = await Promise.all([
+      getValidatedSession(db, 'sid', 'secret'),
+      getValidatedSession(db, 'sid', 'wrong'),
+      getValidatedSession(db, 'other', 'secret'),
+      getValidatedSession(db, 'sid', 'secret'),
+    ]);
+    expect(results[0]).toEqual({ email: 'a@b.c', userId: '@u:ex.com' });
+    expect(results[1]).toBeNull();
+    expect(results[2]).toBeNull();
+    expect(results[3]).toEqual({ email: 'a@b.c', userId: '@u:ex.com' });
+  });
+
+  it('sendVerificationEmail concurrent success∥Error∥non-Error stay isolated', async () => {
+    vi.useRealTimers();
+    const ok = vi.fn(async () => ({ messageId: 'ok' }));
+    const results = await Promise.all([
+      sendVerificationEmail({ EMAIL: { send: ok } } as unknown as Env, 'a@ex.com', '111111', 'ex.com'),
+      sendVerificationEmail(
+        {
+          EMAIL: {
+            send: async () => {
+              throw new Error('boom');
+            },
+          },
+        } as unknown as Env,
+        'b@ex.com',
+        '222222',
+        'ex.com'
+      ),
+      sendVerificationEmail(
+        {
+          EMAIL: {
+            send: async () => {
+              throw 42;
+            },
+          },
+        } as unknown as Env,
+        'c@ex.com',
+        '333333',
+        'ex.com'
+      ),
+      sendVerificationEmail({} as Env, 'd@ex.com', '444444', 'ex.com'),
+    ]);
+    expect(results[0]).toEqual({ success: true });
+    expect(results[1]).toEqual({ success: false, error: 'boom' });
+    expect(results[2]).toEqual({ success: false, error: 'Failed to send email' });
+    expect(results[3]).toEqual({ success: false, error: 'Email service not configured' });
+    expect(ok).toHaveBeenCalledOnce();
+  });
+
+  it('create then validate then getValidatedSession happy path', async () => {
+    const db = createEmailDb();
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 321;
+      if (arr instanceof Uint8Array) arr.fill(0x44);
+      return arr;
+    });
+
+    const created = await createVerificationSession(db, 'ok@ex.com', 'sec', 1, '@alice:ex.com');
+    expect(created).toEqual({ sessionId: '44'.repeat(16), token: '100321' });
+    if ('error' in created) throw new Error(created.error);
+
+    expect(await getValidatedSession(db, created.sessionId, 'sec')).toBeNull();
+    expect(await validateEmailToken(db, created.sessionId, 'sec', '100321')).toEqual({ success: true });
+    expect(await getValidatedSession(db, created.sessionId, 'sec')).toEqual({
+      email: 'ok@ex.com',
+      userId: '@alice:ex.com',
+    });
+  });
+
+  it('generateSessionId requests exactly 16 bytes from getRandomValues', async () => {
+    const lengths: number[] = [];
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      lengths.push(arr.byteLength);
+      if (arr instanceof Uint8Array) arr.fill(0x0f);
+      return arr;
+    });
+    expect(await generateSessionId()).toBe('0f'.repeat(16));
+    expect(lengths).toEqual([16]);
+  });
+
+  it('generateVerificationToken requests a single Uint32', () => {
+    const kinds: string[] = [];
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      kinds.push(arr.constructor.name);
+      if (arr instanceof Uint32Array) {
+        expect(arr.length).toBe(1);
+        arr[0] = 0;
+      }
+      return arr;
+    });
+    expect(generateVerificationToken()).toBe('100000');
+    expect(kinds).toEqual(['Uint32Array']);
+  });
+});
