@@ -16,7 +16,7 @@ const app = new Hono<AppEnv>();
 // Types
 // ============================================
 
-interface BackupAlgorithmData {
+export interface BackupAlgorithmData {
   public_key: string;
   signatures?: Record<string, Record<string, string>>;
 }
@@ -35,14 +35,14 @@ export type BackupVersionResponse = {
   version: string;
 };
 
-interface KeyBackupData {
+export interface KeyBackupData {
   first_message_index: number;
   forwarded_count: number;
   is_verified: boolean;
   session_data: Record<string, any>;
 }
 
-interface RoomKeyBackup {
+export interface RoomKeyBackup {
   sessions: Record<string, KeyBackupData>;
 }
 
@@ -50,12 +50,106 @@ interface KeysBackupRequest {
   rooms: Record<string, RoomKeyBackup>;
 }
 
+/** Spec + MSC3270 algorithms accepted by POST /room_keys/version. */
+export const VALID_BACKUP_ALGORITHMS = [
+  'm.megolm_backup.v1.curve25519-aes-sha2',
+  'org.matrix.msc3270.v1.aes-hmac-sha2',
+] as const;
+
+export type ValidBackupAlgorithm = (typeof VALID_BACKUP_ALGORITHMS)[number];
+
+export interface KeyBackupVersionRow {
+  version: number | string;
+  algorithm: string;
+  auth_data: string;
+  count: number;
+  etag: string;
+}
+
+export interface KeyBackupKeyRow {
+  room_id?: string;
+  session_id: string;
+  first_message_index: number;
+  forwarded_count: number;
+  is_verified: number;
+  session_data: string;
+}
+
 // ============================================
-// Helper Functions
+// Helper Functions (exported for unit tests)
 // ============================================
 
-function generateEtag(): string {
+export function isValidBackupAlgorithm(algorithm: string): boolean {
+  return (VALID_BACKUP_ALGORITHMS as readonly string[]).includes(algorithm);
+}
+
+export function generateEtag(): string {
   return crypto.randomUUID().replace(/-/g, '').substring(0, 16);
+}
+
+/** Format a key_backup_versions row into the Matrix CS API response shape. */
+export function formatBackupVersionResponse(backup: KeyBackupVersionRow): BackupVersionResponse {
+  return {
+    algorithm: backup.algorithm,
+    auth_data: JSON.parse(backup.auth_data) as BackupAlgorithmData,
+    count: backup.count,
+    etag: backup.etag,
+    version: String(backup.version),
+  };
+}
+
+/** Map a key_backup_keys row into KeyBackupData (is_verified is stored as 0/1). */
+export function mapKeyRowToSession(
+  key: Pick<
+    KeyBackupKeyRow,
+    'first_message_index' | 'forwarded_count' | 'is_verified' | 'session_data'
+  >
+): KeyBackupData {
+  return {
+    first_message_index: key.first_message_index,
+    forwarded_count: key.forwarded_count,
+    is_verified: key.is_verified === 1,
+    session_data: JSON.parse(key.session_data),
+  };
+}
+
+/** Group key rows by room_id into the GET /room_keys/keys rooms payload. */
+export function groupBackupKeysByRoom(
+  keys: Array<KeyBackupKeyRow & { room_id: string }>
+): Record<string, RoomKeyBackup> {
+  const rooms: Record<string, RoomKeyBackup> = {};
+  for (const key of keys) {
+    if (!rooms[key.room_id]) {
+      rooms[key.room_id] = { sessions: {} };
+    }
+    rooms[key.room_id].sessions[key.session_id] = mapKeyRowToSession(key);
+  }
+  return rooms;
+}
+
+/** Convert boolean is_verified from the client into the D1 INTEGER flag. */
+export function verifiedFlag(isVerified: boolean | undefined | null): number {
+  return isVerified ? 1 : 0;
+}
+
+/** Build bind args for upserting a session key row. */
+export function sessionUpsertValues(
+  userId: string,
+  version: string,
+  roomId: string,
+  sessionId: string,
+  session: KeyBackupData
+): [string, string, string, string, number, number, number, string] {
+  return [
+    userId,
+    version,
+    roomId,
+    sessionId,
+    session.first_message_index,
+    session.forwarded_count,
+    verifiedFlag(session.is_verified),
+    JSON.stringify(session.session_data),
+  ];
 }
 
 // ============================================
@@ -79,14 +173,10 @@ app.post('/_matrix/client/v3/room_keys/version', requireAuth(), async (c) => {
   }
 
   // Validate algorithm
-  const validAlgorithms = [
-    'm.megolm_backup.v1.curve25519-aes-sha2',
-    'org.matrix.msc3270.v1.aes-hmac-sha2',
-  ];
-  if (!validAlgorithms.includes(body.algorithm)) {
+  if (!isValidBackupAlgorithm(body.algorithm)) {
     return c.json({
       errcode: 'M_INVALID_PARAM',
-      error: `Invalid algorithm. Must be one of: ${validAlgorithms.join(', ')}`,
+      error: `Invalid algorithm. Must be one of: ${VALID_BACKUP_ALGORITHMS.join(', ')}`,
     }, 400);
   }
 
@@ -133,13 +223,7 @@ app.get('/_matrix/client/v3/room_keys/version', requireAuth(), async (c) => {
     }, 404);
   }
 
-  return c.json({
-    algorithm: backup.algorithm,
-    auth_data: JSON.parse(backup.auth_data),
-    count: backup.count,
-    etag: backup.etag,
-    version: String(backup.version),
-  });
+  return c.json(formatBackupVersionResponse(backup));
 });
 
 // GET /room_keys/version/:version - Get specific backup version
@@ -167,13 +251,7 @@ app.get('/_matrix/client/v3/room_keys/version/:version', requireAuth(), async (c
     }, 404);
   }
 
-  return c.json({
-    algorithm: backup.algorithm,
-    auth_data: JSON.parse(backup.auth_data),
-    count: backup.count,
-    etag: backup.etag,
-    version: String(backup.version),
-  });
+  return c.json(formatBackupVersionResponse(backup));
 });
 
 // PUT /room_keys/version/:version - Update backup version auth_data
@@ -293,16 +371,7 @@ app.put('/_matrix/client/v3/room_keys/keys', requireAuth(), async (c) => {
           forwarded_count = excluded.forwarded_count,
           is_verified = excluded.is_verified,
           session_data = excluded.session_data
-      `).bind(
-        userId,
-        version,
-        roomId,
-        sessionId,
-        sessionData.first_message_index,
-        sessionData.forwarded_count,
-        sessionData.is_verified ? 1 : 0,
-        JSON.stringify(sessionData.session_data)
-      ).run();
+      `).bind(...sessionUpsertValues(userId, version, roomId, sessionId, sessionData)).run();
       count++;
     }
   }
@@ -369,16 +438,7 @@ app.put('/_matrix/client/v3/room_keys/keys/:roomId', requireAuth(), async (c) =>
         forwarded_count = excluded.forwarded_count,
         is_verified = excluded.is_verified,
         session_data = excluded.session_data
-    `).bind(
-      userId,
-      version,
-      roomId,
-      sessionId,
-      sessionData.first_message_index,
-      sessionData.forwarded_count,
-      sessionData.is_verified ? 1 : 0,
-      JSON.stringify(sessionData.session_data)
-    ).run();
+    `).bind(...sessionUpsertValues(userId, version, roomId, sessionId, sessionData)).run();
   }
 
   // Update count and etag
@@ -443,16 +503,7 @@ app.put('/_matrix/client/v3/room_keys/keys/:roomId/:sessionId', requireAuth(), a
       forwarded_count = excluded.forwarded_count,
       is_verified = excluded.is_verified,
       session_data = excluded.session_data
-  `).bind(
-    userId,
-    version,
-    roomId,
-    sessionId,
-    body.first_message_index,
-    body.forwarded_count,
-    body.is_verified ? 1 : 0,
-    JSON.stringify(body.session_data)
-  ).run();
+  `).bind(...sessionUpsertValues(userId, version, roomId, sessionId, body)).run();
 
   // Update count and etag
   const newEtag = generateEtag();
@@ -510,21 +561,7 @@ app.get('/_matrix/client/v3/room_keys/keys', requireAuth(), async (c) => {
     session_data: string;
   }>();
 
-  // Group by room
-  const rooms: Record<string, RoomKeyBackup> = {};
-  for (const key of keys.results) {
-    if (!rooms[key.room_id]) {
-      rooms[key.room_id] = { sessions: {} };
-    }
-    rooms[key.room_id].sessions[key.session_id] = {
-      first_message_index: key.first_message_index,
-      forwarded_count: key.forwarded_count,
-      is_verified: key.is_verified === 1,
-      session_data: JSON.parse(key.session_data),
-    };
-  }
-
-  return c.json({ rooms });
+  return c.json({ rooms: groupBackupKeysByRoom(keys.results) });
 });
 
 // GET /room_keys/keys/:roomId - Download keys for a room
@@ -566,12 +603,7 @@ app.get('/_matrix/client/v3/room_keys/keys/:roomId', requireAuth(), async (c) =>
 
   const sessions: Record<string, KeyBackupData> = {};
   for (const key of keys.results) {
-    sessions[key.session_id] = {
-      first_message_index: key.first_message_index,
-      forwarded_count: key.forwarded_count,
-      is_verified: key.is_verified === 1,
-      session_data: JSON.parse(key.session_data),
-    };
+    sessions[key.session_id] = mapKeyRowToSession(key);
   }
 
   return c.json({ sessions });
@@ -621,12 +653,7 @@ app.get('/_matrix/client/v3/room_keys/keys/:roomId/:sessionId', requireAuth(), a
     }, 404);
   }
 
-  return c.json({
-    first_message_index: key.first_message_index,
-    forwarded_count: key.forwarded_count,
-    is_verified: key.is_verified === 1,
-    session_data: JSON.parse(key.session_data),
-  });
+  return c.json(mapKeyRowToSession(key));
 });
 
 // DELETE /room_keys/keys - Delete all keys
