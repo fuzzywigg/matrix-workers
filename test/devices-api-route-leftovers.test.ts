@@ -1,5 +1,5 @@
 /**
- * TOKENMAXX HEAVY leftovers after #149 / deepen after #232 — devices API
+ * TOKENMAXX HEAVY leftovers after #149 / deepen after #232 / after #241 — devices API
  * soft/edge/reliability. Complements devices-api-routes.test.ts and residual
  * concurrent-race leftovers. Tests-only — no product inventing.
  * Fixtures use example.com only.
@@ -8,6 +8,10 @@
  * null display_name, CURRENT self-delete, cascade order, session ignored,
  * delete_devices null/duplicate ids, PUT preserves last_seen, case-sensitive
  * device ids, empty-string password, SSO/token/dummy auth matrix.
+ *
+ * Deepen after #241: delete_devices empty array; password-field missing on
+ * m.login.password; devices not-array shapes; GET omits null last_seen fields;
+ * delete_devices password missing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -3214,6 +3218,137 @@ describe('devices leftovers cross-user isolation soft flood after #232', () => {
       expect(del.status).toBe(404);
       expect(db.devices).toHaveLength(1);
       expect(db.devices[0].display_name).toBe('bob');
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// deepen devices-api route leftovers after #241
+// ---------------------------------------------------------------------------
+
+describe('devices leftovers delete_devices empty array soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`delete_devices [] succeeds no-op soft-${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [
+          seedDevice({ device_id: 'KEEP_A' }),
+          seedDevice({ device_id: 'KEEP_B' }),
+        ],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/delete_devices',
+        jsonInit('POST', {
+          devices: [],
+          auth: { type: 'm.login.password', password: 's3cret' },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(db.devices).toHaveLength(2);
+      expect(db.deletes).toHaveLength(0);
+    });
+  }
+});
+
+describe('devices leftovers password-field missing soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`DELETE password type without password soft-${i}`, async () => {
+      const id = `MP${i}`;
+      vi.mocked(verifyPassword).mockClear();
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/devices/${id}`,
+        jsonInit('DELETE', { auth: { type: 'm.login.password' } })
+      );
+      expect(res.status).toBe(403);
+      expect((res.body as { errcode: string }).errcode).toBe('M_FORBIDDEN');
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(db.devices).toHaveLength(1);
+      expect(db.deletes).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`delete_devices password type without password soft-${i}`, async () => {
+      const id = `BP${i}`;
+      vi.mocked(verifyPassword).mockClear();
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/delete_devices',
+        jsonInit('POST', {
+          devices: [id],
+          auth: { type: 'm.login.password' },
+        })
+      );
+      expect(res.status).toBe(403);
+      expect((res.body as { errcode: string }).errcode).toBe('M_FORBIDDEN');
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(db.devices).toHaveLength(1);
+    });
+  }
+});
+
+describe('devices leftovers delete_devices not-array soft flood after #241', () => {
+  const bad = ['PHONE', 1, { id: 'x' }, true];
+  for (let i = 0; i < 12; i++) {
+    it(`devices not-array soft-${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice()] });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/delete_devices',
+        jsonInit('POST', {
+          devices: bad[i % bad.length],
+          auth: { type: 'm.login.dummy' },
+        })
+      );
+      expect(res.status).toBe(400);
+      expect((res.body as { errcode: string }).errcode).toBe('M_MISSING_PARAM');
+      expect(db.devices).toHaveLength(1);
+      expect(db.deletes).toHaveLength(0);
+    });
+  }
+});
+
+describe('devices leftovers GET omits null last_seen soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`GET :deviceId omits null last_seen soft-${i}`, async () => {
+      const id = `LS${i}`;
+      const db = createDevicesDb({
+        devices: [
+          seedDevice({
+            device_id: id,
+            display_name: null,
+            last_seen_ts: null,
+            last_seen_ip: null,
+          }),
+        ],
+      });
+      const res = await request(db, `/_matrix/client/v3/devices/${id}`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ device_id: id });
+      expect(res.body).not.toHaveProperty('display_name');
+      expect(res.body).not.toHaveProperty('last_seen_ts');
+      expect(res.body).not.toHaveProperty('last_seen_ip');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`GET list omits null optional fields soft-${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [
+          seedDevice({
+            device_id: `L${i}`,
+            display_name: null,
+            last_seen_ts: null,
+            last_seen_ip: null,
+          }),
+        ],
+      });
+      const res = await request(db, '/_matrix/client/v3/devices');
+      expect(res.status).toBe(200);
+      expect((res.body as { devices: unknown[] }).devices).toEqual([{ device_id: `L${i}` }]);
     });
   }
 });

@@ -1,7 +1,13 @@
 /**
- * TOKENMAXX HEAVY leftovers after #149 — key-backups API soft/edge/reliability.
- * Complements key-backups-api-routes.test.ts. Tests-only — no product inventing.
- * Fixtures use example.com only.
+ * TOKENMAXX HEAVY leftovers after #149 / deepen after #241 — key-backups API
+ * soft/edge/reliability. Complements key-backups-api-routes.test.ts. Tests-only —
+ * no product inventing. Fixtures use example.com only.
+ *
+ * Deepen after #241 (unsaturated vs soft floods after #149 / routes after #90):
+ *   PUT version omit / algorithm-only / auth_data:{}; soft-deleted version key ops;
+ *   nullCount COUNT||0; is_verified false/undefined; empty rooms/sessions PUT;
+ *   room-scoped PUT soft flood; missing version query; double soft-delete;
+ *   cross-user keys isolation; POST empty algorithm string.
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -3252,4 +3258,376 @@ describe('key-backups leftovers lifecycle soft floods after #149', () => {
     );
     expect(del.status).toBe(200);
   });
+});
+
+// ---------------------------------------------------------------------------
+// deepen key-backups-api route leftovers after #241
+// ---------------------------------------------------------------------------
+
+describe('key-backups leftovers PUT version omit/empty auth_data after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`PUT omit auth_data no UPDATE soft-${i}`, async () => {
+      const before = JSON.stringify({ ...AUTH_DATA, n: i });
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, auth_data: before })],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/room_keys/version/1',
+        jsonInit('PUT', { algorithm: ALG_MEGOLM })
+      );
+      expect(res.status).toBe(200);
+      expect(db.versions[0].auth_data).toBe(before);
+      expect(db.updates.filter((u) => u.sql.includes('SET auth_data'))).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`PUT auth_data:{} still updates soft-${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, auth_data: JSON.stringify(AUTH_DATA) })],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/room_keys/version/1',
+        jsonInit('PUT', { auth_data: {} })
+      );
+      expect(res.status).toBe(200);
+      expect(db.versions[0].auth_data).toBe('{}');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`PUT {} body no auth_data UPDATE soft-${i}`, async () => {
+      const before = JSON.stringify({ ...AUTH_DATA, keep: i });
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, auth_data: before })],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/room_keys/version/1',
+        jsonInit('PUT', {})
+      );
+      expect(res.status).toBe(200);
+      expect(db.versions[0].auth_data).toBe(before);
+    });
+  }
+});
+
+describe('key-backups leftovers soft-deleted version key ops after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`PUT/GET/DELETE keys soft-deleted version soft-${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, deleted: 1 })],
+        keys: [],
+      });
+      const put = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/s${i}?version=1`,
+        jsonInit('PUT', {
+          first_message_index: 0,
+          forwarded_count: 0,
+          is_verified: true,
+          session_data: { ciphertext: `x${i}` },
+        })
+      );
+      expect(put.status).toBe(404);
+      const got = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/s${i}?version=1`
+      );
+      expect(got.status).toBe(404);
+      const del = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys?version=1`,
+        jsonInit('DELETE')
+      );
+      // DELETE all keys does not check deleted flag — still 200 with count 0
+      expect(del.status).toBe(200);
+      expect((del.body as { count: number }).count).toBe(0);
+      expect(db.keys).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`double DELETE version → 404 soft-${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1 })],
+        keys: [seedKey({ session_id: `d${i}` })],
+      });
+      const first = await request(
+        db,
+        '/_matrix/client/v3/room_keys/version/1',
+        jsonInit('DELETE')
+      );
+      expect(first.status).toBe(200);
+      expect(db.versions[0].deleted).toBe(1);
+      expect(db.keys).toHaveLength(0);
+      const second = await request(
+        db,
+        '/_matrix/client/v3/room_keys/version/1',
+        jsonInit('DELETE')
+      );
+      expect(second.status).toBe(404);
+      expect((second.body as { errcode: string }).errcode).toBe('M_NOT_FOUND');
+    });
+  }
+});
+
+describe('key-backups leftovers nullCount COUNT||0 soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`PUT session with nullCount → count 0 soft-${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, etag: `pre-${i}` })],
+        nullCount: true,
+      });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/nc${i}?version=1`,
+        jsonInit('PUT', {
+          first_message_index: i,
+          forwarded_count: 0,
+          is_verified: true,
+          session_data: { ciphertext: `nc${i}` },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect((res.body as { count: number }).count).toBe(0);
+      expect(typeof (res.body as { etag: string }).etag).toBe('string');
+      expect((res.body as { etag: string }).etag).toHaveLength(16);
+      expect(db.versions[0].count).toBe(0);
+      expect(db.keys).toHaveLength(1);
+    });
+  }
+});
+
+describe('key-backups leftovers is_verified falsy storage soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`is_verified false stores 0 soft-${i}`, async () => {
+      const db = createKeyBackupDb({ versions: [seedVersion()] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/f${i}?version=1`,
+        jsonInit('PUT', {
+          first_message_index: 0,
+          forwarded_count: i,
+          is_verified: false,
+          session_data: { ciphertext: `f${i}` },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(db.keys[0].is_verified).toBe(0);
+      const got = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/f${i}?version=1`
+      );
+      expect(got.status).toBe(200);
+      expect((got.body as { is_verified: boolean }).is_verified).toBe(false);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`is_verified omitted → 0 soft-${i}`, async () => {
+      const db = createKeyBackupDb({ versions: [seedVersion()] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/u${i}?version=1`,
+        jsonInit('PUT', {
+          first_message_index: 0,
+          forwarded_count: 0,
+          session_data: { ciphertext: `u${i}` },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(db.keys[0].is_verified).toBe(0);
+    });
+  }
+});
+
+describe('key-backups leftovers empty rooms/sessions PUT soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`PUT bulk rooms:{} bumps etag soft-${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ etag: `e-empty-${i}` })],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/room_keys/keys?version=1',
+        jsonInit('PUT', { rooms: {} })
+      );
+      expect(res.status).toBe(200);
+      expect((res.body as { count: number }).count).toBe(0);
+      expect(db.keys).toHaveLength(0);
+      expect(db.versions[0].etag).not.toBe(`e-empty-${i}`);
+      expect(db.versions[0].etag).toHaveLength(16);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`PUT bulk body {} treats rooms||{} soft-${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ etag: `e-omit-${i}` })],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/room_keys/keys?version=1',
+        jsonInit('PUT', {})
+      );
+      expect(res.status).toBe(200);
+      expect((res.body as { count: number }).count).toBe(0);
+      expect(db.keys).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`PUT room sessions:{} inserts nothing soft-${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ etag: `e-room-${i}` })],
+      });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}?version=1`,
+        jsonInit('PUT', { sessions: {} })
+      );
+      expect(res.status).toBe(200);
+      expect((res.body as { count: number }).count).toBe(0);
+      expect(db.keys).toHaveLength(0);
+      expect(db.versions[0].etag).not.toBe(`e-room-${i}`);
+    });
+  }
+});
+
+describe('key-backups leftovers PUT room-scoped soft flood after #241', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`PUT room keys soft-${i}`, async () => {
+      const db = createKeyBackupDb({ versions: [seedVersion({ version: 1 })] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}?version=1`,
+        jsonInit('PUT', {
+          sessions: {
+            [`room-s-${i}`]: {
+              first_message_index: i,
+              forwarded_count: 0,
+              is_verified: true,
+              session_data: { ciphertext: `room-${i}` },
+            },
+          },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect((res.body as { count: number }).count).toBe(1);
+      expect(db.keys).toHaveLength(1);
+      expect(db.keys[0].session_id).toBe(`room-s-${i}`);
+      expect(db.keys[0].room_id).toBe(ROOM);
+      const got = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}?version=1`
+      );
+      expect(got.status).toBe(200);
+      expect(
+        (got.body as { sessions: Record<string, { first_message_index: number }> }).sessions[
+          `room-s-${i}`
+        ].first_message_index
+      ).toBe(i);
+    });
+  }
+});
+
+describe('key-backups leftovers missing version query soft flood after #241', () => {
+  const paths = [
+    { method: 'PUT', path: '/_matrix/client/v3/room_keys/keys', body: { rooms: {} } },
+    { method: 'GET', path: '/_matrix/client/v3/room_keys/keys' },
+    { method: 'DELETE', path: '/_matrix/client/v3/room_keys/keys' },
+    {
+      method: 'PUT',
+      path: `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}`,
+      body: { sessions: {} },
+    },
+    { method: 'GET', path: `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}` },
+    { method: 'DELETE', path: `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}` },
+    {
+      method: 'PUT',
+      path: `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/s`,
+      body: {
+        first_message_index: 0,
+        forwarded_count: 0,
+        is_verified: false,
+        session_data: {},
+      },
+    },
+    { method: 'GET', path: `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/s` },
+    { method: 'DELETE', path: `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/s` },
+  ];
+  for (let i = 0; i < paths.length; i++) {
+    it(`missing version → M_MISSING_PARAM soft-${i}`, async () => {
+      const c = paths[i];
+      const db = createKeyBackupDb({ versions: [seedVersion()] });
+      const res = await request(
+        db,
+        c.path,
+        c.body !== undefined ? jsonInit(c.method, c.body) : { method: c.method, headers: { Authorization: 'Bearer t' } }
+      );
+      expect(res.status).toBe(400);
+      expect((res.body as { errcode: string }).errcode).toBe('M_MISSING_PARAM');
+    });
+  }
+});
+
+describe('key-backups leftovers POST empty algorithm soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`POST empty-string algorithm soft-${i}`, async () => {
+      const db = createKeyBackupDb();
+      const res = await request(
+        db,
+        '/_matrix/client/v3/room_keys/version',
+        jsonInit('POST', { algorithm: '', auth_data: AUTH_DATA })
+      );
+      expect(res.status).toBe(400);
+      expect((res.body as { errcode: string }).errcode).toBe('M_MISSING_PARAM');
+      expect(db.versions).toHaveLength(0);
+    });
+  }
+});
+
+describe('key-backups leftovers cross-user keys isolation soft flood after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`GET/PUT/DELETE other-user keys soft-${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [
+          seedVersion({ version: 1, user_id: OTHER }),
+          seedVersion({ version: 2 }),
+        ],
+        keys: [
+          seedKey({
+            user_id: OTHER,
+            version: '1',
+            session_id: `bob-${i}`,
+            session_data: JSON.stringify({ ciphertext: 'bob' }),
+          }),
+        ],
+      });
+      const got = await request(db, '/_matrix/client/v3/room_keys/keys?version=1');
+      expect(got.status).toBe(404);
+      const put = await request(
+        db,
+        `/_matrix/client/v3/room_keys/keys/${ROOM_ENC}/hack${i}?version=1`,
+        jsonInit('PUT', {
+          first_message_index: 0,
+          forwarded_count: 0,
+          is_verified: true,
+          session_data: { ciphertext: 'hack' },
+        })
+      );
+      expect(put.status).toBe(404);
+      const del = await request(
+        db,
+        '/_matrix/client/v3/room_keys/version/1',
+        jsonInit('DELETE')
+      );
+      expect(del.status).toBe(404);
+      expect(db.keys).toHaveLength(1);
+      expect(db.versions.find((v) => v.version === 1)?.deleted).toBe(0);
+    });
+  }
 });
