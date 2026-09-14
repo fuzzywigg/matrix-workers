@@ -25,7 +25,7 @@
  * Does not touch auth.ts source (HITL). Reversible by delete.
  * No invent-product / secrets / DNS / history rewrite.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
 import type { AppServiceRegistration } from '../src/services/appservice';
 import {
@@ -34,10 +34,7 @@ import {
   getInterestedAppServices,
   sendAppServiceTransaction,
 } from '../src/services/appservice';
-import {
-  extractAccessToken,
-  requireAuth,
-} from '../src/middleware/auth';
+import { extractAccessToken } from '../src/middleware/auth';
 
 // Real requireAuth/optionalAuth loaded via importActual in auth suites below
 // (filter routes use the mocked requireAuth from vi.mock).
@@ -787,11 +784,18 @@ describe('race septenary appservice rooms:null throw after #292', () => {
 
 // ===========================================================================
 // AUTH — soft forbid error-string quad never mixed with AS success
+// (real requireAuth via importActual — filter mock still wraps the default export)
 // ===========================================================================
 
 describe('race septenary auth soft forbid error-string quad after #292', () => {
-  // requireAuth is the real export (filter mock still wraps via importActual)
-  const realRequireAuth = requireAuth;
+  let realRequireAuth: typeof import('../src/middleware/auth').requireAuth;
+
+  beforeAll(async () => {
+    const actual = await vi.importActual<typeof import('../src/middleware/auth')>(
+      '../src/middleware/auth'
+    );
+    realRequireAuth = actual.requireAuth;
+  });
 
   for (let i = 0; i < 12; i++) {
     it(`Invalid format∥impersonate∥ns deny∥AS success never mix flood-${i}`, async () => {
@@ -942,7 +946,14 @@ describe('race septenary auth soft forbid error-string quad after #292', () => {
 // ===========================================================================
 
 describe('race septenary auth protocols object under requireAuth after #292', () => {
-  const realRequireAuth = requireAuth;
+  let realRequireAuth: typeof import('../src/middleware/auth').requireAuth;
+
+  beforeAll(async () => {
+    const actual = await vi.importActual<typeof import('../src/middleware/auth')>(
+      '../src/middleware/auth'
+    );
+    realRequireAuth = actual.requireAuth;
+  });
 
   for (let i = 0; i < 8; i++) {
     it(`protocols '{}' allow ∥ ' ' unknown ∥ null allow flood-${i}`, async () => {
