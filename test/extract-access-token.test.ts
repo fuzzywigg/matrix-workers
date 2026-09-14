@@ -452,9 +452,10 @@ describe('extractAccessToken TOKENMAXX HEAVY leftovers after #232', () => {
     expect(extractAccessToken(req)).toBeNull();
   });
 
-  it('does not read credentials / userinfo from the request URL as a token', () => {
-    const req = new Request('https://user:pass@matrix.example.com/?foo=1');
-    expect(extractAccessToken(req)).toBeNull();
+  it('rejects Request construction from a URL that includes userinfo credentials', () => {
+    expect(() => new Request('https://user:pass@matrix.example.com/?foo=1')).toThrow(
+      /includes credentials/i
+    );
   });
 
   it('Request method and body do not affect token extraction', () => {
