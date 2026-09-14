@@ -7,11 +7,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
 
+/** Switchable auth principal for whois / requireAdmin !userId edges. */
+const authState = vi.hoisted(() => ({
+  userId: '@admin:example.com' as string | undefined,
+  deviceId: 'ADMINDEVICE',
+}));
+
 vi.mock('../src/middleware/auth', () => ({
   requireAuth: () => {
     return async (c: { set: (k: string, v: unknown) => void }, next: () => Promise<void>) => {
-      c.set('userId', '@admin:example.com');
-      c.set('deviceId', 'ADMINDEVICE');
+      c.set('userId', authState.userId);
+      c.set('deviceId', authState.deviceId);
       await next();
     };
   },
@@ -2709,5 +2715,272 @@ describe('admin API bad JSON / missing params leftovers', () => {
 
     const empty = await req('/admin/api/federation/status', {}, createEnv({ cache: mockKv() }));
     expect((await empty.json()).signing_key_id).toMatch(/^ed25519:a_/);
+  });
+});
+
+
+describe('admin TOKENMAXX auth/whois/keys/login-token leftovers after #102', () => {
+  afterEach(() => {
+    authState.userId = ADMIN;
+    authState.deviceId = 'ADMINDEVICE';
+  });
+
+  it('requireAdmin returns M_UNAUTHORIZED when userId is missing', async () => {
+    authState.userId = undefined;
+    const res = await req('/admin/api/config');
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.errcode).toBe('M_UNAUTHORIZED');
+    expect(body.error).toMatch(/Admin access required/);
+  });
+
+  it('whois: non-admin querying another user is forbidden', async () => {
+    authState.userId = BOB;
+    const res = await req(`/_matrix/client/v3/admin/whois/${encodeURIComponent(ADMIN)}`);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.errcode).toBe('M_FORBIDDEN');
+    expect(body.error).toMatch(/Admin privileges required to query other users/);
+  });
+
+  it('whois: non-admin may query self', async () => {
+    authState.userId = BOB;
+    const res = await req(`/_matrix/client/v3/admin/whois/${encodeURIComponent(BOB)}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.user_id).toBe(BOB);
+    expect(body.devices.BOBDEVICE.sessions[0].connections[0].ip).toBe('5.6.7.8');
+  });
+
+  it('login-token deactivated returns exact M_USER_DEACTIVATED', async () => {
+    const db = createAdminDb();
+    db.users.find((u) => u.user_id === BOB)!.is_deactivated = 1;
+    const res = await req(
+      `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+      { method: 'POST' },
+      createEnv({ db })
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      errcode: 'M_USER_DEACTIVATED',
+      error: 'User is deactivated',
+    });
+  });
+
+  it('login-token defaults ttl to 10 minutes on missing/invalid JSON body', async () => {
+    const sessions = mockKv();
+    const env = createEnv({ sessions });
+    const res = await req(
+      `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{' },
+      env
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ttl_seconds).toBe(600);
+    expect(sessions.puts[0].options?.expirationTtl).toBe(600);
+  });
+
+  it('login-token clamps ttl_minutes 0 and 0.5 up to 1 minute', async () => {
+    for (const ttl of [0, 0.5]) {
+      const sessions = mockKv();
+      const env = createEnv({ sessions });
+      const res = await req(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ttl_minutes: ttl }),
+        },
+        env
+      );
+      expect(res.status).toBe(200);
+      // 0 is falsy → default 10; 0.5 is truthy number → clamp max(0.5,1)=1
+      if (ttl === 0) {
+        expect((await res.json()).ttl_seconds).toBe(600);
+      } else {
+        expect((await res.json()).ttl_seconds).toBe(60);
+        expect(sessions.puts[0].options?.expirationTtl).toBe(60);
+      }
+    }
+  });
+
+  it('keys debug: No signature in DB when self-signing exists but sig missing', async () => {
+    const db = createAdminDb({ crossSigningSigs: [] });
+    const res = await req(
+      `/admin/api/users/${encodeURIComponent(BOB)}/keys`,
+      {},
+      createEnv({ db })
+    );
+    const body = await res.json();
+    expect(body.verification_status.BOBDEVICE).toEqual({
+      verified: false,
+      reason: 'No signature in DB',
+    });
+  });
+
+  it('keys debug: Signature not in device key object when DB sig present', async () => {
+    const deviceKeys = mockKv({
+      [`device:${BOB}:BOBDEVICE`]: JSON.stringify({
+        algorithms: ['m.olm.v1.curve25519-aes-sha2'],
+        device_id: 'BOBDEVICE',
+        user_id: BOB,
+        keys: { 'ed25519:BOBDEVICE': 'DEVKEY' },
+        // signatures omit self-signing key id
+        signatures: { [BOB]: { 'ed25519:other': 'sig' } },
+      }),
+    });
+    const res = await req(
+      `/admin/api/users/${encodeURIComponent(BOB)}/keys`,
+      {},
+      createEnv({ deviceKeys })
+    );
+    const body = await res.json();
+    expect(body.verification_status.BOBDEVICE).toEqual({
+      verified: false,
+      reason: 'Signature not in device key object',
+    });
+  });
+
+  it('DELETE idp provider 404s when missing', async () => {
+    const db = createAdminDb({ idpProviders: [] });
+    const res = await req(
+      '/admin/api/idp/providers/missing',
+      { method: 'DELETE' },
+      createEnv({ db })
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).errcode).toBe('M_NOT_FOUND');
+  });
+
+  it('idp test connection returns success:false when discovery throws', async () => {
+    const db = createAdminDb({
+      idpProviders: [
+        {
+          id: 'bad',
+          name: 'Bad',
+          issuer_url: 'https://bad-issuer.example',
+          client_id: 'c',
+          client_secret_encrypted: 'enc:s',
+          scopes: 'openid',
+          enabled: 1,
+          auto_create_users: 0,
+          username_claim: 'email',
+          display_order: 0,
+          icon_url: null,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+    const res = await req(
+      '/admin/api/idp/providers/bad/test',
+      { method: 'POST' },
+      createEnv({ db })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+    expect(String(body.error)).toMatch(/discovery failed/);
+  });
+
+  it('unresolve 404s unknown report id', async () => {
+    const res = await req('/admin/api/reports/999/unresolve', { method: 'POST' });
+    expect(res.status).toBe(404);
+  });
+
+  it('reports resolved=true filter returns only resolved rows', async () => {
+    const db = createAdminDb();
+    db.reports[0].resolved = 1;
+    db.reports[0].resolved_by = ADMIN;
+    db.reports[0].resolved_at = 99;
+    const res = await req('/admin/api/reports?resolved=true', {}, createEnv({ db }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.reports.length).toBeGreaterThan(0);
+    for (const r of body.reports) {
+      expect(r.resolved).toBeTruthy();
+    }
+  });
+
+  it('server-notice with zero devices notifies 0', async () => {
+    const db = createAdminDb({
+      devices: [
+        {
+          user_id: ADMIN,
+          device_id: 'ADMINDEVICE',
+          display_name: 'Admin Device',
+          last_seen_ts: 5_000,
+          last_seen_ip: '1.2.3.4',
+        },
+      ],
+    });
+    const res = await req(
+      '/admin/api/server-notice',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: BOB, message: 'Hello bob' }),
+      },
+      createEnv({ db })
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).devices_notified).toBe(0);
+    expect(db.inserts.some((i) => i.sql.includes('to_device_messages'))).toBe(false);
+  });
+
+  it('remove-admin missing user_id is M_MISSING_PARAM', async () => {
+    const res = await req(
+      '/admin/api/remove-admin',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).errcode).toBe('M_MISSING_PARAM');
+  });
+
+  it('synapse deactivate 404s missing user', async () => {
+    const res = await req(
+      `/_synapse/admin/v1/deactivate/${encodeURIComponent('@nope:example.com')}`,
+      { method: 'POST' }
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).errcode).toBe('M_NOT_FOUND');
+  });
+
+  it('synapse reset_password defaults logout_devices true', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const before = db.tokens.filter((t) => t.user_id === BOB).length;
+    expect(before).toBeGreaterThan(0);
+    const res = await req(
+      `/_synapse/admin/v1/reset_password/${encodeURIComponent(BOB)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_password: 'Zzz9!' }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    expect(db.tokens.filter((t) => t.user_id === BOB)).toHaveLength(0);
+  });
+
+  it('federation status uses serverName first label when CACHE key has no keyId', async () => {
+    const cache = mockKv({
+      server_signing_key: JSON.stringify({ public_key: 'abc' }),
+    });
+    const res = await req('/admin/api/federation/status', {}, createEnv({ cache }));
+    const body = await res.json();
+    expect(body.signing_key_id).toBe('ed25519:example');
+  });
+
+  it('analytics unknown period falls back to default window but echoes period', async () => {
+    const reqAnalytics = await req('/_matrix/client/v3/admin/analytics/requests?period=weird');
+    expect(reqAnalytics.status).toBe(200);
+    expect((await reqAnalytics.json()).period).toBe('weird');
+
+    const fedAnalytics = await req('/_matrix/client/v3/admin/analytics/federation?period=weird');
+    expect(fedAnalytics.status).toBe(200);
+    expect((await fedAnalytics.json()).period).toBe('weird');
   });
 });
