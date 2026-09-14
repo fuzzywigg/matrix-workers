@@ -53,6 +53,19 @@ jobs:
       - run: npm ci
       - run: npm run test:media-presence-soft-concurrent
 
+  # Focused gate for crypto + database residual coverage (fast signal vs full suite).
+  crypto-db:
+    name: Crypto + DB residual tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:crypto-db
+
   test:
     name: Tests
     runs-on: ubuntu-latest

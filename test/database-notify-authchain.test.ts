@@ -1793,3 +1793,164 @@ describe('notify / auth-chain TOKENMAXX residual tertiary leftovers after #290',
     expect(binds).toHaveLength(2);
   });
 });
+
+describe('notify / auth-chain TOKENMAXX residual quaternary leftovers after #310', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeNotifyEnv(
+    membersByRoom: Record<string, string[]>,
+    opts?: { failUsers?: Set<string> }
+  ) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              const roomId = args[0] as string;
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    const members = membersByRoom[roomId] ?? [];
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('concurrent notify partial Sync DO fail ∥ success sibling isolates fan-out', async () => {
+    const env = makeNotifyEnv(
+      {
+        '!fail:example.com': ['@ok:example.com', '@bad:example.com'],
+        '!ok:example.com': ['@solo:example.com'],
+      },
+      { failUsers: new Set(['@bad:example.com']) }
+    );
+    await Promise.all([
+      notifyUsersOfEvent(env, '!fail:example.com', '$f', 'm.room.message'),
+      notifyUsersOfEvent(env, '!ok:example.com', '$o', 'm.room.member'),
+    ]);
+    expect(env.notifies.map((n: { userId: string }) => n.userId).sort()).toEqual([
+      '@ok:example.com',
+      '@solo:example.com',
+    ]);
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @bad:example.com of event:',
+      expect.any(Error)
+    );
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      2,
+      'users of event',
+      '$f',
+      'users:',
+      '@ok:example.com, @bad:example.com'
+    );
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      1,
+      'users of event',
+      '$o',
+      'users:',
+      '@solo:example.com'
+    );
+  });
+
+  it('concurrent getAuthChain missing mid-chain ∥ short sibling stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      ['$tip', pdu('$tip', ['$missing', '$leaf'])],
+      ['$leaf', pdu('$leaf', [])],
+      ['$short', pdu('$short', [])],
+    ]);
+    const db = createAuthChainDb(events);
+    const [partial, short] = await Promise.all([
+      getAuthChain(db, ['$tip']),
+      getAuthChain(db, ['$short']),
+    ]);
+    expect(partial.map((e) => e.event_id).sort()).toEqual(['$leaf', '$tip'].sort());
+    expect(short.map((e) => e.event_id)).toEqual(['$short']);
+  });
+
+  it('concurrent getStateAtEvent empty-auth leaf ∥ missing leaf stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$empty-auth',
+        pdu('$empty-auth', [], {
+          type: 'm.room.message',
+          content: { body: 'x' },
+        }),
+      ],
+    ]);
+    delete (events.get('$empty-auth') as { state_key?: string }).state_key;
+    const db = createAuthChainDb(events);
+    const [emptyAuth, missing] = await Promise.all([
+      getStateAtEvent(db, '$empty-auth'),
+      getStateAtEvent(db, '$nope'),
+    ]);
+    expect(emptyAuth).toEqual([]);
+    expect(missing).toEqual([]);
+  });
+
+  it('getServersInRoomsWithUser multi-segment ∥ empty co-members under race', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare() {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            const subject = args[0] as string;
+            return {
+              async all<T>() {
+                if (subject === '@multi:example.com') {
+                  return {
+                    results: [
+                      { server_name: 'a.b.example.com' },
+                      { server_name: 'peer.example.com' },
+                    ] as T[],
+                  };
+                }
+                return { results: [] as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const [multi, empty] = await Promise.all([
+      getServersInRoomsWithUser(db, '@multi:example.com'),
+      getServersInRoomsWithUser(db, '@alone:example.com'),
+    ]);
+    expect(multi).toEqual(['a.b.example.com', 'peer.example.com']);
+    expect(empty).toEqual([]);
+    expect(binds).toHaveLength(2);
+    expect(binds[0]).toEqual(['@multi:example.com', '@multi:example.com']);
+    expect(binds[1]).toEqual(['@alone:example.com', '@alone:example.com']);
+  });
+});
