@@ -13,6 +13,7 @@
     "db:migrate:local": "wrangler d1 execute matrix-db --local --file=./migrations/schema.sql",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:admin-federation-leftovers": "vitest run test/admin-api-route-leftovers.test.ts test/admin-api-concurrent-race-leftovers.test.ts test/admin-api-quaternary-concurrent-race-leftovers.test.ts test/admin-api-quinary-concurrent-race-leftovers.test.ts test/admin-mutate-concurrent-race-leftovers.test.ts test/federation-api-route-leftovers.test.ts test/federation-api-concurrent-race-leftovers.test.ts test/federation-api-quaternary-concurrent-race-leftovers.test.ts test/federation-api-quinary-concurrent-race-leftovers.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/ test/",
     "worker:check": "wrangler deploy --dry-run --outdir=.wrangler-dry-run"
