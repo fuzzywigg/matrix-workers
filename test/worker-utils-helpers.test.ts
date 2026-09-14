@@ -942,3 +942,109 @@ describe('crypto canonicalJson / content-hash extras after #75', () => {
     expect(await verifyContentHash({}, h)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// TOKENMAXX HEAVY after #87 — second lane worker-utils leftovers
+// (ports / ID length / password exact / crypto + errors pins)
+// ---------------------------------------------------------------------------
+
+describe('worker-utils TOKENMAXX HEAVY after #87 (url ports + schemes)', () => {
+  it('rejects remaining service ports with exact error strings', () => {
+    for (const port of [53, 135, 139, 445, 3389, 5900]) {
+      expect(validateUrl(`https://example.com:${port}`).error).toBe(
+        `Access to port ${port} is not allowed`
+      );
+    }
+  });
+
+  it('rejects ws/wss schemes with exact protocol error', () => {
+    expect(validateUrl('ws://example.com/').error).toBe(
+      'Only HTTP and HTTPS protocols are allowed'
+    );
+    expect(validateUrl('wss://example.com/').error).toBe(
+      'Only HTTP and HTTPS protocols are allowed'
+    );
+  });
+
+  it('allows IPv4-mapped public ::ffff:8.8.8.8 and blocks 2001:0db8 documentation form', () => {
+    expect(validateUrl('http://[::ffff:8.8.8.8]/').valid).toBe(true);
+    expect(validateUrl('http://[2001:0db8::1]/').valid).toBe(false);
+  });
+
+  it('blocks broadcast 255.255.255.255', () => {
+    expect(validateUrl('http://255.255.255.255/').valid).toBe(false);
+  });
+});
+
+describe('worker-utils TOKENMAXX HEAVY after #87 (ids length + event-id format)', () => {
+  it('enforces localpart empty / 255 / 256 length bounds', () => {
+    expect(isValidLocalpart('')).toBe(false);
+    expect(isValidLocalpart('a'.repeat(255))).toBe(true);
+    expect(isValidLocalpart('a'.repeat(256))).toBe(false);
+  });
+
+  it('enforces server-name empty / 255 / 256 length bounds', () => {
+    expect(isValidServerName('')).toBe(false);
+    expect(isValidServerName('a'.repeat(255))).toBe(true);
+    expect(isValidServerName('a'.repeat(256))).toBe(false);
+  });
+
+  it('generateEventId uses domain-suffixed form for v1/v2 and bare for v3+', async () => {
+    const v1 = await generateEventId('ex.com', '1');
+    expect(v1).toMatch(/^\$[^:]+:ex\.com$/);
+    const v2 = await generateEventId('ex.com', '2');
+    expect(v2).toMatch(/^\$[^:]+:ex\.com$/);
+    const v3 = await generateEventId('ex.com', '3');
+    expect(v3.startsWith('$')).toBe(true);
+    expect(v3.includes(':')).toBe(false);
+  });
+});
+
+describe('worker-utils TOKENMAXX HEAVY after #87 (crypto + errors exact pins)', () => {
+  it('pins exact password strength messages for empty / max length', () => {
+    expect(validatePasswordStrength('')).toBe('Password must be at least 8 characters long');
+    expect(validatePasswordStrength('a1' + 'x'.repeat(999))).toBe(
+      'Password must be at most 1000 characters long'
+    );
+  });
+
+  it('generateRandomString(0) returns empty string', () => {
+    expect(generateRandomString(0)).toBe('');
+  });
+
+  it('canonicalJson maps undefined and NaN to null', () => {
+    expect(canonicalJson(undefined)).toBe('null');
+    expect(canonicalJson(Number.NaN)).toBe('null');
+  });
+
+  it('verifyPassword rejects iteration count 99999 and wrong scheme', async () => {
+    const salt = btoa('saltsaltsaltsalt');
+    const hash = btoa('hashhashhashhashhashhashhashhash');
+    expect(await verifyPassword('password1', `$pbkdf2-sha256$99999$${salt}$${hash}`)).toBe(
+      false
+    );
+    expect(await verifyPassword('password1', `$pbkdf2-sha1$100000$${salt}$${hash}`)).toBe(false);
+  });
+
+  it('verifyPassword accepts a real hash at exactly 100000 iterations', async () => {
+    const stored = await hashPassword('ValidPass1');
+    expect(stored.startsWith('$pbkdf2-sha256$100000$')).toBe(true);
+    expect(await verifyPassword('ValidPass1', stored)).toBe(true);
+    expect(await verifyPassword('WrongPass1', stored)).toBe(false);
+  });
+
+  it('invalidParam / limitExceeded(0) / emptyResponse(201) / withErrorHandler success', async () => {
+    const inv = Errors.invalidParam('limit', 'must be positive');
+    expect(inv.message).toBe('must be positive');
+    expect(inv.errcode).toBe(ErrorCodes.M_INVALID_PARAM);
+
+    const lim = Errors.limitExceeded('x', 0);
+    expect(lim.toJSON()).toEqual({ errcode: ErrorCodes.M_LIMIT_EXCEEDED, error: 'x' });
+
+    const empty = emptyResponse(201);
+    expect(empty.status).toBe(201);
+    await expect(empty.json()).resolves.toEqual({});
+
+    await expect(withErrorHandler(async () => 42)).resolves.toBe(42);
+  });
+});

@@ -351,3 +351,139 @@ describe('Cloudflare Calls TOKENMAXX after #77/#78', () => {
     ).rejects.toMatchObject({ code: 'remote_boom', message: 'Track error', statusCode: 400 });
   });
 });
+
+// ---------------------------------------------------------------------------
+// TOKENMAXX HEAVY after #87 — Calls exact messages / empty tracks / raw fetch reject
+// ---------------------------------------------------------------------------
+
+describe('Cloudflare Calls TOKENMAXX HEAVY after #87', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('pins exact NOT_CONFIGURED message', async () => {
+    await expect(createSession({} as Env)).rejects.toMatchObject({
+      code: 'NOT_CONFIGURED',
+      statusCode: 500,
+      message: 'Cloudflare Calls not configured. Set CALLS_APP_ID and CALLS_APP_SECRET.',
+    });
+  });
+
+  it('pins exact API_ERROR message with status and body suffix', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('quota', { status: 403 })));
+    await expect(createSession(callsEnv())).rejects.toMatchObject({
+      code: 'API_ERROR',
+      statusCode: 403,
+      message: 'Calls API error: 403 - quota',
+    });
+  });
+
+  it('documents that fetch reject surfaces as raw Error (no CloudflareCallsError wrap)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network down');
+    }));
+    await expect(createSession(callsEnv())).rejects.toSatisfy((err: unknown) => {
+      return err instanceof Error && !(err instanceof CloudflareCallsError) && err.message === 'network down';
+    });
+  });
+
+  it('documents TypeError when SDP present but tracks array is empty', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            sessionDescription: { type: 'answer', sdp: 'ans' },
+            tracks: [],
+            requiresImmediateRenegotiation: false,
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    await expect(
+      pushLocalTrack(callsEnv(), 's1', { type: 'offer', sdp: 'off' }, 'cam')
+    ).rejects.toBeInstanceOf(TypeError);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            sessionDescription: { type: 'offer', sdp: 'off' },
+            tracks: [],
+            requiresImmediateRenegotiation: false,
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    await expect(
+      pullRemoteTrack(callsEnv(), 'local', 'remote', 'cam')
+    ).rejects.toBeInstanceOf(TypeError);
+  });
+
+  it('maps empty errorDescription string to Track error for push and pull', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            sessionDescription: { type: 'answer', sdp: 'ans' },
+            tracks: [
+              { mid: '0', trackName: 'x', errorCode: 'empty_desc', errorDescription: '' },
+            ],
+            requiresImmediateRenegotiation: false,
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    await expect(
+      pushLocalTrack(callsEnv(), 's1', { type: 'offer', sdp: 'off' }, 'cam')
+    ).rejects.toMatchObject({ code: 'empty_desc', message: 'Track error' });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            sessionDescription: { type: 'offer', sdp: 'off' },
+            tracks: [
+              { mid: '1', trackName: 'y', errorCode: 'empty_remote', errorDescription: '' },
+            ],
+            requiresImmediateRenegotiation: false,
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    await expect(
+      pullRemoteTrack(callsEnv(), 'local', 'remote', 'cam')
+    ).rejects.toMatchObject({ code: 'empty_remote', message: 'Track error' });
+  });
+
+  it('pins requiresRenegotiation false when SFU does not require immediate renegotiation', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            sessionDescription: { type: 'offer', sdp: 'off' },
+            tracks: [{ mid: '2', trackName: 'remote-cam' }],
+            requiresImmediateRenegotiation: false,
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    await expect(
+      pullRemoteTrack(callsEnv(), 'local-sess', 'remote-sess', 'remote-cam')
+    ).resolves.toEqual({
+      offer: { type: 'offer', sdp: 'off' },
+      mid: '2',
+      requiresRenegotiation: false,
+    });
+  });
+});
