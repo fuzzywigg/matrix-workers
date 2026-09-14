@@ -1,6 +1,6 @@
 /**
- * TOKENMAXX HEAVY deepen after #94/#96/#99 — different slice: login/register API routes.
- * Avoids keys (#99), key-backups (#96), search (#94). Tests-only — no product inventing.
+ * TOKENMAXX HEAVY deepen after #94/#96/#99/#128 — different slice: login/register API routes.
+ * Avoids keys (#99), key-backups (#96), search (#94), push (#128). Tests-only — no product inventing.
  * Exercises login flows, lockout, refresh rotation, register/guest, logout, whoami,
  * and get_token via Hono app.request().
  */
@@ -2801,5 +2801,171 @@ describe('login TOKENMAXX soft-cap lifecycles', () => {
       const res = await request(e, c.path, c.init);
       expect(res.body).toMatchObject({ errcode: c.code });
     }
+  });
+});
+
+describe('login soft-cap flood — more identifier / register / refresh leftovers', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('password login rejects m.id.thirdparty identifier', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        passwordLoginBody({
+          identifier: { type: 'm.id.thirdparty', medium: 'email', address: 'a@b.c' },
+        }),
+        ''
+      )
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_UNRECOGNIZED' });
+  });
+
+  it('password login with only spaces password still attempts verify (not missing)', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ password: '   ' }), '')
+    );
+    // non-empty string → not M_MISSING_PARAM; verify fails → M_FORBIDDEN
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('register inhibit_login true omits access_token/refresh_token keys entirely', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'nolgin',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: true,
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      user_id: `@nolgin:${SERVER}`,
+      home_server: SERVER,
+    });
+  });
+
+  it('register initial_device_display_name stored on device', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'namedev',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          initial_device_display_name: 'Reg Phone',
+          device_id: 'REG1',
+        },
+        ''
+      )
+    );
+    expect(db.devices[0]).toMatchObject({
+      device_id: 'REG1',
+      display_name: 'Reg Phone',
+    });
+  });
+
+  it('refresh with whitespace-only refresh_token is missing', async () => {
+    // Implementation checks !refreshToken — non-empty spaces are truthy → unknown token
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: '   ' }, '')
+    );
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({ errcode: 'M_UNKNOWN_TOKEN' });
+  });
+
+  it('available returns available:true without available:false field', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(env, '/_matrix/client/v3/register/available?username=zzyx');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ available: true });
+  });
+
+  it('login response does not include well_known or expires_in_s', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody(), '')
+    );
+    expect(Object.keys(res.body as object).sort()).toEqual([
+      'access_token',
+      'device_id',
+      'expires_in_ms',
+      'home_server',
+      'refresh_token',
+      'user_id',
+    ]);
+  });
+
+  it('whoami for admin user still only returns user_id/device_id/is_guest', async () => {
+    const env = envFor(
+      createLoginDb({
+        users: new Map([
+          [
+            USER,
+            userRow({
+              user_id: USER,
+              localpart: 'alice',
+              password_hash: 'mockok:secret123',
+              admin: 1,
+            }),
+          ],
+        ]),
+      })
+    );
+    const res = await request(env, '/_matrix/client/v3/account/whoami');
+    expect(res.body).toEqual({
+      user_id: USER,
+      device_id: DEVICE,
+      is_guest: false,
+    });
+  });
+
+  it('logout/all on user with zero tokens still returns {}', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(env, '/_matrix/client/v3/logout/all', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+  });
+
+  it('get_token expires_at is ~now+120000 within clock skew', async () => {
+    const sessions = mockKv();
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }), sessions);
+    const before = Date.now();
+    await request(env, '/_matrix/client/v1/login/get_token', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+    const after = Date.now();
+    const payload = JSON.parse(sessions.puts[0].value) as { expires_at: number };
+    expect(payload.expires_at).toBeGreaterThanOrEqual(before + 120_000);
+    expect(payload.expires_at).toBeLessThanOrEqual(after + 120_000);
   });
 });
