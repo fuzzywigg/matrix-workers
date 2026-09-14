@@ -1,7 +1,7 @@
 /**
- * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 — admin API
- * soft/edge/reliability. Complements admin-api-routes.test.ts and
- * admin-api-concurrent-race leftovers (#239). Tests-only — no product inventing.
+ * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
+ * — admin API soft/edge/reliability. Complements admin-api-routes.test.ts and
+ * admin-api-concurrent-race leftovers (#239/#248). Tests-only — no product inventing.
  * Fixtures use example.com only.
  *
  * Deepen after #241: analytics period soft, synapse destinations/event_reports,
@@ -9,6 +9,11 @@
  * login-token TTL soft, reactivate, quarantine, registration GET, room events,
  * keys debug, self-purge/self-demote guards — niches present in admin.ts /
  * admin-api-routes but unsaturated in this leftovers soft flood after #157/#161.
+ *
+ * Residual after #252 (post-#248): Synapse PUT/DELETE soft, media DELETE,
+ * login-token TTL clamps, federation/test all-green+empty-keys, registration PUT
+ * fail/non-bool, bulk-delete deleted:0, synapse rooms query knobs,
+ * reset_password logout_devices:false, empty-body user PUT errcode.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -4019,6 +4024,293 @@ describe('admin leftovers room events/keys/self-purge soft flood after #241', ()
       const providers = res.body.providers as Array<Record<string, unknown>>;
       expect(providers[0].id).toBe('idp1');
       expect(providers[0].client_secret_encrypted).toBeUndefined();
+    });
+  }
+});
+
+// residual soft floods after #252 (post-#248 niches unsaturated in leftovers)
+
+describe('admin leftovers synapse PUT/DELETE soft flood after #252', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`synapse PUT update existing soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/_synapse/admin/v2/users/${encodeURIComponent(BOB)}`,
+        jsonInit('PUT', { displayname: `Bob-${i}`, admin: false }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.name).toBe(BOB);
+      expect(res.body.displayname).toBe(`Bob-${i}`);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse PUT create new soft-${i}`, async () => {
+      const db = createAdminDb();
+      const uid = `@newuser${i}:example.com`;
+      const res = await jsonReq(
+        `/_synapse/admin/v2/users/${encodeURIComponent(uid)}`,
+        jsonInit('PUT', { password: `Pass${i}!x`, displayname: `New${i}` }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.name).toBe(uid);
+      expect(db.users.find((u) => u.user_id === uid)?.localpart).toBe(`newuser${i}`);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse PUT missing password soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/_synapse/admin/v2/users/${encodeURIComponent(`@fresh${i}:example.com`)}`,
+        jsonInit('PUT', { displayname: 'NoPass' })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+      expect(String(res.body.error)).toMatch(/password required for new user/);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`synapse PUT bad MXID soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/_synapse/admin/v2/users/${encodeURIComponent(`not-an-mxid-${i}`)}`,
+        jsonInit('PUT', { password: 'Pass1!xx' })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_INVALID_USERNAME');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse DELETE room soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/_synapse/admin/v1/rooms/${encodeURIComponent(ROOM)}`,
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.kicked_users).toEqual([]);
+      expect(res.body.failed_to_kick_users).toEqual([]);
+      expect(res.body.local_aliases).toEqual([]);
+      expect(res.body.new_room_id).toBeNull();
+      expect(db.rooms.find((r) => r.room_id === ROOM)).toBeUndefined();
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`admin DELETE room soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/admin/api/rooms/${encodeURIComponent(ROOM)}`,
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.rooms.find((r) => r.room_id === ROOM)).toBeUndefined();
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`synapse DELETE missing room soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/_synapse/admin/v1/rooms/${encodeURIComponent(`!missing${i}:example.com`)}`,
+        { method: 'DELETE', headers: AUTH }
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+    });
+  }
+});
+
+describe('admin leftovers media DELETE / login-token clamp / federation-test soft after #252', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`media DELETE soft-${i}`, async () => {
+      const db = createAdminDb();
+      const media = mockR2();
+      const res = await jsonReq(
+        `/admin/api/media/${MEDIA_ID}`,
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db, media })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.media.find((m) => m.media_id === MEDIA_ID)).toBeUndefined();
+      expect(media.deleted).toContain(MEDIA_ID);
+      expect(media.deleted).toContain(`thumb_${MEDIA_ID}_96x96_crop`);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`login-token TTL clamp soft-${i}`, async () => {
+      const sessions = mockKv();
+      const cases = [
+        { ttl: 0, expectSec: 600 },
+        { ttl: 0.5, expectSec: 60 },
+        { ttl: 120, expectSec: 3600 },
+        { ttl: 999, expectSec: 3600 },
+      ] as const;
+      const c = cases[i % cases.length];
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        jsonInit('POST', { ttl_minutes: c.ttl }),
+        createEnv({ sessions })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.ttl_seconds).toBe(c.expectSec);
+      expect(res.body.token).toBe('mlt_pinned_login_token');
+      expect(String(res.body.qr_url)).toContain('/login/qr/mlt_pinned_login_token');
+      expect(sessions.puts[0].key).toBe('login_token:tokhash:mlt_pinned_login_token');
+      expect(sessions.puts[0].options?.expirationTtl).toBe(c.expectSec);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`federation/test all-success soft-${i}`, async () => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/.well-known/matrix/server')) {
+          return Response.json({ 'm.server': `${SERVER}:443` });
+        }
+        if (url.includes('/_matrix/key/v2/server')) {
+          return Response.json({ verify_keys: { 'ed25519:a': { key: 'x' } } });
+        }
+        if (url.includes('/_matrix/federation/v1/version')) {
+          return Response.json({ server: { name: 'matrix-worker', version: 't' } });
+        }
+        if (url.includes('/.well-known/matrix/client')) {
+          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
+        }
+        return new Response('missing', { status: 404 });
+      });
+      const res = await jsonReq('/admin/api/federation/test');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      const tests = res.body.tests as Array<{ name: string; passed: boolean }>;
+      expect(tests).toHaveLength(4);
+      expect(tests.every((t) => t.passed)).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`federation/test empty verify_keys soft-${i}`, async () => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/.well-known/matrix/server')) {
+          return Response.json({ 'm.server': `${SERVER}:443` });
+        }
+        if (url.includes('/_matrix/key/v2/server')) {
+          return Response.json({ verify_keys: {} });
+        }
+        if (url.includes('/_matrix/federation/v1/version')) {
+          return Response.json({ server: { name: 'matrix-worker', version: 't' } });
+        }
+        if (url.includes('/.well-known/matrix/client')) {
+          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
+        }
+        return new Response('missing', { status: 404 });
+      });
+      const res = await jsonReq('/admin/api/federation/test');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(false);
+      const tests = res.body.tests as Array<{ name: string; passed: boolean; message: string }>;
+      const signing = tests.find((t) => t.name === 'Server signing keys');
+      expect(signing?.passed).toBe(false);
+      expect(signing?.message).toBe('No signing keys found');
+      expect(tests.filter((t) => t.name !== 'Server signing keys').every((t) => t.passed)).toBe(true);
+    });
+  }
+});
+
+describe('admin leftovers registration/bulk/synapse-rooms/reset soft flood after #252', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`registration PUT non-boolean soft-${i}`, async () => {
+      const body = i % 2 === 0 ? { enabled: 'true' } : {};
+      const res = await jsonReq('/admin/api/registration', jsonInit('PUT', body));
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`registration PUT failConfigPut soft-${i}`, async () => {
+      const adminDO = createAdminDO({ failConfigPut: true });
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/registration',
+        jsonInit('PUT', { enabled: i % 2 === 0 }),
+        createEnv({ adminDO, db })
+      );
+      expect(res.status).toBe(500);
+      expect(res.body.raw).toBe('Failed to update config');
+      const audit = db.audit.find((a) => a.action === 'config.registration.update');
+      expect(audit?.success).toBe(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`bulk-delete self-only deleted:0 soft-${i}`, async () => {
+      const res = await jsonReq(
+        '/admin/api/users/bulk-delete',
+        jsonInit('POST', { user_ids: [ADMIN] })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.deleted).toBe(0);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`bulk-delete empty/missing soft-${i}`, async () => {
+      const body = i % 2 === 0 ? { user_ids: [] } : {};
+      const res = await jsonReq('/admin/api/users/bulk-delete', jsonInit('POST', body));
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse rooms search/order/dir soft-${i}`, async () => {
+      const order = i % 2 === 0 ? 'joined_members' : 'name';
+      const dir = i % 3 === 0 ? 'b' : 'f';
+      const res = await jsonReq(
+        `/_synapse/admin/v1/rooms?limit=10&from=0&search_term=room&order_by=${order}&dir=${dir}`
+      );
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.rooms)).toBe(true);
+      expect(typeof res.body.total_rooms === 'number' || typeof res.body.total === 'number').toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`reset_password logout_devices false soft-${i}`, async () => {
+      const db = createAdminDb();
+      const before = db.tokens.filter((t) => t.user_id === BOB).length;
+      const res = await jsonReq(
+        `/_synapse/admin/v1/reset_password/${encodeURIComponent(BOB)}`,
+        jsonInit('POST', { new_password: `Zzz${i}!`, logout_devices: false }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({});
+      expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(before);
+      const audit = db.audit.find((a) => a.action === 'user.reset_password');
+      expect(JSON.parse(String(audit?.details)).logout_devices).toBe(false);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`PUT users empty-body No fields soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}`,
+        jsonInit('PUT', {})
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+      expect(String(res.body.error)).toMatch(/No fields to update/);
     });
   }
 });

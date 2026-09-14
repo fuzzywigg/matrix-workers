@@ -1,13 +1,18 @@
 /**
- * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 — federation S2S
- * soft/edge/reliability. Complements federation-api-routes.test.ts and
- * federation-api-concurrent-race leftovers (#239). Tests-only — no product inventing.
- * Fixtures use example.com only.
+ * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
+ * — federation S2S soft/edge/reliability (non-catchup). Complements
+ * federation-api-routes.test.ts and federation-api-concurrent-race leftovers
+ * (#239/#248). Tests-only — no product inventing. Fixtures use example.com only.
  *
  * Deepen after #241: hierarchy, timestamp_to_event, event_auth, backfill,
  * get_missing_events, media/thumbnail soft floods — present in federation.ts /
  * federation-api-routes base but unsaturated in this leftovers soft flood after
  * #157/#161 (concurrent races covered those paths; serial soft floods did not).
+ *
+ * Residual after #252 (post-#248, skip catchup #249/#250): send content-hash
+ * mismatch/throw; previously-rejected null reason; origin-server invalid sig;
+ * auth-check throw accept; m.presence + noop EDU record; media disposition /
+ * octet-stream; thumbnail clamp + non-image; OpenID expired vs invalid text.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -62,6 +67,20 @@ const checkEventAuth = vi.fn(() => ({ allowed: true }));
 vi.mock('../src/services/event-auth', () => ({
   checkEventAuth: (...args: unknown[]) => checkEventAuth(...args),
 }));
+
+const verifyContentHash = vi.hoisted(() => vi.fn());
+vi.mock('../src/utils/crypto', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/utils/crypto')>();
+  verifyContentHash.mockImplementation(
+    (content: Record<string, unknown>, expectedHash: string) =>
+      actual.verifyContentHash(content, expectedHash)
+  );
+  return {
+    ...actual,
+    verifyContentHash: (...args: unknown[]) =>
+      verifyContentHash(...(args as [Record<string, unknown>, string])),
+  };
+});
 
 import federation from '../src/api/federation';
 import { generateSigningKeyPair } from '../src/utils/crypto';
@@ -3041,3 +3060,313 @@ describe('soft media thumbnail leftover flood after #241', () => {
 });
 
 afterEach(() => { federationOrigin = FED_ORIGIN; vi.clearAllMocks(); });
+
+// residual soft floods after #252 (non-catchup send/media/openid niches unsaturated post-#248)
+
+const REMOTE_USER = `@remote:${FED_ORIGIN}`;
+
+describe('soft send content-hash / prev-rejected / origin-sig leftover flood after #252', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    verifyContentHash.mockReset();
+    verifyContentHash.mockImplementation(async () => false);
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`content-hash mismatch soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      verifyContentHash.mockResolvedValue(false);
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$hashmiss${i}`;
+      const { status, body } = await req('PUT', `/_matrix/federation/v1/send/txn-hash-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            hashes: { sha256: 'not-a-real-hash' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      });
+      expect(status).toBe(200);
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe('Content hash mismatch');
+      expect(
+        db.inserts.some(
+          (ins) =>
+            String(ins.sql).includes('processed_pdus') &&
+            ins.args.includes('Content hash mismatch')
+        )
+      ).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`content-hash verification throw soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      verifyContentHash.mockRejectedValue(new Error(`hash-boom-${i}`));
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$hashthrow${i}`;
+      const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-hashthrow-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            hashes: { sha256: 'any' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      });
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
+        'Content hash verification error'
+      );
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`previously-rejected null reason soft-${i}`, async () => {
+      const eid = `$prevnull${i}`;
+      const db = createFedDb({
+        processedPdus: { [eid]: { accepted: 0, rejection_reason: null } },
+      });
+      const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-prev-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+          },
+        ],
+      });
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe('Previously rejected');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`origin-server invalid signature soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(false);
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '1', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$originsig${i}`;
+      const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-origsig-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'bad' } },
+          },
+        ],
+      });
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
+        'PDU from origin server without valid signature'
+      );
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`checkEventAuth throw accepts soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      verifyContentHash.mockResolvedValue(true);
+      checkEventAuth.mockImplementation(() => {
+        throw new Error(`auth-boom-${i}`);
+      });
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$auththrow${i}`;
+      const { status, body } = await req('PUT', `/_matrix/federation/v1/send/txn-auththrow-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'ok' },
+            hashes: { sha256: 'ok' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      });
+      expect(status).toBe(200);
+      expect((body as { pdus: Record<string, unknown> }).pdus[eid]).toEqual({});
+      expect(
+        db.inserts.some(
+          (ins) =>
+            String(ins.sql).includes('processed_pdus') &&
+            String(ins.sql).includes('1, NULL')
+        )
+      ).toBe(true);
+    });
+  }
+});
+
+describe('soft send presence / noop EDU leftover flood after #252', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`m.presence upsert soft-${i}`, async () => {
+      const db = createFedDb();
+      const { status, body } = await req('PUT', `/_matrix/federation/v1/send/txn-pres-${i}`, makeEnv(db), {
+        pdus: [],
+        edus: [
+          {
+            edu_type: 'm.presence',
+            content: {
+              push: [
+                {
+                  user_id: `@u${i}:${FED_ORIGIN}`,
+                  presence: i % 2 === 0 ? 'online' : 'unavailable',
+                  status_msg: `s${i}`,
+                  last_active_ago: 1000 * (i + 1),
+                  currently_active: i % 2 === 0,
+                },
+              ],
+            },
+          },
+        ],
+      });
+      expect(status).toBe(200);
+      expect((body as { pdus: unknown }).pdus).toEqual({});
+      expect(db.inserts.some((ins) => String(ins.sql).includes('INSERT INTO presence'))).toBe(true);
+      expect(db.inserts.some((ins) => String(ins.sql).includes('INSERT OR REPLACE INTO processed_edus'))).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`noop EDU still recorded soft-${i}`, async () => {
+      const types = ['m.receipt', 'm.direct_to_device', 'm.signing_key_update', 'm.unknown_edu'] as const;
+      const eduType = types[i % types.length];
+      const db = createFedDb();
+      const { status } = await req('PUT', `/_matrix/federation/v1/send/txn-noop-${i}`, makeEnv(db), {
+        pdus: [],
+        edus: [{ edu_type: eduType, content: { n: i } }],
+      });
+      expect(status).toBe(200);
+      const eduInsert = db.inserts.find((ins) => String(ins.sql).includes('INSERT OR REPLACE INTO processed_edus'));
+      expect(eduInsert).toBeTruthy();
+      expect(eduInsert!.args[1]).toBe(eduType);
+    });
+  }
+});
+
+describe('soft media download/thumbnail / openid text leftover flood after #252', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+  });
+
+  const MEDIA_ID = 'fed_media_disp';
+
+  for (let i = 0; i < 8; i++) {
+    it(`download Content-Disposition soft-${i}`, async () => {
+      const media = mockR2({ [MEDIA_ID]: new Uint8Array([1, 2, 3, i]) });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: `pic-${i}.png` }],
+      });
+      const r = await req('GET', `/_matrix/federation/v1/media/download/${MEDIA_ID}`, makeEnv(db, { media }));
+      expect(r.status).toBe(200);
+      expect(r.headers.get('Content-Type')).toBe('image/png');
+      expect(r.headers.get('Content-Disposition')).toBe(`inline; filename="pic-${i}.png"`);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`download octet-stream missing meta soft-${i}`, async () => {
+      const id = `orphan_media_${i}`;
+      const media = mockR2({ [id]: new Uint8Array([9, 9, i]) });
+      const db = createFedDb({ media: [] });
+      const r = await req('GET', `/_matrix/federation/v1/media/download/${id}`, makeEnv(db, { media }));
+      expect(r.status).toBe(200);
+      expect(r.headers.get('Content-Type')).toBe('application/octet-stream');
+      expect(r.headers.get('Content-Disposition')).toBeNull();
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`thumbnail clamp width soft-${i}`, async () => {
+      const thumbKey = `thumb_${MEDIA_ID}_1920x96_scale`;
+      const media = mockR2({
+        [MEDIA_ID]: new Uint8Array([1, 2, 3]),
+        [thumbKey]: new Uint8Array([7, 7, 7]),
+      });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'big.png' }],
+      });
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=99999&height=96&method=scale`,
+        makeEnv(db, { media })
+      );
+      expect(r.status).toBe(200);
+      expect(r.headers.get('Content-Type')).toBe('image/jpeg');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`thumbnail non-image no X-Thumbnail soft-${i}`, async () => {
+      const media = mockR2({ [MEDIA_ID]: new Uint8Array([4, 5, 6, i]) });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'application/pdf', filename: 'doc.pdf' }],
+      });
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=64&height=64`,
+        makeEnv(db, { media })
+      );
+      expect(r.status).toBe(200);
+      expect(r.headers.get('Content-Type')).toBe('application/pdf');
+      expect(r.headers.get('X-Thumbnail-Generated')).toBeNull();
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`openid invalid vs expired text soft-${i}`, async () => {
+      if (i % 2 === 0) {
+        const sessions = mockKv();
+        const r = await req(
+          'GET',
+          `/_matrix/federation/v1/openid/userinfo?access_token=missing${i}`,
+          makeEnv(createFedDb(), { sessions })
+        );
+        expect(r.status).toBe(401);
+        expect((r.body as { errcode: string; error: string }).errcode).toBe('M_UNKNOWN_TOKEN');
+        expect((r.body as { error: string }).error).toBe('Invalid or expired OpenID token');
+      } else {
+        const tok = `expired${i}`;
+        const sessions = mockKv({
+          [`openid:${tok}`]: JSON.stringify({ user_id: LOCAL_USER, expires_at: Date.now() - 1000 }),
+        });
+        const r = await req(
+          'GET',
+          `/_matrix/federation/v1/openid/userinfo?access_token=${tok}`,
+          makeEnv(createFedDb(), { sessions })
+        );
+        expect(r.status).toBe(401);
+        expect((r.body as { errcode: string; error: string }).errcode).toBe('M_UNKNOWN_TOKEN');
+        expect((r.body as { error: string }).error).toBe('OpenID token has expired');
+        expect(sessions.data[`openid:${tok}`]).toBeUndefined();
+      }
+    });
+  }
+});

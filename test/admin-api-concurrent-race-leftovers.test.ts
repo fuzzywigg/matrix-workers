@@ -1,8 +1,8 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
- * — admin *GET concurrent race / TOCTOU* for leftover admin-api routes that
- * only had serial soft floods (#157 leftover) or mutate races (#189). Distinct
- * from admin-mutate-concurrent-race-leftovers (writes) and
+ * / residual after #252 — admin concurrent race / TOCTOU for leftover admin-api
+ * routes that only had serial soft floods (#157 leftover) or mutate races (#189).
+ * Distinct from admin-mutate-concurrent-race-leftovers (writes) and
  * admin-api-route-leftovers (serial GET floods).
  *
  * Distinct from tip #241 (devices+keybackups residual) and #239 (this file's
@@ -10,6 +10,10 @@
  * quarantine∥media list; reactivate∥user detail; make-admin∥whois;
  * analytics∥destinations isolation — soft-flooded in route leftovers but not
  * raced under Promise.all after #239.
+ *
+ * Residual after #252 (post-#248): Synapse PUT∥detail; room DELETE∥events;
+ * media DELETE∥list; reset_password(false)∥sessions; registration fail∥GET;
+ * bulk-delete self∥empty PUT errcode.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -3027,6 +3031,188 @@ describe('race residual make-admin∥whois∥analytics after #241', () => {
       const results = await Promise.all([
         jsonReq('/admin/api/make-admin', jsonInit('POST', { user_id: BOB }), env),
         jsonReq(`/_matrix/client/v3/admin/analytics/requests?period=${i % 2 === 0 ? '1h' : '24h'}`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+// residual concurrent races after #252 (route-leftover soft niches not raced post-#248)
+
+describe('race residual synapse PUT∥detail after #252', () => {
+  it('synapse PUT update∥GET detail dual 200', async () => {
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const [put, detail] = await Promise.all([
+      jsonReq(`/_synapse/admin/v2/users/${bobEnc}`, jsonInit('PUT', { displayname: 'BobRace' }), env),
+      jsonReq(`/_synapse/admin/v2/users/${bobEnc}`, {}, env),
+    ]);
+    expect(put.status).toBe(200);
+    expect(detail.status).toBe(200);
+    expect(put.body.name).toBe(BOB);
+  });
+
+  it('synapse PUT create∥missing password isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [create, missing] = await Promise.all([
+      jsonReq(
+        `/_synapse/admin/v2/users/${encodeURIComponent('@racecreate:example.com')}`,
+        jsonInit('PUT', { password: 'Pass1!xx', displayname: 'Race' }),
+        env
+      ),
+      jsonReq(
+        `/_synapse/admin/v2/users/${encodeURIComponent('@nopass:example.com')}`,
+        jsonInit('PUT', { displayname: 'NoPass' }),
+        env
+      ),
+    ]);
+    expect(create.status).toBe(200);
+    expect(missing.status).toBe(400);
+    expect(missing.body.errcode).toBe('M_MISSING_PARAM');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse PUT residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const bobEnc = encodeURIComponent(BOB);
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq(`/_synapse/admin/v2/users/${bobEnc}`, jsonInit('PUT', { displayname: `R${i}` }), env),
+        jsonReq(`/_synapse/admin/v2/users/${bobEnc}`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual room DELETE∥events after #252', () => {
+  it('synapse DELETE∥room events race', async () => {
+    const db = createAdminDb();
+    const roomEnc = encodeURIComponent(ROOM);
+    const env = createEnv({ db });
+    const [del, events] = await Promise.all([
+      jsonReq(`/_synapse/admin/v1/rooms/${roomEnc}`, { method: 'DELETE', headers: AUTH }, env),
+      jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=5`, {}, env),
+    ]);
+    expect(del.status).toBe(200);
+    expect([200, 404]).toContain(events.status);
+    expect(db.rooms.find((r) => r.room_id === ROOM)).toBeUndefined();
+  });
+
+  it('admin DELETE∥detail race', async () => {
+    const db = createAdminDb();
+    const roomEnc = encodeURIComponent(ROOM);
+    const env = createEnv({ db });
+    const [del, detail] = await Promise.all([
+      jsonReq(`/admin/api/rooms/${roomEnc}`, { method: 'DELETE', headers: AUTH }, env),
+      jsonReq(`/admin/api/rooms/${roomEnc}`, {}, env),
+    ]);
+    expect(del.status).toBe(200);
+    expect([200, 404]).toContain(detail.status);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`room DELETE residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const roomEnc = encodeURIComponent(ROOM);
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq(`/_synapse/admin/v1/rooms/${roomEnc}`, { method: 'DELETE', headers: AUTH }, env),
+        jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=3`, {}, env),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect([200, 404]).toContain(results[1].status);
+    });
+  }
+});
+
+describe('race residual media DELETE∥list after #252', () => {
+  it('media DELETE∥list isolation', async () => {
+    const db = createAdminDb();
+    const media = mockR2();
+    const env = createEnv({ db, media });
+    const [del, list] = await Promise.all([
+      jsonReq(`/admin/api/media/${MEDIA_ID}`, { method: 'DELETE', headers: AUTH }, env),
+      jsonReq('/admin/api/media?limit=10', {}, env),
+    ]);
+    expect(del.status).toBe(200);
+    expect(list.status).toBe(200);
+    expect(db.media.find((m) => m.media_id === MEDIA_ID)).toBeUndefined();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`media DELETE residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const media = mockR2();
+      const env = createEnv({ db, media });
+      const results = await Promise.all([
+        jsonReq(`/admin/api/media/${MEDIA_ID}`, { method: 'DELETE', headers: AUTH }, env),
+        jsonReq('/admin/api/media?limit=5', {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual reset_password∥sessions / registration fail after #252', () => {
+  it('reset_password logout false∥sessions keeps tokens', async () => {
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const before = db.tokens.filter((t) => t.user_id === BOB).length;
+    const [reset, list] = await Promise.all([
+      jsonReq(
+        `/_synapse/admin/v1/reset_password/${bobEnc}`,
+        jsonInit('POST', { new_password: 'KeepTok1!', logout_devices: false }),
+        env
+      ),
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+    ]);
+    expect(reset.status).toBe(200);
+    expect(list.status).toBe(200);
+    expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(before);
+  });
+
+  it('registration failConfigPut∥GET isolation', async () => {
+    const adminDO = createAdminDO({ failConfigPut: true, config: { registration_enabled: true } });
+    const db = createAdminDb();
+    const env = createEnv({ adminDO, db });
+    const [put, get] = await Promise.all([
+      jsonReq('/admin/api/registration', jsonInit('PUT', { enabled: false }), env),
+      jsonReq('/admin/api/registration', {}, env),
+    ]);
+    expect(put.status).toBe(500);
+    expect(get.status).toBe(200);
+    expect(get.body.enabled).toBe(true);
+  });
+
+  it('bulk-delete self∥PUT empty fields isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [bulk, empty] = await Promise.all([
+      jsonReq('/admin/api/users/bulk-delete', jsonInit('POST', { user_ids: [ADMIN] }), env),
+      jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}`, jsonInit('PUT', {}), env),
+    ]);
+    expect(bulk.status).toBe(200);
+    expect(bulk.body.deleted).toBe(0);
+    expect(empty.status).toBe(400);
+    expect(empty.body.errcode).toBe('M_MISSING_PARAM');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`reset/registration residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const bobEnc = encodeURIComponent(BOB);
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq(
+          `/_synapse/admin/v1/reset_password/${bobEnc}`,
+          jsonInit('POST', { new_password: `Keep${i}!`, logout_devices: false }),
+          env
+        ),
+        jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
     });
