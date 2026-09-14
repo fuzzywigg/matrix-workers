@@ -2522,3 +2522,401 @@ describe('oauth leftovers hash/random soft-cap flood', () => {
     expect(s).toMatch(/^[0-9a-f]+$/);
   });
 });
+
+// =============================================================================
+// Soft-cap flood continuation — oauth / push / account-data / register edges
+// =============================================================================
+
+describe('oauth leftovers base64Url decode soft failure flood', () => {
+  it('decode rejects space in middle', () => {
+    expect(() => base64UrlDecode('ab cd')).toThrow();
+  });
+  it('decode rejects newline', () => {
+    expect(() => base64UrlDecode('abcd\n')).toThrow();
+  });
+  it('decode rejects tab', () => {
+    expect(() => base64UrlDecode('ab\tcd')).toThrow();
+  });
+  it('decode rejects curly braces', () => {
+    expect(() => base64UrlDecode('{abc}')).toThrow();
+  });
+  it('decode rejects percent encoding literal', () => {
+    expect(() => base64UrlDecode('%2B%2F')).toThrow();
+  });
+  it('encode empty Uint8Array → empty string', () => {
+    expect(base64UrlEncode(new Uint8Array(0))).toBe('');
+  });
+  it('round-trip length 1 and 2 soft', () => {
+    for (const len of [1, 2]) {
+      const src = new Uint8Array(len).map((_, i) => (i + 7) & 0xff);
+      expect(Array.from(base64UrlDecode(base64UrlEncode(src)))).toEqual(Array.from(src));
+    }
+  });
+  it('encode never emits + or / for high bytes', () => {
+    const enc = base64UrlEncode(new Uint8Array([0xff, 0xfe, 0xfd, 0xfc]));
+    expect(enc).not.toMatch(/[+/]/);
+    expect(enc).toMatch(/[-_A-Za-z0-9]+/);
+  });
+});
+
+describe('oauth leftovers PKCE plain/S256 soft verifier edges', () => {
+  it('plain rejects unequal verifier/challenge', async () => {
+    expect(await verifyCodeChallenge('aaa', 'bbb', 'plain')).toBe(false);
+  });
+  it('plain accepts identical empty strings', async () => {
+    expect(await verifyCodeChallenge('', '', 'plain')).toBe(true);
+  });
+  it('plain is case-sensitive on verifier', async () => {
+    expect(await verifyCodeChallenge('AbC', 'abc', 'plain')).toBe(false);
+    expect(await verifyCodeChallenge('abc', 'abc', 'plain')).toBe(true);
+  });
+  it('S256 rejects wrong challenge for known verifier', async () => {
+    expect(await verifyCodeChallenge('verifier-1', 'not-the-hash', 'S256')).toBe(false);
+  });
+  it('S256 accepts recomputed challenge', async () => {
+    const verifier = 'soft-cap-verifier-xyz';
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    const challenge = base64UrlEncode(new Uint8Array(hash));
+    expect(await verifyCodeChallenge(verifier, challenge, 'S256')).toBe(true);
+  });
+  it('S256 rejects challenge with trailing padding = leftover', async () => {
+    const verifier = 'pad-check';
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    const challenge = base64UrlEncode(new Uint8Array(hash)) + '=';
+    expect(await verifyCodeChallenge(verifier, challenge, 'S256')).toBe(false);
+  });
+  it('empty method always fails even when plain would match', async () => {
+    expect(await verifyCodeChallenge('x', 'x', '')).toBe(false);
+  });
+});
+
+describe('oauth leftovers escapeHtml compound reliability flood', () => {
+  it('escapes ampersand before other entities (order soft)', () => {
+    expect(escapeHtml('&<>"\'')).toBe('&amp;&lt;&gt;&quot;&#039;');
+  });
+  it('double-escape of already-escaped amp stays literal amp entity text', () => {
+    expect(escapeHtml('&amp;')).toBe('&amp;amp;');
+  });
+  it('empty string stays empty', () => {
+    expect(escapeHtml('')).toBe('');
+  });
+  it('no-op for alphanumeric', () => {
+    expect(escapeHtml('Alice123')).toBe('Alice123');
+  });
+  it('escapes each quote independently in sequence', () => {
+    expect(escapeHtml('""\'\'')).toBe('&quot;&quot;&#039;&#039;');
+  });
+  it('login page embeds escaped error without raw angle brackets', () => {
+    const html = generateLoginPage('c', 'r', 's', '<img src=x onerror=1>');
+    expect(html).toContain(escapeHtml('<img src=x onerror=1>'));
+    expect(html).not.toContain('<img src=x onerror=1>');
+  });
+  it('uia cancelled page embeds escaped server name', () => {
+    const html = generateUiaCancelledPage('srv<script>');
+    expect(html).toContain(escapeHtml('srv<script>'));
+    expect(html).not.toContain('srv<script>');
+    expect(html).toContain('<title>Cancelled - srv&lt;script&gt;</title>');
+  });
+});
+
+describe('push leftovers room_member_count operator soft edges', () => {
+  const base = { type: 'm.room.message', content: {}, sender: '@a:x', room_id: '!r:x' };
+
+  it('== exact match', () => {
+    expect(
+      matchesCondition({ kind: 'room_member_count', is: '==3' }, base, USER, 3)
+    ).toBe(true);
+    expect(
+      matchesCondition({ kind: 'room_member_count', is: '==3' }, base, USER, 2)
+    ).toBe(false);
+  });
+  it('bare number defaults to ==', () => {
+    expect(matchesCondition({ kind: 'room_member_count', is: '2' }, base, USER, 2)).toBe(true);
+    expect(matchesCondition({ kind: 'room_member_count', is: '2' }, base, USER, 3)).toBe(false);
+  });
+  it('< and > boundaries', () => {
+    expect(matchesCondition({ kind: 'room_member_count', is: '<5' }, base, USER, 4)).toBe(true);
+    expect(matchesCondition({ kind: 'room_member_count', is: '<5' }, base, USER, 5)).toBe(false);
+    expect(matchesCondition({ kind: 'room_member_count', is: '>1' }, base, USER, 2)).toBe(true);
+    expect(matchesCondition({ kind: 'room_member_count', is: '>1' }, base, USER, 1)).toBe(false);
+  });
+  it('<= and >= boundaries', () => {
+    expect(matchesCondition({ kind: 'room_member_count', is: '<=2' }, base, USER, 2)).toBe(true);
+    expect(matchesCondition({ kind: 'room_member_count', is: '<=2' }, base, USER, 3)).toBe(false);
+    expect(matchesCondition({ kind: 'room_member_count', is: '>=10' }, base, USER, 10)).toBe(true);
+    expect(matchesCondition({ kind: 'room_member_count', is: '>=10' }, base, USER, 9)).toBe(false);
+  });
+  it('rejects malformed is strings', () => {
+    for (const is of ['', 'abc', '==', '===3', '<>3', '3==', ' 2', '2 ']) {
+      expect(matchesCondition({ kind: 'room_member_count', is }, base, USER, 2)).toBe(false);
+    }
+  });
+  it('missing is → false', () => {
+    expect(matchesCondition({ kind: 'room_member_count' }, base, USER, 1)).toBe(false);
+  });
+});
+
+describe('push leftovers event_property soft failure flood', () => {
+  it('event_property_is false when key missing', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_is', value: 1 },
+        { content: { a: 1 } },
+        USER,
+        1
+      )
+    ).toBe(false);
+  });
+  it('event_property_is strict equality (no coercion)', () => {
+    const ev = { content: { n: 1, s: '1', b: true } };
+    expect(
+      matchesCondition({ kind: 'event_property_is', key: 'content.n', value: '1' }, ev, USER, 1)
+    ).toBe(false);
+    expect(
+      matchesCondition({ kind: 'event_property_is', key: 'content.n', value: 1 }, ev, USER, 1)
+    ).toBe(true);
+    expect(
+      matchesCondition({ kind: 'event_property_is', key: 'content.b', value: true }, ev, USER, 1)
+    ).toBe(true);
+  });
+  it('event_property_contains requires array', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.tags', value: 'a' },
+        { content: { tags: 'a' } },
+        USER,
+        1
+      )
+    ).toBe(false);
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.tags', value: 'a' },
+        { content: { tags: ['a', 'b'] } },
+        USER,
+        1
+      )
+    ).toBe(true);
+  });
+  it('event_property_contains false when value absent', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.tags', value: 'z' },
+        { content: { tags: ['a'] } },
+        USER,
+        1
+      )
+    ).toBe(false);
+  });
+  it('event_match missing key/pattern → false', () => {
+    expect(
+      matchesCondition({ kind: 'event_match', key: 'type' }, msg, USER, 2)
+    ).toBe(false);
+    expect(
+      matchesCondition({ kind: 'event_match', pattern: 'x' }, msg, USER, 2)
+    ).toBe(false);
+  });
+  it('contains_display_name false without body or displayName', () => {
+    expect(
+      matchesCondition(
+        { kind: 'contains_display_name' },
+        { content: {} },
+        USER,
+        2,
+        'Alice'
+      )
+    ).toBe(false);
+    expect(
+      matchesCondition(
+        { kind: 'contains_display_name' },
+        { content: { body: 'hi Alice' } },
+        USER,
+        2
+      )
+    ).toBe(false);
+  });
+});
+
+describe('push leftovers gateway response body soft reliability', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  it('200 with empty body still records last_success', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('', { status: 200 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 });
+    expect(db.updates[0]).toMatchObject({ kind: 'success', ts: NOW });
+  });
+
+  it('200 with non-JSON body still records last_success', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('not-json{{{', { status: 200 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 });
+    expect(db.updates[0].kind).toBe('success');
+  });
+
+  it('204 no-content treated as success path (ok)', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 });
+    expect(db.updates[0].kind).toBe('success');
+  });
+
+  it('continues second pusher after first network failure', async () => {
+    fetchMock
+      .mockRejectedValueOnce(new Error('timeout'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ rejected: [] }), { status: 200 }));
+    const db = createPushDb({
+      pushers: {
+        [PUSH_USER]: [
+          httpPusher({}, { pushkey: 'bad', app_id: 'a' }),
+          httpPusher({}, { pushkey: 'good', app_id: 'b' }),
+        ],
+      },
+    });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 });
+    expect(db.updates).toEqual([
+      expect.objectContaining({ kind: 'failure', pushkey: 'bad' }),
+      expect.objectContaining({ kind: 'success', pushkey: 'good' }),
+    ]);
+  });
+
+  it('missed_calls count is forwarded in payload', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 4, missed_calls: 2 });
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.notification.counts).toEqual({ unread: 4, missed_calls: 2 });
+  });
+});
+
+describe('push leftovers updateThrow / empty pushers reliability', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  it('empty pushers → no fetch and no updates', async () => {
+    const db = createPushDb({ pushers: { [PUSH_USER]: [] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.updates).toEqual([]);
+  });
+
+  it('unknown user with no pusher rows is quiet', async () => {
+    const db = createPushDb({});
+    await sendPushNotification(db, '@nobody:example.com', baseEvent(), { unread: 0 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('updateThrow on success path propagates', async () => {
+    const db = createPushDb({
+      pushers: { [PUSH_USER]: [httpPusher()] },
+      updateThrow: true,
+    });
+    await expect(
+      sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 })
+    ).rejects.toThrow('update fail');
+  });
+
+  it('updateThrow on failure path propagates', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('err', { status: 500 }));
+    const db = createPushDb({
+      pushers: { [PUSH_USER]: [httpPusher()] },
+      updateThrow: true,
+    });
+    await expect(
+      sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 })
+    ).rejects.toThrow('update fail');
+  });
+});
+
+describe('account-data leftovers prepare/empty soft reliability flood', () => {
+  it('throwOnPrepare surfaces for getGlobalAccountData', async () => {
+    const db = createAccountDataDb({ throwOnPrepare: true });
+    await expect(getGlobalAccountData(db, USER)).rejects.toThrow('prepare boom');
+  });
+
+  it('throwOnPrepare surfaces for getRoomAccountData', async () => {
+    const db = createAccountDataDb({ throwOnPrepare: true });
+    await expect(getRoomAccountData(db, USER, '!r:x')).rejects.toThrow('prepare boom');
+  });
+
+  it('throwOnPrepare surfaces for getAccountDataStreamPosition', async () => {
+    const db = createAccountDataDb({ throwOnPrepare: true });
+    await expect(getAccountDataStreamPosition(db)).rejects.toThrow('prepare boom');
+  });
+
+  it('getAllRoomAccountData empty roomIds → {} without prepare', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '!r:x', event_type: 'm.tag', content: '{}' }],
+    });
+    expect(await getAllRoomAccountData(db, USER, [])).toEqual({});
+    expect(db.prepares).toHaveLength(0);
+  });
+
+  it('stream position null → 0', async () => {
+    const db = createAccountDataDb({ streamPosition: null });
+    expect(await getAccountDataStreamPosition(db)).toBe(0);
+  });
+
+  it('stream position 0 is preserved (not coerced via ||)', async () => {
+    const db = createAccountDataDb({ streamPosition: 0 });
+    expect(await getAccountDataStreamPosition(db)).toBe(0);
+  });
+
+  it('since filter excludes rows at exactly since boundary', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '', event_type: 'm.direct', content: '{"a":1}' }],
+      changes: [{ user_id: USER, room_id: '', event_type: 'm.direct', stream_position: 10 }],
+    });
+    expect(await getGlobalAccountData(db, USER, 10)).toEqual([]);
+    expect(await getGlobalAccountData(db, USER, 9)).toEqual([
+      { type: 'm.direct', content: { a: 1 } },
+    ]);
+  });
+});
+
+describe('register leftovers available unicode/whitespace soft reject flood', () => {
+  const rejectCases = [
+    ['leading-space', ' alice'],
+    ['trailing-space', 'alice '],
+    ['tab', 'a\tb'],
+    ['newline', 'a\nb'],
+    ['cr', 'a\rb'],
+    ['nbsp', 'a\u00a0b'],
+    ['emoji', 'alice😀'],
+    ['cyrillic', 'алиса'],
+    ['fullwidth-a', 'ａlice'],
+    ['null-byte', 'a\0b'],
+    ['backslash', 'a\\b'],
+    ['comma', 'a,b'],
+    ['semicolon', 'a;b'],
+    ['parens', 'a(b)'],
+    ['brackets', 'a[b]'],
+  ] as const;
+
+  for (const [label, username] of rejectCases) {
+    it(`rejects soft-invalid localpart (${label})`, async () => {
+      const { status, body } = await availableRequest(
+        availableEnv(createAvailableDb()),
+        `/_matrix/client/v3/register/available?username=${encodeURIComponent(username)}`
+      );
+      expect(status).toBe(400);
+      expect(body.errcode).toBe('M_INVALID_USERNAME');
+    });
+  }
+});
