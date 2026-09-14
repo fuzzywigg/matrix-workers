@@ -1,5 +1,5 @@
 /**
- * TOKENMAXX HEAVY deepen — account-data HTTP routes (account leftover after #124 devices).
+ * TOKENMAXX HEAVY deepen after #131 — account-data leftovers (with login/register/push).
  * Different slice than devices, federation keys/events/S2S, sliding-sync, sync, voip,
  * rooms, oidc, media, relations/threads. Prefer account leftovers over login/push/oauth.
  * Avoids helpers already covered in account-data-helpers.test.ts.
@@ -2913,5 +2913,356 @@ describe('account-data soft-cap flood: stream change row shapes after #124', () 
     expect(db.rows).toHaveLength(1);
     expect(db.changes).toHaveLength(1);
     expect(db.changes[0].stream_position).toBe(8);
+  });
+});
+
+
+// =============================================================================
+// TOKENMAXX HEAVY leftovers after #131 — account-data soft-cap deepen
+// =============================================================================
+
+describe('account-data after #131 — E2EE type classification leftovers', () => {
+  const e2eeTypes = [
+    'm.secret_storage.default_key',
+    'm.secret_storage.key.ABCD',
+    'm.cross_signing.master',
+    'm.cross_signing.self_signing',
+    'm.cross_signing.user_signing',
+    'm.megolm_backup.v1',
+  ];
+
+  it.each(e2eeTypes)('GET %s prefers USER_KEYS DO before KV/D1', async (type) => {
+    const userKeys = createUserKeysStub({
+      accountData: { [type]: { from: 'do', type } },
+    });
+    const accountDataKv = mockKv({
+      [`global:${USER}:${type}`]: JSON.stringify({ from: 'kv' }),
+    });
+    const db = createAccountDataDb({
+      rows: [
+        {
+          user_id: USER,
+          room_id: '',
+          event_type: type,
+          content: JSON.stringify({ from: 'd1' }),
+        },
+      ],
+    });
+    const env = createEnv({ userKeys, accountDataKv, db });
+    const res = await request(env, globalPath(USER_ENC, type));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ from: 'do', type });
+    expect(userKeys.fetches.length).toBeGreaterThan(0);
+  });
+
+  it.each(e2eeTypes)('PUT %s writes DO then KV then D1 + change', async (type) => {
+    const userKeys = createUserKeysStub();
+    const accountDataKv = mockKv();
+    const db = createAccountDataDb({ streamPositions: { account_data: 3 } });
+    const env = createEnv({ userKeys, accountDataKv, db });
+    const body = { marker: type };
+    const res = await request(env, globalPath(USER_ENC, type), jsonInit('PUT', body));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+    expect(userKeys.fetches.some((f) => f.method === 'POST')).toBe(true);
+    expect(accountDataKv.puts.some((p) => p.key === `global:${USER}:${type}`)).toBe(true);
+    expect(db.rows.some((r) => r.event_type === type && r.room_id === '')).toBe(true);
+    expect(db.changes.at(-1)).toMatchObject({
+      user_id: USER,
+      room_id: '',
+      event_type: type,
+      stream_position: 4,
+    });
+  });
+
+  it('non-E2EE type skips DO/KV on GET and reads D1 only', async () => {
+    const userKeys = createUserKeysStub({
+      accountData: { 'm.direct': { should: 'not-read' } },
+    });
+    const accountDataKv = mockKv({
+      [`global:${USER}:m.direct`]: JSON.stringify({ should: 'not-read' }),
+    });
+    const db = createAccountDataDb({
+      rows: [
+        {
+          user_id: USER,
+          room_id: '',
+          event_type: 'm.direct',
+          content: JSON.stringify({ a: '@bob:example.com' }),
+        },
+      ],
+    });
+    const env = createEnv({ userKeys, accountDataKv, db });
+    const res = await request(env, globalPath(USER_ENC, 'm.direct'));
+    expect(res.body).toEqual({ a: '@bob:example.com' });
+    expect(userKeys.fetches).toHaveLength(0);
+  });
+});
+
+describe('account-data after #131 — room membership gate leftovers', () => {
+  it.each(['invite', 'leave', 'ban', 'knock'] as const)(
+    'room GET forbidden when membership=%s',
+    async (membership) => {
+      const db = createAccountDataDb({
+        memberships: [{ room_id: ROOM, user_id: USER, membership }],
+        rows: [
+          {
+            user_id: USER,
+            room_id: ROOM,
+            event_type: 'm.tag',
+            content: '{}',
+          },
+        ],
+      });
+      const env = createEnv({ db });
+      const res = await request(env, roomPath(USER_ENC, ROOM_ENC, 'm.tag'));
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+    }
+  );
+
+  it.each(['invite', 'leave', 'ban'] as const)(
+    'room PUT forbidden when membership=%s',
+    async (membership) => {
+      const db = createAccountDataDb({
+        memberships: [{ room_id: ROOM, user_id: USER, membership }],
+      });
+      const env = createEnv({ db });
+      const before = db.rows.length;
+      const res = await request(
+        env,
+        roomPath(USER_ENC, ROOM_ENC, 'm.tag'),
+        jsonInit('PUT', { tags: {} })
+      );
+      expect(res.status).toBe(403);
+      expect(db.rows).toHaveLength(before);
+      expect(db.changes).toHaveLength(0);
+    }
+  );
+
+  it('missing membership row is forbidden (not 404)', async () => {
+    const db = createAccountDataDb({ memberships: [] });
+    const env = createEnv({ db });
+    const res = await request(env, roomPath(USER_ENC, ROOM_ENC, 'm.fully_read'));
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('account-data after #131 — decode + empty content leftovers', () => {
+  it('decodes percent-encoded type with dots and slashes', async () => {
+    const type = 'im.vector.setting.breadcrumbs';
+    const db = createAccountDataDb({
+      rows: [
+        {
+          user_id: USER,
+          room_id: '',
+          event_type: type,
+          content: JSON.stringify({ recent_rooms: [] }),
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      `/_matrix/client/v3/user/${USER_ENC}/account_data/${encodeURIComponent(type)}`
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ recent_rooms: [] });
+  });
+
+  it('GET corrupt JSON content returns empty object', async () => {
+    const db = createAccountDataDb({
+      rows: [
+        {
+          user_id: USER,
+          room_id: '',
+          event_type: 'm.direct',
+          content: '{not-json',
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const res = await request(env, globalPath(USER_ENC, 'm.direct'));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+  });
+
+  it('PUT empty object then GET round-trips {}', async () => {
+    const db = joinedDb({ streamPositions: { account_data: 1 } });
+    const env = createEnv({ db });
+    await request(env, roomPath(USER_ENC, ROOM_ENC, 'm.tag'), jsonInit('PUT', {}));
+    const get = await request(env, roomPath(USER_ENC, ROOM_ENC, 'm.tag'));
+    expect(get.body).toEqual({});
+  });
+
+  it('PUT array body is stored (spec allows any JSON)', async () => {
+    const db = createAccountDataDb();
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      globalPath(USER_ENC, 'org.example.list'),
+      jsonInit('PUT', [1, 2, 3])
+    );
+    expect(res.status).toBe(200);
+    expect(JSON.parse(db.rows[0].content)).toEqual([1, 2, 3]);
+  });
+});
+
+describe('account-data after #131 — stream position || 1 leftovers', () => {
+  it('missing stream_positions row still records change at position 1', async () => {
+    const db = createAccountDataDb({ missingStreamRow: true, streamPositions: {} });
+    const env = createEnv({ db });
+    await request(env, globalPath(USER_ENC, 'm.direct'), jsonInit('PUT', { x: 1 }));
+    expect(db.changes[0].stream_position).toBe(1);
+  });
+
+  it('concurrent puts increment stream monotonically', async () => {
+    const db = createAccountDataDb({ streamPositions: { account_data: 100 } });
+    const env = createEnv({ db });
+    for (let i = 0; i < 5; i++) {
+      await request(
+        env,
+        globalPath(USER_ENC, `org.example.n${i}`),
+        jsonInit('PUT', { i })
+      );
+    }
+    expect(db.changes.map((c) => c.stream_position)).toEqual([101, 102, 103, 104, 105]);
+  });
+});
+
+describe('account-data after #131 — SQL bind contracts leftovers', () => {
+  it('global GET SELECT binds [userId, type]', async () => {
+    const db = createAccountDataDb({
+      rows: [
+        {
+          user_id: USER,
+          room_id: '',
+          event_type: 'm.ignored_user_list',
+          content: '{}',
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    await request(env, globalPath(USER_ENC, 'm.ignored_user_list'));
+    const sel = db.firsts.find(
+      (f) => f.sql.includes('SELECT content FROM account_data') && f.sql.includes("room_id = ''")
+    );
+    expect(sel?.args).toEqual([USER, 'm.ignored_user_list']);
+  });
+
+  it('room GET SELECT binds [userId, roomId, type]', async () => {
+    const db = joinedDb({
+      rows: [
+        {
+          user_id: USER,
+          room_id: ROOM,
+          event_type: 'm.fully_read',
+          content: JSON.stringify({ event_id: '$e' }),
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    await request(env, roomPath(USER_ENC, ROOM_ENC, 'm.fully_read'));
+    const sel = db.firsts.find(
+      (f) =>
+        f.sql.includes('SELECT content FROM account_data') &&
+        !f.sql.includes("room_id = ''")
+    );
+    expect(sel?.args).toEqual([USER, ROOM, 'm.fully_read']);
+  });
+
+  it('room membership SELECT binds [roomId, userId]', async () => {
+    const db = joinedDb();
+    const env = createEnv({ db });
+    await request(env, roomPath(USER_ENC, ROOM_ENC, 'm.tag'));
+    const mem = db.firsts.find((f) => f.sql.includes('FROM room_memberships'));
+    expect(mem?.args).toEqual([ROOM, USER]);
+  });
+});
+
+describe('account-data after #131 — DO failure + KV fallback leftovers', () => {
+  it('GET falls back to KV when DO get fails', async () => {
+    const type = 'm.cross_signing.master';
+    const userKeys = createUserKeysStub({ failGet: true });
+    const accountDataKv = mockKv({
+      [`global:${USER}:${type}`]: JSON.stringify({ via: 'kv' }),
+    });
+    const env = createEnv({ userKeys, accountDataKv });
+    const res = await request(env, globalPath(USER_ENC, type));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ via: 'kv' });
+  });
+
+  it('GET falls back to D1 when DO and KV miss', async () => {
+    const type = 'm.megolm_backup.v1';
+    const userKeys = createUserKeysStub({ accountData: {} });
+    const accountDataKv = mockKv();
+    const db = createAccountDataDb({
+      rows: [
+        {
+          user_id: USER,
+          room_id: '',
+          event_type: type,
+          content: JSON.stringify({ version: '1' }),
+        },
+      ],
+    });
+    const env = createEnv({ userKeys, accountDataKv, db });
+    const res = await request(env, globalPath(USER_ENC, type));
+    expect(res.body).toEqual({ version: '1' });
+  });
+
+  it('PUT E2EE returns 503 when DO put fails and does not write KV', async () => {
+    const type = 'm.secret_storage.default_key';
+    const userKeys = createUserKeysStub({ failPut: true });
+    const accountDataKv = mockKv();
+    const db = createAccountDataDb();
+    const env = createEnv({ userKeys, accountDataKv, db });
+    const res = await request(
+      env,
+      globalPath(USER_ENC, type),
+      jsonInit('PUT', { key: 'abc' })
+    );
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ errcode: 'M_UNKNOWN' });
+    expect(accountDataKv.puts).toHaveLength(0);
+    expect(db.rows).toHaveLength(0);
+  });
+});
+
+describe('account-data after #131 — forbidden matrix leftovers', () => {
+  it('forbids global PUT for other user without touching storage', async () => {
+    const userKeys = createUserKeysStub();
+    const accountDataKv = mockKv();
+    const db = createAccountDataDb();
+    const env = createEnv({ userKeys, accountDataKv, db });
+    const res = await request(
+      env,
+      globalPath(BOB_ENC, 'm.direct'),
+      jsonInit('PUT', { x: 1 })
+    );
+    expect(res.status).toBe(403);
+    expect(userKeys.fetches).toHaveLength(0);
+    expect(accountDataKv.puts).toHaveLength(0);
+    expect(db.rows).toHaveLength(0);
+  });
+
+  it('errcode vocabulary: forbidden / not found / bad json', async () => {
+    const env = createEnv({ db: joinedDb() });
+    const forbidden = await request(env, globalPath(BOB_ENC, 'm.direct'));
+    expect(forbidden.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+    const missing = await request(env, globalPath(USER_ENC, 'org.example.missing'));
+    expect(missing.status).toBe(404);
+    expect((missing.body as { errcode: string }).errcode).toMatch(/M_NOT_FOUND|M_NOT_FOUND/);
+    const bad = await request(env, globalPath(USER_ENC, 'm.direct'), {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer t',
+      },
+      body: '{',
+    });
+    expect(bad.status).toBe(400);
+    expect(bad.body).toMatchObject({ errcode: 'M_BAD_JSON' });
   });
 });

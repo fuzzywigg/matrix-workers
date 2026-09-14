@@ -1,5 +1,5 @@
 /**
- * TOKENMAXX HEAVY deepen — different slice: login/register API routes.
+ * TOKENMAXX HEAVY deepen after #131 — login/register leftovers (with push/account-data).
  * After #124 (devices). Prefer login leftovers over devices/relations/federation/sync/voip.
  * Tests-only — no product inventing.
  * Exercises login flows, lockout, refresh rotation, register/guest, logout, whoami,
@@ -3483,5 +3483,264 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
     const again = await request(env, '/_matrix/client/v3/register/available?username=slot');
     expect(again.status).toBe(400);
     expect(again.body).toMatchObject({ errcode: 'M_USER_IN_USE' });
+  });
+});
+
+
+// =============================================================================
+// TOKENMAXX HEAVY leftovers after #131 — login/register soft-cap deepen
+// =============================================================================
+
+describe('login/register leftovers after #131 — available + kind matrix', () => {
+  it('available accepts unicode localparts rejected by charset as M_INVALID_USERNAME', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      `/_matrix/client/v3/register/available?username=${encodeURIComponent('alice🚀')}`
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_INVALID_USERNAME' });
+  });
+
+  it('available is case-sensitive: Alice ≠ alice occupancy', async () => {
+    const db = createLoginDb({
+      users: new Map([[USER, seedAlice()]]),
+    });
+    // seedAlice localpart is alice — Alice should be invalid charset (uppercase)
+    const env = envFor(db);
+    const res = await request(env, '/_matrix/client/v3/register/available?username=Alice');
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_INVALID_USERNAME' });
+  });
+
+  it('register kind=user explicit with inhibit_login returns only user_id/home_server', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register?kind=user',
+      jsonInit(
+        'POST',
+        {
+          username: 'kinduser',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: true,
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body as object).sort()).toEqual(['home_server', 'user_id']);
+  });
+
+  it('register guest ignores provided username and still issues opaque mxid', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register?kind=guest',
+      jsonInit(
+        'POST',
+        { username: 'ignored', password: 'Password1', inhibit_login: true },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    const uid = (res.body as { user_id: string }).user_id;
+    expect(uid).toMatch(new RegExp(`^@[^:]+:${SERVER}$`));
+    expect(uid).not.toBe(`@ignored:${SERVER}`);
+    expect(db.users.get(uid)?.is_guest).toBe(1);
+  });
+
+  it('register password strength boundary: 8 chars letter+digit ok', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'bound8',
+          password: 'abcdefgh1',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: true,
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('register UIA session is 16-char opaque and unique', async () => {
+    const env = envFor(createLoginDb());
+    const a = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit('POST', { username: 'u', password: 'Password1' }, '')
+    );
+    const b = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit('POST', { username: 'u', password: 'Password1' }, '')
+    );
+    expect((a.body as { session: string }).session.length).toBeGreaterThanOrEqual(16);
+    expect((a.body as { session: string }).session).not.toBe(
+      (b.body as { session: string }).session
+    );
+  });
+});
+
+describe('login leftovers after #131 — refresh/logout/whoami binds', () => {
+  it('refresh rotates and stores new refresh with 7d TTL', async () => {
+    const oldRefresh = 'syr_rotate';
+    const oldHash = await hashToken(oldRefresh);
+    const sessions = mockKv({
+      [`refresh:${oldHash}`]: JSON.stringify({
+        userId: USER,
+        deviceId: DEVICE,
+        accessTokenId: 'tok-old',
+        createdAt: 1,
+      }),
+    });
+    const db = createLoginDb({
+      users: new Map([[USER, seedAlice()]]),
+      tokens: [
+        {
+          token_id: 'tok-old',
+          token_hash: 'h-old',
+          user_id: USER,
+          device_id: DEVICE,
+          created_at: 1,
+        },
+      ],
+    });
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: oldRefresh }, '')
+    );
+    expect(res.status).toBe(200);
+    expect(sessions.deletes).toContain(`refresh:${oldHash}`);
+    const put = sessions.puts.find((p) => p.key.startsWith('refresh:'));
+    expect(put?.options?.expirationTtl).toBe(7 * 24 * 60 * 60);
+    expect((res.body as { expires_in_ms: number }).expires_in_ms).toBe(3_600_000);
+  });
+
+  it('logout/all only deletes tokens for authenticated user', async () => {
+    const db = createLoginDb({
+      users: new Map([
+        [USER, seedAlice()],
+        [BOB, userRow({ user_id: BOB, localpart: 'bob', password_hash: 'mockok:x' })],
+      ]),
+      tokens: [
+        {
+          token_id: 'a',
+          token_hash: 'ha',
+          user_id: USER,
+          device_id: DEVICE,
+          created_at: 1,
+        },
+        {
+          token_id: 'b',
+          token_hash: 'hb',
+          user_id: BOB,
+          device_id: 'B',
+          created_at: 1,
+        },
+      ],
+    });
+    const env = envFor(db);
+    await request(env, '/_matrix/client/v3/logout/all', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(db.tokens.map((t) => t.token_id)).toEqual(['b']);
+  });
+
+  it('whoami is_guest false for normal user and true for guest', async () => {
+    const normal = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const a = await request(normal, '/_matrix/client/v3/account/whoami');
+    expect(a.body).toMatchObject({ user_id: USER, is_guest: false });
+
+    const guestRow = userRow({
+      user_id: USER,
+      localpart: 'alice',
+      password_hash: null,
+      is_guest: 1,
+    });
+    const guest = envFor(createLoginDb({ users: new Map([[USER, guestRow]]) }));
+    const b = await request(guest, '/_matrix/client/v3/account/whoami');
+    expect(b.body).toMatchObject({ is_guest: true });
+  });
+
+  it('get_token stores login_token with TTL 120', async () => {
+    const sessions = mockKv();
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }), sessions);
+    const res = await request(env, '/_matrix/client/v1/login/get_token', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { expires_in_ms: number }).expires_in_ms).toBe(120_000);
+    expect(sessions.puts[0].options?.expirationTtl).toBe(120);
+    expect(sessions.puts[0].key.startsWith('login_token:')).toBe(true);
+  });
+});
+
+describe('login leftovers after #131 — lockout + password identifier edges', () => {
+  it('attempts 1..4 never set lockedUntil; 5th sets it', async () => {
+    const sessions = mockKv();
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db, sessions);
+    for (let i = 1; i <= 4; i++) {
+      await request(
+        env,
+        '/_matrix/client/v3/login',
+        jsonInit('POST', passwordLoginBody({ password: 'wrong' }), '')
+      );
+      const stored = JSON.parse(sessions.data[`lockout:${USER}`]);
+      expect(stored.attempts).toBe(i);
+      expect(stored.lockedUntil).toBeUndefined();
+    }
+    await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ password: 'wrong' }), '')
+    );
+    const locked = JSON.parse(sessions.data[`lockout:${USER}`]);
+    expect(locked.attempts).toBe(5);
+    expect(typeof locked.lockedUntil).toBe('number');
+  });
+
+  it('full MXID identifier does not rewrite server', async () => {
+    const foreign = '@alice:other.org';
+    const db = createLoginDb({
+      users: new Map([
+        [
+          foreign,
+          userRow({
+            user_id: foreign,
+            localpart: 'alice',
+            password_hash: 'mockok:secret123',
+          }),
+        ],
+      ]),
+    });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        passwordLoginBody({
+          identifier: { type: 'm.id.user', user: foreign },
+        }),
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { user_id: string }).user_id).toBe(foreign);
   });
 });

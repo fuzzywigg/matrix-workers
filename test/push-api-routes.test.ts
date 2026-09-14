@@ -4224,3 +4224,175 @@ describe('notifications SELECT bind arity leftovers', () => {
     expect(sel?.args).toEqual([USER, 4]);
   });
 });
+
+
+// =============================================================================
+// TOKENMAXX HEAVY leftovers after #131 — push soft-cap deepen
+// =============================================================================
+
+describe('push leftovers after #131 — pushers field + append matrix', () => {
+  it('lists omit enabled/user_id columns', async () => {
+    const db = createPushDb({ pushers: [seedPusher()] });
+    const res = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(res.body.pushers[0].enabled).toBeUndefined();
+    expect(res.body.pushers[0].user_id).toBeUndefined();
+  });
+
+  it('append:false replaces same pushkey across app_ids', async () => {
+    const db = createPushDb({
+      pushers: [
+        seedPusher({ pushkey: 'pk', app_id: 'a' }),
+        seedPusher({ pushkey: 'pk', app_id: 'b' }),
+        seedPusher({ pushkey: 'other', app_id: 'a' }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, pushkey: 'pk', app_id: 'c', append: false })
+    );
+    expect(db.pushers.map((p) => `${p.pushkey}:${p.app_id}`).sort()).toEqual([
+      'other:a',
+      'pk:c',
+    ]);
+  });
+
+  it('kind omitted deletes; kind empty-string creates', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: 'd1', app_id: 'im.vector.app' })],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { pushkey: 'd1', app_id: 'im.vector.app' })
+    );
+    expect(db.pushers).toHaveLength(0);
+
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, kind: '' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.pushers[0].kind).toBe('');
+  });
+
+  it('profile_tag empty string stores as null via || null', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, profile_tag: '' })
+    );
+    expect(db.pushers[0].profile_tag).toBeNull();
+  });
+});
+
+describe('push leftovers after #131 — rules kind CRUD matrix', () => {
+  it.each(['override', 'content', 'room', 'sender', 'underride'] as const)(
+    'custom %s rule create→get→delete',
+    async (kind) => {
+      const id =
+        kind === 'room' ? '!r:example.com' : kind === 'sender' ? '@s:example.com' : `rule.${kind}`;
+      const db = createPushDb();
+      const body =
+        kind === 'content'
+          ? { actions: ['notify'], pattern: 'hi' }
+          : { actions: ['dont_notify'] };
+      const put = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/${encodeURIComponent(id)}`,
+        jsonInit('PUT', body)
+      );
+      expect(put.status).toBe(200);
+      const get = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/${encodeURIComponent(id)}`,
+        authGet()
+      );
+      expect(get.status).toBe(200);
+      expect(get.body.rule_id).toBe(id);
+      const del = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/${encodeURIComponent(id)}`,
+        { method: 'DELETE', headers: { Authorization: 'Bearer t' } }
+      );
+      expect(del.status).toBe(200);
+      expect(db.rules).toHaveLength(0);
+    }
+  );
+
+  it('cannot overwrite or delete .m.rule.* defaults', async () => {
+    const db = createPushDb();
+    const put = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.master',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(put.body).toMatchObject({ errcode: 'M_CANNOT_OVERWRITE_DEFAULT' });
+    const del = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.master',
+      { method: 'DELETE', headers: { Authorization: 'Bearer t' } }
+    );
+    expect(del.body).toMatchObject({ errcode: 'M_CANNOT_DELETE_DEFAULT' });
+  });
+
+  it('enabled missing custom rule still 200 (UPDATE 0 rows)', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/ghost/enabled',
+      jsonInit('PUT', { enabled: true })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+  });
+});
+
+describe('push leftovers after #131 — notifications pagination leftovers', () => {
+  it('limit=0 returns empty without next_token', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 1 })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications?limit=0', authGet());
+    expect(res.body).toEqual({ notifications: [] });
+  });
+
+  it('only=highlight filters; other only values do not', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 1, notification_type: 'notify', event_id: '$n' }),
+        seedNotification({ id: 2, notification_type: 'highlight', event_id: '$h' }),
+      ],
+    });
+    const hi = await request(
+      db,
+      '/_matrix/client/v3/notifications?only=highlight',
+      authGet()
+    );
+    expect(hi.body.notifications).toHaveLength(1);
+    expect(hi.body.notifications[0].event.event_id).toBe('$h');
+    const other = await request(
+      db,
+      '/_matrix/client/v3/notifications?only=something',
+      authGet()
+    );
+    expect(other.body.notifications).toHaveLength(2);
+  });
+
+  it('next_token equals last id in DESC page', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 1, created_at: 10, event_id: '$a' }),
+        seedNotification({ id: 2, created_at: 20, event_id: '$b' }),
+        seedNotification({ id: 3, created_at: 30, event_id: '$c' }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications?limit=2', authGet());
+    expect(res.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
+      ['$c', '$b']
+    );
+    expect(res.body.next_token).toBe('2');
+  });
+});
