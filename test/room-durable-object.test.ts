@@ -2115,3 +2115,181 @@ describe('RoomDurableObject hibernation senary typing/receipt/ws leftovers after
     });
   }
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #273/#276 senary — RoomDurableObject
+ * hibernation *septenary* (WS typing false∥true, thread_id ''∥omit).
+ */
+
+describe('RoomDurableObject hibernation septenary typing/thread leftovers after #273', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`WS typing false∥true same user both broadcast flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      state.sockets.push(a, b);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'typing', typing: false })),
+        wsMsg(room, a, JSON.stringify({ type: 'typing', typing: true })),
+      ]);
+
+      const peerTyping = b.sent
+        .map((s) => JSON.parse(s))
+        .filter((m) => m.type === 'typing' && m.user_id === '@a:example.com');
+      expect(peerTyping.length).toBeGreaterThanOrEqual(2);
+      expect(peerTyping.some((m) => m.typing === false)).toBe(true);
+      expect(peerTyping.some((m) => m.typing === true)).toBe(true);
+      // WS path does not touch typingUsers map
+      const typing = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(typing.user_ids).toEqual([]);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`thread_id ''∥omit distinct receipt keys flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              event_id: '$empty',
+              receipt_type: 'm.read',
+              thread_id: '',
+            }),
+          })
+        ),
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              event_id: '$omit',
+              receipt_type: 'm.read',
+            }),
+          })
+        ),
+      ]);
+
+      // '' is not coalesced by ?? → key ends with ':' ; omit → unthreaded
+      expect(state.storage.map.has('receipt:@a:example.com:m.read:')).toBe(true);
+      expect(state.storage.map.has('receipt:@a:example.com:m.read:unthreaded')).toBe(
+        true
+      );
+      const get = (await (await room.fetch(new Request('https://do/receipts'))).json()) as {
+        receipts: Record<
+          string,
+          Record<string, Record<string, { thread_id?: string }>>
+        >;
+      };
+      expect(get.receipts.$empty['m.read']['@a:example.com'].thread_id).toBeUndefined();
+      expect(get.receipts.$omit['m.read']['@a:example.com'].thread_id).toBeUndefined();
+    });
+  }
+});
+
+/**
+ * TOKENMAXX HEAVY leftovers after #281 — RoomDurableObject hibernation
+ * *octonary* (dual ping same socket, typing timeout 0∥GET).
+ */
+
+describe('RoomDurableObject hibernation octonary ping/timeout leftovers after #281', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`dual ping same socket two pongs flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      state.sockets.push(a);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'ping' })),
+        wsMsg(room, a, JSON.stringify({ type: 'ping' })),
+      ]);
+
+      expect(a.sent).toEqual([
+        JSON.stringify({ type: 'pong' }),
+        JSON.stringify({ type: 'pong' }),
+      ]);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`typing timeout 0 expires immediately∥GET flood-${i}`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(20_000);
+      const { do: room } = makeRacingRoomDo();
+
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              typing: true,
+              timeout: 0,
+            }),
+          })
+        ),
+        room.fetch(new Request('https://do/typing')),
+      ]);
+
+      // expiresAt = now + min(0,120000) = now → already expired on GET cleanup
+      const typing = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(typing.user_ids).toEqual([]);
+    });
+  }
+});
+
+/**
+ * TOKENMAXX HEAVY leftovers after #281 — RoomDurableObject hibernation
+ * *nonary* (ping∥close same socket).
+ */
+
+describe('RoomDurableObject hibernation nonary ping/close leftovers after #281', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`ping∥close same socket pong-or-closed LWW flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      state.sockets.push(a, b);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'ping' })),
+        wsClose(room, a, 1000, 'bye'),
+      ]);
+
+      // Ping may land before close (pong) or after (no send); close always sets closed
+      expect(a.closed?.code).toBe(1000);
+      expect(a.sent.length === 0 || a.sent[0] === JSON.stringify({ type: 'pong' })).toBe(
+        true
+      );
+      expect(b.sent.some((s) => JSON.parse(s).type === 'user_disconnected')).toBe(true);
+    });
+  }
+});
