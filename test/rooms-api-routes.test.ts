@@ -896,10 +896,21 @@ describe('POST /_matrix/client/v3/createRoom', () => {
     const res = await request(
       db,
       '/_matrix/client/v3/createRoom',
-      jsonInit('POST', { initial_state: [null] })
+      jsonInit('POST', { initial_state: ['not-an-object'] })
     );
     expect(res.status).toBe(400);
     expect((res.body as { error: string }).error).toContain('must be an object');
+  });
+
+  it('surfaces server error when null initial_state entry crashes encryption pre-check', async () => {
+    // Product code filters s.type before validateStateEvent; null throws TypeError → M_UNKNOWN.
+    const db = createRoomsDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/createRoom',
+      jsonInit('POST', { initial_state: [null] })
+    );
+    expect(res.status).toBe(500);
   });
 });
 
