@@ -112,6 +112,21 @@ jobs:
       - run: npm ci
       - run: npm run test:turn-concurrent
 
+  # Fail-fast canary for room-cache concurrent leftovers
+  # (tridecenary #314 + quattuordecenary #325 + quindecenary #332 +
+  # sexdecenary deepen). Isolates flake attribution before the full suite.
+  room-cache:
+    name: Room-Cache Concurrent Canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:room-cache
+
   test:
     name: Tests
     runs-on: ubuntu-latest
