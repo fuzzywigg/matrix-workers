@@ -294,7 +294,8 @@ function createDeviceListDb(opts: {
                 selectBarrier = undefined;
               }, sql, args);
               if (sql.includes('SELECT response FROM federation_transactions')) {
-                const [txnId, origin] = args as [string, string];
+                // bind(origin, txnId) on SELECT … WHERE origin = ? AND txn_id = ?
+                const [origin, txnId] = args as [string, string];
                 const raw = federationTxns[`${origin}|${txnId}`];
                 return (raw ? { response: raw } : null) as T;
               }
@@ -1051,7 +1052,9 @@ describe('federation-consumer concurrent-race leftovers after #226', () => {
       const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
       fetchMock.mockImplementation(async (url: string) => {
         if (String(url).includes('left.example.com')) {
-          return new Response('x', { status });
+          return status === 204
+            ? new Response(null, { status })
+            : new Response('x', { status });
         }
         return new Response('{}', { status: 200 });
       });
