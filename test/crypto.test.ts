@@ -2051,3 +2051,252 @@ describe('federation signing TOKENMAXX residual octonary leftovers after #330', 
     });
   }
 });
+
+describe('crypto TOKENMAXX residual nonary leftovers after #336', () => {
+  it('verifyPassword wrong-scheme ∥ NaN-iter log ∥ ok stay isolated under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const real = await hashPassword('nonary-ok-1');
+    const [ok, argon, bcrypt, nanIter, emptyScheme] = await Promise.all([
+      verifyPassword('nonary-ok-1', real),
+      verifyPassword('x', '$argon2id$100000$c2FsdA==$aGFzaA=='),
+      verifyPassword('x', '$bcrypt$100000$c2FsdA==$aGFzaA=='),
+      verifyPassword('x', '$pbkdf2-sha256$NaN$c2FsdA==$aGFzaA=='),
+      verifyPassword('x', '$$100000$c2FsdA==$aGFzaA=='),
+    ]);
+    expect(ok).toBe(true);
+    expect(argon).toBe(false);
+    expect(bcrypt).toBe(false);
+    expect(nanIter).toBe(false);
+    expect(emptyScheme).toBe(false);
+    const iterLogs = spy.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes('[crypto] Rejecting stored hash with invalid iteration count:'));
+    // scheme mismatches are silent; only NaN iteration logs
+    expect(iterLogs).toEqual([
+      '[crypto] Rejecting stored hash with invalid iteration count: NaN',
+    ]);
+    spy.mockRestore();
+  });
+
+  it('timingSafeEqual first/last char-diff ∥ unicode combining stay isolated under race', async () => {
+    const [eq, first, last, uniEq, uniNe, emptyNe] = await Promise.all([
+      Promise.resolve(timingSafeEqual('abcd', 'abcd')),
+      Promise.resolve(timingSafeEqual('Xbcd', 'abcd')),
+      Promise.resolve(timingSafeEqual('abcX', 'abcd')),
+      Promise.resolve(timingSafeEqual('e\u0301', 'e\u0301')),
+      Promise.resolve(timingSafeEqual('e\u0301', 'é')), // combining vs precomposed: different code units
+      Promise.resolve(timingSafeEqual('', '0')),
+    ]);
+    expect(eq).toBe(true);
+    expect(first).toBe(false);
+    expect(last).toBe(false);
+    expect(uniEq).toBe(true);
+    expect(uniNe).toBe(false);
+    expect(emptyNe).toBe(false);
+  });
+
+  it('canonicalJson Symbol-keyed object ∥ nested holes ∥ Map-like plain stay deterministic', async () => {
+    const withSym = { visible: 1, [Symbol('hidden')]: 2 };
+    // Array.map skips holes; join then emits empty slots → "[1,,3]" (not null-filled)
+    const sparse = [1];
+    sparse.length = 3;
+    sparse[2] = 3;
+    const [symObj, holes, mapLike, emptySymOnly] = await Promise.all([
+      Promise.resolve(canonicalJson(withSym)),
+      Promise.resolve(canonicalJson(sparse)),
+      Promise.resolve(canonicalJson({ size: 1, data: [] })),
+      Promise.resolve(canonicalJson({ [Symbol.for('x')]: true })),
+    ]);
+    // Object.keys ignores Symbols
+    expect(symObj).toBe('{"visible":1}');
+    expect(holes).toBe('[1,,3]');
+    expect(mapLike).toBe('{"data":[],"size":1}');
+    expect(emptySymOnly).toBe('{}');
+  });
+
+  it('hashPassword unicode ∥ verify wrong/ok ∥ hashToken under race', async () => {
+    const pw = 'pásswörd1!';
+    const [hash, tok, tokAgain] = await Promise.all([
+      hashPassword(pw),
+      hashToken(pw),
+      hashToken(pw),
+    ]);
+    const [ok, wrong, wrongCase] = await Promise.all([
+      verifyPassword(pw, hash),
+      verifyPassword('password1!', hash),
+      verifyPassword('PÁSSWÖRD1!', hash),
+    ]);
+    expect(ok).toBe(true);
+    expect(wrong).toBe(false);
+    expect(wrongCase).toBe(false);
+    expect(tok).toBe(tokAgain);
+    expect(tok).toBe(await sha256(pw));
+    expect(hash).toMatch(/^\$pbkdf2-sha256\$100000\$/);
+  });
+
+  it('calculateContentHash keeps hashes field (not stripped) under race with signatures/unsigned', async () => {
+    const withHashes = {
+      type: 'm.test',
+      content: { body: 'x' },
+      hashes: { sha256: 'keep-me' },
+    };
+    const withSig = {
+      type: 'm.test',
+      content: { body: 'x' },
+      hashes: { sha256: 'keep-me' },
+      signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+      unsigned: { age: 1 },
+    };
+    const withoutHashes = { type: 'm.test', content: { body: 'x' } };
+    const expected = await calculateContentHash(withHashes);
+    const [hKeep, hStrip, hBare, vKeep, vBare] = await Promise.all([
+      calculateContentHash(withHashes),
+      calculateContentHash(withSig),
+      calculateContentHash(withoutHashes),
+      verifyContentHash(withHashes, expected),
+      verifyContentHash(withoutHashes, expected),
+    ]);
+    // signatures/unsigned stripped → same as hashes-only body
+    expect(hKeep).toBe(hStrip);
+    expect(hKeep).toBe(expected);
+    // hashes is hashed (not stripped) → differs from bare body
+    expect(hKeep).not.toBe(hBare);
+    expect(vKeep).toBe(true);
+    expect(vBare).toBe(false);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`hashPassword∥verify∥timingSafeEqual∥canonicalJson flood-${i}`, async () => {
+      const [hash, eq, ne, canon] = await Promise.all([
+        hashPassword(`non-flood-${i}-1`),
+        Promise.resolve(timingSafeEqual(`n-${i}`, `n-${i}`)),
+        Promise.resolve(timingSafeEqual(`n-${i}`, `n-${i}!`)),
+        Promise.resolve(canonicalJson({ i, nest: { z: i, a: i } })),
+      ]);
+      const [ok, wrong] = await Promise.all([
+        verifyPassword(`non-flood-${i}-1`, hash),
+        verifyPassword(`non-flood-${i}-WRONG`, hash),
+      ]);
+      expect(ok).toBe(true);
+      expect(wrong).toBe(false);
+      expect(eq).toBe(true);
+      expect(ne).toBe(false);
+      expect(canon).toBe(`{"i":${i},"nest":{"a":${i},"z":${i}}}`);
+    });
+  }
+});
+
+describe('federation signing TOKENMAXX residual nonary leftovers after #336', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('legacy string privateKey ∥ object-JWK concurrent sign both verify under race', async () => {
+    const legacy = await generateSigningKeyPairLegacy();
+    const modern = await generateSigningKeyPair();
+    const base = { type: 'm.test', content: { path: 'non-legacy' } };
+    const [signedLegacy, signedModern, hash] = await Promise.all([
+      signJson(base, 'legacy.example.com', legacy.keyId, legacy.privateKey),
+      signJson(base, 'modern.example.com', modern.keyId, modern.privateKeyJwk),
+      calculateContentHash(base),
+    ]);
+    const [okL, okM, miss, hashOk] = await Promise.all([
+      verifySignature(signedLegacy, 'legacy.example.com', legacy.keyId, legacy.publicKey),
+      verifySignature(signedModern, 'modern.example.com', modern.keyId, modern.publicKey),
+      verifySignature(signedLegacy, 'modern.example.com', modern.keyId, modern.publicKey),
+      verifyContentHash(base, hash),
+    ]);
+    expect(okL).toBe(true);
+    expect(okM).toBe(true);
+    expect(miss).toBe(false);
+    expect(hashOk).toBe(true);
+  });
+
+  it('empty signatures {} merge ∥ re-sign same keyId overwrites under race', async () => {
+    const pair = await generateSigningKeyPair();
+    const base = {
+      type: 'm.test',
+      content: { path: 'non-empty-sigs' },
+      signatures: {},
+    };
+    const once = await signJson(base, 'ex.com', pair.keyId, pair.privateKeyJwk);
+    const twice = await signJson(
+      { ...once, content: { path: 'non-empty-sigs', v: 2 } },
+      'ex.com',
+      pair.keyId,
+      pair.privateKeyJwk
+    );
+    const sigsOnce = once.signatures as Record<string, Record<string, string>>;
+    const sigsTwice = twice.signatures as Record<string, Record<string, string>>;
+    expect(Object.keys(sigsOnce['ex.com'])).toEqual([pair.keyId]);
+    expect(Object.keys(sigsTwice['ex.com'])).toEqual([pair.keyId]);
+    const [okOnce, okTwiceOnOnceBody, okTwice] = await Promise.all([
+      verifySignature(once, 'ex.com', pair.keyId, pair.publicKey),
+      verifySignature(
+        { ...once, content: { path: 'non-empty-sigs', v: 2 }, signatures: once.signatures },
+        'ex.com',
+        pair.keyId,
+        pair.publicKey
+      ),
+      verifySignature(twice, 'ex.com', pair.keyId, pair.publicKey),
+    ]);
+    expect(okOnce).toBe(true);
+    expect(okTwiceOnOnceBody).toBe(false); // body changed, old sig
+    expect(okTwice).toBe(true);
+    expect(sigsOnce['ex.com'][pair.keyId]).not.toBe(sigsTwice['ex.com'][pair.keyId]);
+  });
+
+  it('verifySignature truncated pubkey ∥ empty server map ∥ valid stay isolated under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.test', content: { ok: true } },
+      'ex.com',
+      keyId,
+      privateKeyJwk
+    );
+    const emptyServer = {
+      ...signed,
+      signatures: { 'ex.com': {} },
+    };
+    const truncPub = publicKey.slice(0, 8);
+    const [ok, emptyMap, trunc] = await Promise.all([
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(emptyServer, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'ex.com', keyId, truncPub),
+    ]);
+    expect(ok).toBe(true);
+    expect(emptyMap).toBe(false);
+    expect(trunc).toBe(false);
+    expect(
+      spy.mock.calls.some((c) => String(c[0]).includes('Signature verification failed'))
+    ).toBe(true);
+    spy.mockRestore();
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`legacy∥modern signJson∥verify∥content-hash flood-${i}`, async () => {
+      const legacy = await generateSigningKeyPairLegacy();
+      const obj = { type: 'm.test', content: { n: i }, unsigned: { age: i } };
+      const [signed, hash] = await Promise.all([
+        signJson(obj, 'ex.com', legacy.keyId, legacy.privateKey),
+        calculateContentHash(obj),
+      ]);
+      const [ok, miss, hashOk] = await Promise.all([
+        verifySignature(signed, 'ex.com', legacy.keyId, legacy.publicKey),
+        verifySignature(signed, 'other.example.com', legacy.keyId, legacy.publicKey),
+        verifyContentHash(obj, hash),
+      ]);
+      expect(ok).toBe(true);
+      expect(miss).toBe(false);
+      expect(hashOk).toBe(true);
+      expect(signed.unsigned).toEqual({ age: i });
+    });
+  }
+});
