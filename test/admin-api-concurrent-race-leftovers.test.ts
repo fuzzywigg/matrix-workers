@@ -1743,8 +1743,38 @@ function createAdminDb(opts: {
               if (sql.includes('UPDATE idp_providers SET')) {
                 const id = args[args.length - 1] as string;
                 const p = idpProviders.find((x) => x.id === id);
-                if (p && sql.includes('name = ?')) {
-                  // best-effort: leave as-is; updates tracked in updates[]
+                if (p) {
+                  let ai = 0;
+                  if (sql.includes('name = ?')) {
+                    p.name = args[ai++] as string;
+                  }
+                  if (sql.includes('issuer_url = ?')) {
+                    p.issuer_url = args[ai++] as string;
+                  }
+                  if (sql.includes('client_id = ?')) {
+                    p.client_id = args[ai++] as string;
+                  }
+                  if (sql.includes('client_secret_encrypted = ?')) {
+                    p.client_secret_encrypted = args[ai++] as string;
+                  }
+                  if (sql.includes('scopes = ?')) {
+                    p.scopes = args[ai++] as string;
+                  }
+                  if (sql.includes('enabled = ?')) {
+                    p.enabled = args[ai++] as number;
+                  }
+                  if (sql.includes('auto_create_users = ?')) {
+                    p.auto_create_users = args[ai++] as number;
+                  }
+                  if (sql.includes('username_claim = ?')) {
+                    p.username_claim = args[ai++] as string;
+                  }
+                  if (sql.includes('display_order = ?')) {
+                    p.display_order = args[ai++] as number;
+                  }
+                  if (sql.includes('icon_url = ?')) {
+                    p.icon_url = (args[ai++] as string | null) ?? null;
+                  }
                   p.updated_at = Date.now();
                 }
               }
