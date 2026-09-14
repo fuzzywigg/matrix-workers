@@ -249,3 +249,111 @@ describe('errors TOKENMAXX leftovers after #226', () => {
     });
   });
 });
+
+describe('errors TOKENMAXX leftovers after #232', () => {
+  it('omits retry_after_ms for NaN and includes it for Infinity / 1', () => {
+    // `if (this.retryAfterMs)` treats NaN as falsy
+    expect(new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'x', 429, Number.NaN).toJSON()).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'x',
+    });
+    expect(
+      new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'x', 429, Number.POSITIVE_INFINITY).toJSON()
+    ).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'x',
+      retry_after_ms: Number.POSITIVE_INFINITY,
+    });
+    expect(Errors.limitExceeded('x', 1).toJSON()).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'x',
+      retry_after_ms: 1,
+    });
+    expect(Errors.limitExceeded('x', 0).toJSON()).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'x',
+    });
+  });
+
+  it('pins exact errcodes for every Errors factory', () => {
+    expect(Errors.forbidden().errcode).toBe(ErrorCodes.M_FORBIDDEN);
+    expect(Errors.unknownToken().errcode).toBe(ErrorCodes.M_UNKNOWN_TOKEN);
+    expect(Errors.missingToken().errcode).toBe(ErrorCodes.M_MISSING_TOKEN);
+    expect(Errors.badJson().errcode).toBe(ErrorCodes.M_BAD_JSON);
+    expect(Errors.notJson().errcode).toBe(ErrorCodes.M_NOT_JSON);
+    expect(Errors.notFound().errcode).toBe(ErrorCodes.M_NOT_FOUND);
+    expect(Errors.limitExceeded().errcode).toBe(ErrorCodes.M_LIMIT_EXCEEDED);
+    expect(Errors.unknown().errcode).toBe(ErrorCodes.M_UNKNOWN);
+    expect(Errors.unrecognized().errcode).toBe(ErrorCodes.M_UNRECOGNIZED);
+    expect(Errors.unauthorized().errcode).toBe(ErrorCodes.M_UNAUTHORIZED);
+    expect(Errors.userDeactivated().errcode).toBe(ErrorCodes.M_USER_DEACTIVATED);
+    expect(Errors.userInUse().errcode).toBe(ErrorCodes.M_USER_IN_USE);
+    expect(Errors.invalidUsername().errcode).toBe(ErrorCodes.M_INVALID_USERNAME);
+    expect(Errors.roomInUse().errcode).toBe(ErrorCodes.M_ROOM_IN_USE);
+    expect(Errors.invalidRoomState().errcode).toBe(ErrorCodes.M_INVALID_ROOM_STATE);
+    expect(Errors.unsupportedRoomVersion().errcode).toBe(ErrorCodes.M_UNSUPPORTED_ROOM_VERSION);
+    expect(Errors.guestAccessForbidden().errcode).toBe(ErrorCodes.M_GUEST_ACCESS_FORBIDDEN);
+    expect(Errors.missingParam('p').errcode).toBe(ErrorCodes.M_MISSING_PARAM);
+    expect(Errors.invalidParam('p').errcode).toBe(ErrorCodes.M_INVALID_PARAM);
+    expect(Errors.tooLarge().errcode).toBe(ErrorCodes.M_TOO_LARGE);
+    expect(Errors.conflict().errcode).toBe(ErrorCodes.M_CONFLICT);
+  });
+
+  it('invalidParam default message embeds the parameter name exactly', () => {
+    expect(Errors.invalidParam('limit').message).toBe('Invalid parameter: limit');
+    expect(Errors.invalidParam('user_id', 'must be MXID').message).toBe('must be MXID');
+  });
+
+  it('withErrorHandler passes through limitExceeded retry_after_ms in the Response body', async () => {
+    const res = (await withErrorHandler(async () => {
+      throw Errors.limitExceeded('slow', 1500);
+    })) as Response;
+    expect(res.status).toBe(429);
+    await expect(res.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'slow',
+      retry_after_ms: 1500,
+    });
+  });
+
+  it('withErrorHandler returns a successful Response value as-is', async () => {
+    const ok = jsonResponse({ ok: true }, 201);
+    const res = await withErrorHandler(async () => ok);
+    expect(res).toBe(ok);
+    expect((res as Response).status).toBe(201);
+  });
+
+  it('jsonResponse with undefined yields an empty body; null serializes as JSON null', async () => {
+    // JSON.stringify(undefined) is undefined → Response body is empty
+    const undef = jsonResponse(undefined);
+    expect(undef.status).toBe(200);
+    await expect(undef.text()).resolves.toBe('');
+    const res = jsonResponse(null, 200);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toBeNull();
+  });
+
+  it('emptyResponse always sets application/json Content-Type', () => {
+    expect(emptyResponse().headers.get('Content-Type')).toBe('application/json');
+    expect(emptyResponse(201).headers.get('Content-Type')).toBe('application/json');
+  });
+
+  it('Errors factories return distinct MatrixApiError instances each call', () => {
+    const a = Errors.forbidden();
+    const b = Errors.forbidden();
+    expect(a).not.toBe(b);
+    expect(a).toBeInstanceOf(MatrixApiError);
+    expect(a).toBeInstanceOf(Error);
+  });
+
+  it('withErrorHandler maps null throws to M_UNKNOWN and logs them', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = (await withErrorHandler(async () => {
+      throw null;
+    })) as Response;
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toMatchObject({ errcode: 'M_UNKNOWN' });
+    expect(spy).toHaveBeenCalledWith('Unexpected error:', null);
+    spy.mockRestore();
+  });
+});

@@ -678,3 +678,225 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #226', () => {
     expect(servers).toEqual(['a.b.example.com', 'matrix.org', 'a.b.example.com']);
   });
 });
+
+describe('notify / auth-chain / servers TOKENMAXX leftovers after #232', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  function makeNotifyEnv(
+    members: string[],
+    opts?: {
+      failUsers?: Set<string>;
+      captureRequests?: Array<{ method: string; contentType: string | null; body: unknown }>;
+    }
+  ) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(..._args: unknown[]) {
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            opts?.captureRequests?.push({
+              method: req.method,
+              contentType: req.headers.get('Content-Type'),
+              body,
+            });
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('notifyUsersOfEvent POSTs application/json with event/room/type fields', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const captureRequests: Array<{ method: string; contentType: string | null; body: unknown }> =
+      [];
+    const env = makeNotifyEnv(['@alice:example.com'], { captureRequests });
+    await notifyUsersOfEvent(env, '!r:example.com', '$evt', 'm.room.member');
+    expect(captureRequests).toEqual([
+      {
+        method: 'POST',
+        contentType: 'application/json',
+        body: {
+          event_id: '$evt',
+          room_id: '!r:example.com',
+          type: 'm.room.member',
+          timestamp: NOW,
+        },
+      },
+    ]);
+  });
+
+  it('notifyUsersOfEvent logs per-user Sync DO failures with the user id', async () => {
+    const env = makeNotifyEnv(['@ok:example.com', '@bad:example.com'], {
+      failUsers: new Set(['@bad:example.com']),
+    });
+    await notifyUsersOfEvent(env, '!r:example.com', '$e', 'm.room.message');
+    expect(env.notifies.map((n: { userId: string }) => n.userId)).toEqual(['@ok:example.com']);
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @bad:example.com of event:',
+      expect.any(Error)
+    );
+  });
+
+  it('notifyUsersOfEvent outer catch logs a stable prefix when membership query throws', async () => {
+    const env = {
+      DB: {
+        prepare() {
+          throw new Error('prepare boom');
+        },
+      },
+      SYNC: { idFromName: () => ({}), get: () => ({}) },
+    } as any;
+    await expect(
+      notifyUsersOfEvent(env, '!r:example.com', '$e', 'm.room.message')
+    ).resolves.toBeUndefined();
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify users of event:',
+      expect.any(Error)
+    );
+  });
+
+  it('getStateAtEvent ignores non-state auth events (missing state_key)', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$leaf',
+        pdu('$leaf', ['$create', '$msg'], {
+          type: 'm.room.message',
+          state_key: undefined,
+          content: { body: 'hi', msgtype: 'm.text' },
+        }),
+      ],
+      [
+        '$create',
+        pdu('$create', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:ex.com' },
+        }),
+      ],
+      [
+        '$msg',
+        pdu('$msg', [], {
+          type: 'm.room.message',
+          state_key: undefined,
+          content: { body: 'prior', msgtype: 'm.text' },
+        }),
+      ],
+    ]);
+    // Delete state_key so it is truly undefined (pdu helper may not set it)
+    delete (events.get('$msg') as { state_key?: string }).state_key;
+    delete (events.get('$leaf') as { state_key?: string }).state_key;
+    const state = await getStateAtEvent(createAuthChainDb(events), '$leaf');
+    expect(state.map((e) => e.event_id)).toEqual(['$create']);
+  });
+
+  it('getAuthChain warns when the 500-event cap aborts a deep linear traversal', async () => {
+    const events = new Map<string, PDU>();
+    for (let i = 0; i < 520; i++) {
+      events.set(`$${i}`, pdu(`$${i}`, i === 0 ? [] : [`$${i - 1}`]));
+    }
+    const chain = await getAuthChain(createAuthChainDb(events), ['$519']);
+    expect(chain).toHaveLength(500);
+    expect(console.warn).toHaveBeenCalledWith(
+      '[getAuthChain] reached MAX_AUTH_CHAIN_SIZE cap',
+      500,
+      'aborting traversal'
+    );
+  });
+
+  it('parallel getAuthChain calls on disjoint tips stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      ['$a1', pdu('$a1', ['$a0'])],
+      ['$a0', pdu('$a0', [])],
+      ['$b1', pdu('$b1', ['$b0'])],
+      ['$b0', pdu('$b0', [])],
+    ]);
+    const db = createAuthChainDb(events);
+    const [a, b] = await Promise.all([getAuthChain(db, ['$a1']), getAuthChain(db, ['$b1'])]);
+    expect(a.map((e) => e.event_id)).toEqual(['$a1', '$a0']);
+    expect(b.map((e) => e.event_id)).toEqual(['$b1', '$b0']);
+  });
+
+  it('getServersInRoomsWithUser drops null server_name rows from the result list', async () => {
+    const db = {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async all<T>() {
+                return {
+                  results: [
+                    { server_name: null },
+                    { server_name: 'peer.example.com' },
+                    { server_name: null },
+                  ] as T[],
+                };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    await expect(getServersInRoomsWithUser(db, '@alice:example.com')).resolves.toEqual([
+      'peer.example.com',
+    ]);
+  });
+
+  it('getAuthChain with duplicate seed ids across a diamond still visits each node once', async () => {
+    const events = new Map<string, PDU>([
+      ['$tip', pdu('$tip', ['$l', '$r'])],
+      ['$l', pdu('$l', ['$root'])],
+      ['$r', pdu('$r', ['$root'])],
+      ['$root', pdu('$root', [])],
+    ]);
+    const chain = await getAuthChain(createAuthChainDb(events), ['$tip', '$tip', '$l']);
+    expect(new Set(chain.map((e) => e.event_id)).size).toBe(4);
+    expect(chain.map((e) => e.event_id).sort()).toEqual(['$l', '$r', '$root', '$tip'].sort());
+  });
+
+  it('notifyUsersOfEvent with a single member still logs the notify line', async () => {
+    const env = makeNotifyEnv(['@solo:example.com']);
+    await notifyUsersOfEvent(env, '!r:example.com', '$solo', 'm.room.message');
+    expect(env.notifies).toHaveLength(1);
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      1,
+      'users of event',
+      '$solo',
+      'users:',
+      '@solo:example.com'
+    );
+  });
+});

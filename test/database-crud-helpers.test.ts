@@ -2638,3 +2638,227 @@ describe('database CRUD TOKENMAXX leftovers after #226', () => {
     expect(event?.state_key).toBeUndefined();
   });
 });
+
+describe('database CRUD TOKENMAXX leftovers after #232', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('storeEvent treats explicit null state_key as state (updates room_state)', async () => {
+    // state_key !== undefined gate — null is a defined value and still writes room_state
+    const db = createCrudDb();
+    const event = pdu({
+      event_id: '$null-sk',
+      type: 'm.room.name',
+      content: { name: 'Lobby' },
+    });
+    (event as { state_key: string | null }).state_key = null;
+    await storeEvent(db, event);
+    expect(db._state.events[0].state_key).toBeNull();
+    expect(db._state.roomState.get(`${ROOM}\0m.room.name\0null`)).toBe('$null-sk');
+  });
+
+  it('concurrent storeEvent allocates distinct monotonically increasing stream ids', async () => {
+    const db = createCrudDb();
+    const streams = await Promise.all([
+      storeEvent(db, pdu({ event_id: '$p1', type: 'm.room.message', content: { body: '1' } })),
+      storeEvent(db, pdu({ event_id: '$p2', type: 'm.room.message', content: { body: '2' } })),
+      storeEvent(db, pdu({ event_id: '$p3', type: 'm.room.message', content: { body: '3' } })),
+    ]);
+    expect(new Set(streams).size).toBe(3);
+    expect(streams.sort((a, b) => a - b)).toEqual([1, 2, 3]);
+    expect(db._state.events).toHaveLength(3);
+  });
+
+  it('storeEventIdempotent concurrent same event_id collapses to one inserted winner', async () => {
+    const db = createCrudDb();
+    const event = pdu({
+      event_id: '$same',
+      type: 'm.room.topic',
+      state_key: '',
+      content: { topic: 'x' },
+    });
+    const [a, b] = await Promise.all([
+      storeEventIdempotent(db, event),
+      storeEventIdempotent(db, event),
+    ]);
+    const winners = [a, b].filter((r) => r.inserted);
+    const losers = [a, b].filter((r) => !r.inserted);
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(losers[0].streamOrdering).toBeNull();
+    expect(db._state.events.filter((e) => e.event_id === '$same')).toHaveLength(1);
+  });
+
+  it('getEventsByIds returns only found ids and ignores unknown placeholders', async () => {
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(pdu({ event_id: '$a', type: 'm.room.message' }), 1),
+        eventRowFromPdu(pdu({ event_id: '$c', type: 'm.room.message' }), 2),
+      ],
+    });
+    const got = await getEventsByIds(db, ['$a', '$missing', '$c', '$a']);
+    expect(got.map((e) => e.event_id).sort()).toEqual(['$a', '$c']);
+  });
+
+  it('getEventsSince with limit 0 returns an empty page', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$e1', type: 'm.room.message' }), 1)],
+    });
+    await expect(getEventsSince(db, ROOM, 0, 0)).resolves.toEqual([]);
+  });
+
+  it('validateEventSize soft-cap error message includes the byte count', () => {
+    const event = pdu({
+      event_id: '$big',
+      type: 'm.room.message',
+      content: { body: 'x'.repeat(70_000) },
+    });
+    try {
+      validateEventSize(event);
+      expect.unreachable('should throw');
+    } catch (err) {
+      const e = err as MatrixApiError;
+      expect(e.errcode).toBe('M_TOO_LARGE');
+      expect(e.status).toBe(413);
+      expect(e.message).toMatch(/65536/);
+      expect(e.message).toMatch(/got \d+/);
+    }
+  });
+
+  it('updateUserProfile can update avatar_url alone without touching display_name', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: 'Alice',
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    await updateUserProfile(db, USER, undefined, 'mxc://example.com/new');
+    expect(db._state.users[0].display_name).toBe('Alice');
+    expect(db._state.users[0].avatar_url).toBe('mxc://example.com/new');
+    expect(db._state.runs.filter((r) => r.sql.includes('avatar_url'))).toHaveLength(1);
+    expect(db._state.runs.filter((r) => r.sql.includes('display_name'))).toHaveLength(0);
+  });
+
+  it('getRoomEvents forwards with fromToken pages oldest-first after the cursor', async () => {
+    const db = createCrudDb({
+      events: [1, 2, 3, 4, 5].map((n) =>
+        eventRowFromPdu(pdu({ event_id: `$${n}`, type: 'm.room.message' }), n)
+      ),
+    });
+    const { events, end } = await getRoomEvents(db, ROOM, 2, 2, 'f');
+    expect(events.map((e) => e.event_id)).toEqual(['$3', '$4']);
+    expect(end).toBe(4);
+  });
+
+  it('createUser guest stamps Date.now for created_at and updated_at', async () => {
+    const db = createCrudDb();
+    await createUser(db, USER, 'alice', null, true);
+    expect(db._state.users[0]).toMatchObject({
+      is_guest: 1,
+      password_hash: null,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+  });
+
+  it('getRoomMembers with membership filter returns mapped display fields', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$1',
+          display_name: 'Alice',
+          avatar_url: 'mxc://example.com/a',
+        },
+        {
+          room_id: ROOM,
+          user_id: BOB,
+          membership: 'invite',
+          event_id: '$2',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    const joined = await getRoomMembers(db, ROOM, 'join');
+    expect(joined).toEqual([
+      {
+        userId: USER,
+        membership: 'join',
+        displayName: 'Alice',
+        avatarUrl: 'mxc://example.com/a',
+      },
+    ]);
+  });
+
+  it('deleteRoomAlias then getRoomByAlias is null; recreate binds creator', async () => {
+    const db = createCrudDb();
+    await createRoomAlias(db, '#lobby:example.com', ROOM, USER);
+    await deleteRoomAlias(db, '#lobby:example.com');
+    await expect(getRoomByAlias(db, '#lobby:example.com')).resolves.toBeNull();
+    await createRoomAlias(db, '#lobby:example.com', ROOM, BOB);
+    await expect(getRoomByAlias(db, '#lobby:example.com')).resolves.toBe(ROOM);
+    expect(db._state.aliases[0].creator_id).toBe(BOB);
+  });
+
+  it('getUserByLocalpart returns null for unknown localpart without preparing cross-user rows', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: null,
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    await expect(getUserByLocalpart(db, 'bob')).resolves.toBeNull();
+    await expect(getUserByLocalpart(db, 'alice')).resolves.toMatchObject({ user_id: USER });
+  });
+
+  it('updateMembership replaces prior membership for the same room/user pair', async () => {
+    const db = createCrudDb();
+    await updateMembership(db, ROOM, USER, 'invite', '$inv', 'Alice');
+    await updateMembership(db, ROOM, USER, 'join', '$join', 'Alice', 'mxc://example.com/a');
+    expect(db._state.memberships).toHaveLength(1);
+    expect(db._state.memberships[0]).toMatchObject({
+      membership: 'join',
+      event_id: '$join',
+      display_name: 'Alice',
+      avatar_url: 'mxc://example.com/a',
+    });
+  });
+
+  it('getLatestStreamPosition ignores other rooms only via global MAX', async () => {
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(pdu({ event_id: '$a', type: 'm.room.message', room_id: '!a:example.com' }), 3),
+        eventRowFromPdu(pdu({ event_id: '$b', type: 'm.room.message', room_id: '!b:example.com' }), 9),
+      ],
+    });
+    // Global max across all rooms (sync cursor semantics)
+    await expect(getLatestStreamPosition(db)).resolves.toBe(9);
+  });
+});
