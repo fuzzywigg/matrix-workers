@@ -1,7 +1,13 @@
 /**
- * TOKENMAXX HEAVY leftovers after #149 — devices API soft/edge/reliability.
- * Complements devices-api-routes.test.ts. Tests-only — no product inventing.
+ * TOKENMAXX HEAVY leftovers after #149 / deepen after #232 — devices API
+ * soft/edge/reliability. Complements devices-api-routes.test.ts and residual
+ * concurrent-race leftovers. Tests-only — no product inventing.
  * Fixtures use example.com only.
+ *
+ * Deepen after #232: non-password auth delete soft flood, auth:{} / auth:null,
+ * null display_name, CURRENT self-delete, cascade order, session ignored,
+ * delete_devices null/duplicate ids, PUT preserves last_seen, case-sensitive
+ * device ids, empty-string password, SSO/token/dummy auth matrix.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -2821,4 +2827,393 @@ describe('devices leftovers lifecycle soft floods after #149', () => {
     expect(del.status).toBe(200);
     expect(db.devices.find((d) => d.device_id === 'L19')).toBeUndefined();
   });
+});
+
+// ---------------------------------------------------------------------------
+// deepen devices-api route leftovers after #232
+// ---------------------------------------------------------------------------
+
+describe('devices leftovers non-password auth DELETE soft flood after #232', () => {
+  const types = [
+    'm.login.dummy',
+    'm.login.sso',
+    'm.login.token',
+    'm.login.email.requestToken',
+    'm.login.application_service',
+  ];
+  for (let i = 0; i < 20; i++) {
+    it(`non-password auth DELETE soft-${i}`, async () => {
+      const type = types[i % types.length];
+      const id = `NP${i}`;
+      vi.mocked(verifyPassword).mockClear();
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/devices/${id}`,
+        jsonInit('DELETE', { auth: { type, session: `s-${i}` } })
+      );
+      expect(res.status).toBe(200);
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(db.devices.find((d) => d.device_id === id)).toBeUndefined();
+      expect(db.deletes.map((d) => d.sql)).toEqual([
+        expect.stringContaining('DELETE FROM access_tokens'),
+        expect.stringContaining('DELETE FROM device_keys'),
+        expect.stringContaining('DELETE FROM devices'),
+      ]);
+    });
+  }
+});
+
+describe('devices leftovers auth:{} / auth:null DELETE soft flood after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`auth:{} DELETE soft-${i}`, async () => {
+      const id = `AE${i}`;
+      vi.mocked(verifyPassword).mockClear();
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/devices/${id}`,
+        jsonInit('DELETE', { auth: {} })
+      );
+      expect(res.status).toBe(200);
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(db.devices).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`auth:null DELETE → UIA soft-${i}`, async () => {
+      const id = `AN${i}`;
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/devices/${id}`,
+        jsonInit('DELETE', { auth: null })
+      );
+      expect(res.status).toBe(401);
+      expect((res.body as { flows: unknown }).flows).toEqual([{ stages: ['m.login.password'] }]);
+      expect(typeof (res.body as { session: string }).session).toBe('string');
+      expect(db.devices).toHaveLength(1);
+      expect(db.deletes).toHaveLength(0);
+    });
+  }
+});
+
+describe('devices leftovers null display_name PUT soft flood after #232', () => {
+  for (let i = 0; i < 16; i++) {
+    it(`PUT display_name null soft-${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ display_name: `before-${i}` })],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/devices/PHONE',
+        jsonInit('PUT', { display_name: null })
+      );
+      expect(res.status).toBe(200);
+      expect(db.devices[0].display_name).toBeNull();
+      expect(db.updates).toHaveLength(1);
+      expect(db.updates[0].args[0]).toBeNull();
+    });
+  }
+});
+
+describe('devices leftovers CURRENT self-delete soft flood after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`DELETE CURRENT device soft-${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [
+          seedDevice({ device_id: 'CURRENT', display_name: `cur-${i}` }),
+          seedDevice({ device_id: 'OTHER', display_name: 'keep' }),
+        ],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/devices/CURRENT',
+        jsonInit('DELETE', { auth: { type: 'm.login.password', password: 's3cret' } })
+      );
+      expect(res.status).toBe(200);
+      expect(db.devices.map((d) => d.device_id)).toEqual(['OTHER']);
+    });
+  }
+});
+
+describe('devices leftovers cascade order soft flood after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`DELETE cascade tokens→keys→devices soft-${i}`, async () => {
+      const id = `C${i}`;
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/devices/${id}`,
+        jsonInit('DELETE', { auth: { type: 'm.login.password', password: 's3cret' } })
+      );
+      expect(res.status).toBe(200);
+      expect(db.deletes).toHaveLength(3);
+      expect(db.deletes[0].sql).toContain('access_tokens');
+      expect(db.deletes[1].sql).toContain('device_keys');
+      expect(db.deletes[2].sql).toContain('DELETE FROM devices');
+      expect(db.deletes.every((d) => d.args[0] === USER && d.args[1] === id)).toBe(true);
+    });
+  }
+});
+
+describe('devices leftovers session ignored on password auth soft flood after #232', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`password auth ignores session soft-${i}`, async () => {
+      const id = `S${i}`;
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/devices/${id}`,
+        jsonInit('DELETE', {
+          auth: {
+            type: 'm.login.password',
+            password: 's3cret',
+            session: `made-up-${i}`,
+          },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(db.devices).toHaveLength(0);
+    });
+  }
+});
+
+describe('devices leftovers empty-string password soft flood after #232', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`empty password rejected soft-${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: `EP${i}` })] });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/devices/EP${i}`,
+        jsonInit('DELETE', { auth: { type: 'm.login.password', password: '' } })
+      );
+      expect(res.status).toBe(403);
+      expect((res.body as { errcode: string }).errcode).toBe('M_FORBIDDEN');
+      expect(db.deletes).toHaveLength(0);
+      expect(db.devices).toHaveLength(1);
+    });
+  }
+});
+
+describe('devices leftovers PUT preserves last_seen soft flood after #232', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`PUT display_name preserves last_seen soft-${i}`, async () => {
+      const ts = 1_700_000_000_000 + i;
+      const ip = `203.0.113.${i + 1}`;
+      const db = createDevicesDb({
+        devices: [
+          seedDevice({
+            display_name: `old-${i}`,
+            last_seen_ts: ts,
+            last_seen_ip: ip,
+          }),
+        ],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/devices/PHONE',
+        jsonInit('PUT', { display_name: `new-${i}` })
+      );
+      expect(res.status).toBe(200);
+      expect(db.devices[0]).toMatchObject({
+        display_name: `new-${i}`,
+        last_seen_ts: ts,
+        last_seen_ip: ip,
+      });
+      const got = await request(db, '/_matrix/client/v3/devices/PHONE');
+      expect(got.body).toMatchObject({
+        display_name: `new-${i}`,
+        last_seen_ts: ts,
+        last_seen_ip: ip,
+      });
+    });
+  }
+});
+
+describe('devices leftovers case-sensitive device id soft flood after #232', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`case-differing device id 404 soft-${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ device_id: `Phone${i}` })],
+      });
+      const res = await request(db, `/_matrix/client/v3/devices/phone${i}`);
+      expect(res.status).toBe(404);
+      expect((res.body as { errcode: string }).errcode).toBe('M_NOT_FOUND');
+    });
+  }
+});
+
+describe('devices leftovers delete_devices null/duplicate/bulk edges after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`delete_devices null devices soft-${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice()] });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/delete_devices',
+        jsonInit('POST', { devices: null, auth: { type: 'm.login.dummy' } })
+      );
+      expect(res.status).toBe(400);
+      expect((res.body as { errcode: string }).errcode).toBe('M_MISSING_PARAM');
+      expect(db.devices).toHaveLength(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`delete_devices duplicate ids soft-${i}`, async () => {
+      const id = `DUP${i}`;
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/delete_devices',
+        jsonInit('POST', {
+          devices: [id, id, id],
+          auth: { type: 'm.login.password', password: 's3cret' },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(db.devices).toHaveLength(0);
+      // three cascade triples (tokens/keys/device) for each list entry
+      expect(db.deletes).toHaveLength(9);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`delete_devices auth:null → UIA soft-${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: `DN${i}` })] });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/delete_devices',
+        jsonInit('POST', { devices: [`DN${i}`], auth: null })
+      );
+      expect(res.status).toBe(401);
+      expect(db.deletes).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`delete_devices auth:{} soft-${i}`, async () => {
+      const id = `DE${i}`;
+      vi.mocked(verifyPassword).mockClear();
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/delete_devices',
+        jsonInit('POST', { devices: [id], auth: {} })
+      );
+      expect(res.status).toBe(200);
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(db.devices).toHaveLength(0);
+    });
+  }
+});
+
+describe('devices leftovers PUT omit vs empty-string vs extra fields after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`PUT {} omits UPDATE soft-${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ display_name: `keep-${i}` })],
+      });
+      const res = await request(db, '/_matrix/client/v3/devices/PHONE', jsonInit('PUT', {}));
+      expect(res.status).toBe(200);
+      expect(db.updates).toHaveLength(0);
+      expect(db.devices[0].display_name).toBe(`keep-${i}`);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`PUT empty-string display_name soft-${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ display_name: `was-${i}` })],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/devices/PHONE',
+        jsonInit('PUT', { display_name: '' })
+      );
+      expect(res.status).toBe(200);
+      expect(db.devices[0].display_name).toBe('');
+      const got = await request(db, '/_matrix/client/v3/devices/PHONE');
+      expect(got.body).toEqual({ device_id: 'PHONE' });
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`PUT ignores extra fields soft-${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [
+          seedDevice({
+            display_name: `x-${i}`,
+            last_seen_ts: 99,
+            last_seen_ip: '10.0.0.1',
+          }),
+        ],
+      });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/devices/PHONE',
+        jsonInit('PUT', {
+          display_name: `y-${i}`,
+          last_seen_ts: 1,
+          last_seen_ip: 'hack',
+          device_id: 'OTHER',
+          user_id: '@eve:example.com',
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(db.devices[0]).toMatchObject({
+        device_id: 'PHONE',
+        user_id: USER,
+        display_name: `y-${i}`,
+        last_seen_ts: 99,
+        last_seen_ip: '10.0.0.1',
+      });
+    });
+  }
+});
+
+describe('devices leftovers DELETE invalid JSON → UIA soft flood after #232', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`DELETE bad JSON body → UIA soft-${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: `BJ${i}` })] });
+      const res = await request(db, `/_matrix/client/v3/devices/BJ${i}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', ...AUTH },
+        body: '{not-json',
+      });
+      expect(res.status).toBe(401);
+      expect((res.body as { flows: unknown }).flows).toEqual([{ stages: ['m.login.password'] }]);
+      expect(db.devices).toHaveLength(1);
+    });
+  }
+});
+
+describe('devices leftovers cross-user isolation soft flood after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`GET/PUT/DELETE other-user same device_id soft-${i}`, async () => {
+      const id = `SHARED${i}`;
+      const db = createDevicesDb({
+        devices: [
+          seedDevice({ device_id: id, user_id: '@bob:example.com', display_name: 'bob' }),
+        ],
+      });
+      const got = await request(db, `/_matrix/client/v3/devices/${id}`);
+      expect(got.status).toBe(404);
+      const put = await request(
+        db,
+        `/_matrix/client/v3/devices/${id}`,
+        jsonInit('PUT', { display_name: 'hack' })
+      );
+      expect(put.status).toBe(404);
+      const del = await request(
+        db,
+        `/_matrix/client/v3/devices/${id}`,
+        jsonInit('DELETE', { auth: { type: 'm.login.dummy' } })
+      );
+      expect(del.status).toBe(404);
+      expect(db.devices).toHaveLength(1);
+      expect(db.devices[0].display_name).toBe('bob');
+    });
+  }
 });
