@@ -1579,3 +1579,33 @@ describe('notify / auth-chain / servers TOKENMAXX residual leftovers after #272'
     );
   });
 });
+
+describe('notify / auth-chain TOKENMAXX residual second-wave leftovers after #282', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('concurrent getAuthChain([]) does not poison a capped sibling chain', async () => {
+    const deep = new Map<string, PDU>();
+    for (let i = 0; i < 520; i++) {
+      deep.set(`$d${i}`, pdu(`$d${i}`, i === 0 ? [] : [`$d${i - 1}`]));
+    }
+    const db = createAuthChainDb(deep);
+    const [empty, capped] = await Promise.all([
+      getAuthChain(db, []),
+      getAuthChain(db, ['$d519']),
+    ]);
+    expect(empty).toEqual([]);
+    expect(capped).toHaveLength(500);
+    expect(console.warn).toHaveBeenCalledWith(
+      '[getAuthChain] reached MAX_AUTH_CHAIN_SIZE cap',
+      500,
+      'aborting traversal'
+    );
+  });
+});

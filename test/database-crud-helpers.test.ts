@@ -3696,3 +3696,104 @@ describe('database CRUD TOKENMAXX residual leftovers after #272', () => {
     expect(back.end).toBe(1);
   });
 });
+
+describe('database CRUD TOKENMAXX residual second-wave leftovers after #282', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('tryInsertJoinMembership concurrent knock→join upgrades collapse to one join', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'knock',
+          event_id: '$knocked',
+          display_name: 'Knocker',
+          avatar_url: null,
+        },
+      ],
+    });
+    const [a, b] = await Promise.all([
+      tryInsertJoinMembership(db, ROOM, USER, '$join-knock-a', 'A'),
+      tryInsertJoinMembership(db, ROOM, USER, '$join-knock-b', 'B'),
+    ]);
+    expect(db._state.memberships).toHaveLength(1);
+    expect(db._state.memberships[0].membership).toBe('join');
+    const winners = [a, b].filter((r) => r.inserted);
+    const losers = [a, b].filter((r) => !r.inserted);
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(losers[0].eventId).toBe(winners[0].eventId);
+    expect(db._state.memberships[0].event_id).toBe(winners[0].eventId);
+  });
+
+  it('concurrent getEventsSince + storeEvent: since page sees old tip or new only', async () => {
+    const seed = pdu({ event_id: '$seed', type: 'm.room.message', content: { body: 's' } });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(seed, 4)],
+      streamPosition: 4,
+    });
+    const neu = pdu({ event_id: '$neu', type: 'm.room.message', content: { body: 'n' } });
+    const [page, stream] = await Promise.all([getEventsSince(db, ROOM, 4, 10), storeEvent(db, neu)]);
+    expect(stream).toBe(5);
+    expect(db._state.streamPosition).toBe(5);
+    // Mid-flight page may miss the concurrent insert (since > 4 empty) or catch it
+    expect(page.every((e) => e.event_id === '$neu')).toBe(true);
+    expect(page.length).toBeLessThanOrEqual(1);
+    const after = await getEventsSince(db, ROOM, 4, 10);
+    expect(after.map((e) => e.event_id)).toEqual(['$neu']);
+  });
+
+  it('concurrent same-alias createRoomAlias both persist under harness (no UNIQUE)', async () => {
+    const db = createCrudDb();
+    await Promise.all([
+      createRoomAlias(db, '#same:example.com', ROOM, USER),
+      createRoomAlias(db, '#same:example.com', ROOM, BOB),
+    ]);
+    // In-memory stand-in does not enforce UNIQUE(alias) — both inserts land
+    expect(db._state.aliases.filter((a) => a.alias === '#same:example.com')).toHaveLength(2);
+    expect(new Set(db._state.aliases.map((a) => a.creator_id))).toEqual(new Set([USER, BOB]));
+    await expect(getRoomByAlias(db, '#same:example.com')).resolves.toBe(ROOM);
+  });
+
+  it('storeEventIdempotent hard-cap oversized inserts under race while storeEvent rejects', async () => {
+    const db = createCrudDb({ streamPosition: 1 });
+    const hard = pdu({
+      event_id: '$hard-idem',
+      type: 'm.room.message',
+      content: { body: 'ok' },
+    });
+    hard.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    expect(JSON.stringify(hard.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(hard).length).toBeGreaterThan(921_600);
+    const ok = pdu({
+      event_id: '$ok-hard-race',
+      type: 'm.room.message',
+      content: { body: 'ok' },
+    });
+    const [idem, storeOk, storeHard] = await Promise.allSettled([
+      storeEventIdempotent(db, hard),
+      storeEvent(db, ok),
+      storeEvent(db, { ...hard, event_id: '$hard-store' }),
+    ]);
+    expect(idem.status).toBe('fulfilled');
+    if (idem.status === 'fulfilled') {
+      expect(idem.value.inserted).toBe(true);
+      expect(idem.value.streamOrdering).not.toBeNull();
+    }
+    expect(storeOk.status).toBe('fulfilled');
+    expect(storeHard.status).toBe('rejected');
+    if (storeHard.status === 'rejected') {
+      expect(storeHard.reason).toMatchObject({ errcode: 'M_TOO_LARGE' });
+      expect((storeHard.reason as MatrixApiError).message).toMatch(/D1 row limit/);
+    }
+    const ids = db._state.events.map((e) => e.event_id).sort();
+    expect(ids).toEqual(['$hard-idem', '$ok-hard-race'].sort());
+    expect(ids).not.toContain('$hard-store');
+  });
+});

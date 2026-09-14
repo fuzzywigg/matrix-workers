@@ -1100,3 +1100,52 @@ describe('federation signing TOKENMAXX residual leftovers after #272', () => {
     expect(badCross).toBe(false);
   });
 });
+
+describe('federation signing TOKENMAXX residual second-wave leftovers after #282', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('concurrent local re-sign from foreign-server base preserves foreign sig', async () => {
+    const foreign = await generateSigningKeyPair();
+    const localA = await generateSigningKeyPair();
+    const localB = await generateSigningKeyPair();
+    const base = await signJson(
+      { type: 'm.test', content: { n: 1 }, unsigned: { age: 9 } },
+      'foreign.example.com',
+      foreign.keyId,
+      foreign.privateKeyJwk
+    );
+    const foreignSnap = {
+      ...(base.signatures as Record<string, Record<string, string>>)['foreign.example.com'],
+    };
+    const [signedA, signedB] = await Promise.all([
+      signJson(base, 'local.example.com', localA.keyId, localA.privateKeyJwk),
+      signJson(base, 'local.example.com', localB.keyId, localB.privateKeyJwk),
+    ]);
+    for (const signed of [signedA, signedB]) {
+      expect((signed.signatures as Record<string, Record<string, string>>)['foreign.example.com']).toEqual(
+        foreignSnap
+      );
+      expect(signed.unsigned).toEqual({ age: 9 });
+      expect(await verifySignature(signed, 'foreign.example.com', foreign.keyId, foreign.publicKey)).toBe(
+        true
+      );
+    }
+    expect(await verifySignature(signedA, 'local.example.com', localA.keyId, localA.publicKey)).toBe(true);
+    expect(await verifySignature(signedB, 'local.example.com', localB.keyId, localB.publicKey)).toBe(true);
+    // Each concurrent call started from the same foreign base — sibling local keyIds are not merged
+    expect(
+      (signedA.signatures as Record<string, Record<string, string>>)['local.example.com'][localB.keyId]
+    ).toBeUndefined();
+    expect(
+      (signedB.signatures as Record<string, Record<string, string>>)['local.example.com'][localA.keyId]
+    ).toBeUndefined();
+  });
+});
