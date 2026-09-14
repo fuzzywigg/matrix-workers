@@ -3986,3 +3986,110 @@ describe('push integration flood — mixed kinds coexistence', () => {
     expect(res.body.content.every((r: { default: boolean }) => r.default)).toBe(true);
   });
 });
+
+// =============================================================================
+// TOKENMAXX soft-cap flood round 3 — remaining handler truthiness leftovers
+// =============================================================================
+
+describe('pushers GET — enabled filter contract leftovers', () => {
+  it('SQL always filters enabled=1 even when DB has mixed rows', async () => {
+    const db = createPushDb({
+      pushers: [
+        seedPusher({ pushkey: 'on', enabled: 1 }),
+        seedPusher({ pushkey: 'off', app_id: 'x', enabled: 0 }),
+      ],
+    });
+    await request(db, '/_matrix/client/v3/pushers', authGet());
+    const sel = db.selects.find((s) => s.sql.includes('FROM pushers'));
+    expect(sel!.sql).toMatch(/enabled\s*=\s*1/);
+    const res = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(res.body.pushers.map((p: { pushkey: string }) => p.pushkey)).toEqual(['on']);
+  });
+});
+
+describe('pushrules actions — rejects non-array with M_MISSING_PARAM leftovers', () => {
+  it.each([undefined, null, 'notify', 1, true, { set_tweak: 'sound' }])(
+    'rejects actions=%j',
+    async (actions) => {
+      const db = createPushDb({ rules: [seedRule({ rule_id: 'x' })] });
+      const res = await request(
+        db,
+        '/_matrix/client/v3/pushrules/global/override/x/actions',
+        jsonInit('PUT', { actions })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    }
+  );
+});
+
+describe('pushrules enabled — rejects non-boolean leftovers', () => {
+  it('rejects missing enabled key entirely', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.master/enabled',
+      jsonInit('PUT', {})
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_MISSING_PARAM');
+  });
+});
+
+describe('notifications from parse leftovers', () => {
+  it('from="" is falsy → no id cursor filter', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 1, created_at: 1 }),
+        seedNotification({ id: 2, created_at: 2, event_id: '$2' }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications?from=', authGet());
+    expect(res.body.notifications).toHaveLength(2);
+    const sel = db.selects.find((s) => s.sql.includes('notification_queue'));
+    expect(sel!.sql).not.toContain('nq.id > ?');
+  });
+
+  it('from=-1 parses to -1 which is not >0 → no cursor filter', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 1 }), seedNotification({ id: 2, event_id: '$2' })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications?from=-1', authGet());
+    expect(res.body.notifications).toHaveLength(2);
+  });
+});
+
+describe('pushrules DELETE — changes=0 → M_NOT_FOUND leftovers', () => {
+  it('returns M_NOT_FOUND when delete affects zero rows', async () => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushrules/global/override/absent', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND', error: 'Push rule not found' });
+  });
+});
+
+describe('pushers SET — create then list data round-trip leftovers', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('format event_id_only survives create→list', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', {
+        ...VALID_PUSHER_BODY,
+        data: { url: 'https://push.example/notify', format: 'event_id_only' },
+      })
+    );
+    const list = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(list.body.pushers[0].data.format).toBe('event_id_only');
+  });
+});
