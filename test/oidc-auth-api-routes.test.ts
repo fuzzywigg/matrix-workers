@@ -520,7 +520,9 @@ describe('encryptSecret / decryptSecret', () => {
       false,
       ['encrypt']
     );
+    // IV[0] must not be 0x01/0x02 — decryptSecret treats those as versioned prefixes.
     const iv = crypto.getRandomValues(new Uint8Array(12));
+    iv[0] = 0xa5;
     const encrypted = new Uint8Array(
       await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode('old-format'))
     );
