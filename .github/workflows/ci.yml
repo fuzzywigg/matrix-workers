@@ -81,6 +81,22 @@ jobs:
       - run: npm ci
       - run: npm run test:filters-appservice-auth
 
+
+  # Fail-fast canary for admin + federation concurrent leftovers
+  # (quinary #317 + senary deepen). Isolates flake attribution before
+  # the full vitest suite.
+  admin-federation:
+    name: Admin/Federation Concurrent Canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:admin-federation
+
   test:
     name: Tests
     runs-on: ubuntu-latest
