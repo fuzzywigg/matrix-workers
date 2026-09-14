@@ -1447,7 +1447,7 @@ describe('PUT /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', () 
     const db = createRoomsDb();
     dbFns.getMembership.mockResolvedValue(seedMembership());
     let plReads = 0;
-    dbFns.getStateEvent.mockImplementation(async (_db, _r, type: string, stateKey?: string) => {
+    dbFns.getStateEvent.mockImplementation(async (_db, _r, type: string, _stateKey?: string) => {
       if (type === 'm.room.power_levels') {
         plReads += 1;
         const id = plReads <= 1 ? '$pl-old:example.com' : '$pl-new:example.com';
