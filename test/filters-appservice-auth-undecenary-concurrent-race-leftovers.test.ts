@@ -41,7 +41,6 @@ import {
   sendAppServiceTransaction,
 } from '../src/services/appservice';
 import { extractAccessToken } from '../src/middleware/auth';
-import { hashToken } from '../src/utils/crypto';
 
 // Real requireAuth loaded via importActual in auth suites below
 // (filter routes use the mocked requireAuth from vi.mock).
