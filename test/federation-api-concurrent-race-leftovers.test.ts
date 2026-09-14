@@ -1,10 +1,11 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
- * / residual after #252 / residual after #265 — federation-api concurrent race /
- * TOCTOU for leftover S2S routes (non-catchup) that only had serial soft floods
- * (#157 leftover). Distinct from federation-keys-membership-account-data
- * concurrent-race (OTK / make_join) and federation-api-route-leftovers (serial
- * floods). Distinct from tip #241/#239/#265 prior deepens. Skip catchup residual
+ * / residual after #252 / residual after #265 / second-wave residual after tip
+ * #271 (post-#270) — federation-api concurrent race / TOCTOU for leftover S2S
+ * routes (non-catchup) that only had serial soft floods (#157 leftover).
+ * Distinct from federation-keys-membership-account-data concurrent-race
+ * (OTK / make_join) and federation-api-route-leftovers (serial floods).
+ * Distinct from tip #241/#239/#265/#270 prior deepens. Skip catchup residual
  * covered by #249/#250.
  *
  * Residual after #241: hierarchy∥timestamp∥backfill triple; thumbnail∥download;
@@ -18,6 +19,10 @@
  * Residual after #265 (post-#252, skip catchup): third-party∥origin sig;
  * missing-hash∥auth-denied; previously-accepted∥rejected; invalid PDU∥sender;
  * typing∥presence EDU; download 404∥thumb height-clamp.
+ *
+ * Second-wave residual after tip #271 (post-#270, skip catchup): legacy-v1∥
+ * missing-hash-v10; Cache-Control-hit∥octet-stream; typing∥noop EDU;
+ * custom-reject∥auth-fallback; openid success∥invalid; missing-origin∥empty-send.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -2820,6 +2825,243 @@ describe('race residual typing∥presence EDU / media 404∥thumb height after #
         req('GET', `/_matrix/federation/v1/media/download/${MEDIA}`, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+// second-wave residual concurrent races after tip #271 (post-#270, skip catchup)
+
+describe('race second-wave legacy∥hash-v10 / custom-reject∥auth-fallback after #271', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    verifyContentHash.mockReset();
+    verifyContentHash.mockResolvedValue(true);
+  });
+
+  it('legacy v1 accept∥missing-hash v10 isolation', async () => {
+    verifyRemoteSignature.mockResolvedValue(true);
+    const roomV1 = '!v1:example.com';
+    const roomV10 = '!v10:example.com';
+    const db = createFedDb({
+      rooms: [
+        { room_id: roomV1, room_version: '1', is_public: 1, created_at: 1 },
+        { room_id: roomV10, room_version: '10', is_public: 1, created_at: 2 },
+      ],
+    });
+    const env = makeEnv(db);
+    const [legacy, nohash] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-sw-legacy', env, {
+        pdus: [
+          {
+            event_id: '$swlegacy',
+            room_id: roomV1,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'ok' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-sw-nohash', env, {
+        pdus: [
+          {
+            event_id: '$swnohash',
+            room_id: roomV10,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf([legacy, nohash])).toEqual([200, 200]);
+    expect((legacy.body as { pdus: Record<string, unknown> }).pdus['$swlegacy']).toEqual({});
+    expect((nohash.body as { pdus: Record<string, { error: string }> }).pdus['$swnohash'].error).toBe(
+      'Missing required hashes.sha256 (room_version=10)'
+    );
+  });
+
+  it('custom rejection_reason∥auth-fallback isolation', async () => {
+    verifyRemoteSignature.mockResolvedValue(true);
+    verifyContentHash.mockResolvedValue(true);
+    checkEventAuth.mockReturnValue({ allowed: false });
+    const db = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      processedPdus: { '$swcustom': { accepted: 0, rejection_reason: 'custom-reason-race' } },
+    });
+    const env = makeEnv(db);
+    const [prev, deny] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-sw-custom', env, {
+        pdus: [
+          {
+            event_id: '$swcustom',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-sw-authfb', env, {
+        pdus: [
+          {
+            event_id: '$swauthfb',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'y' },
+            hashes: { sha256: 'ok' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf([prev, deny])).toEqual([200, 200]);
+    expect((prev.body as { pdus: Record<string, { error: string }> }).pdus['$swcustom'].error).toBe(
+      'custom-reason-race'
+    );
+    expect((deny.body as { pdus: Record<string, { error: string }> }).pdus['$swauthfb'].error).toBe(
+      'Event authorization failed'
+    );
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`legacy/hash second-wave flood-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      const db = createFedDb({
+        rooms: [
+          { room_id: ROOM, room_version: '1', is_public: 1, created_at: 1 },
+        ],
+      });
+      const env = makeEnv(db);
+      const results = await Promise.all([
+        req('PUT', `/_matrix/federation/v1/send/txn-sw-l-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$swl_${i}`,
+              room_id: ROOM,
+              sender: REMOTE_USER,
+              type: 'm.room.message',
+              content: { body: 'ok' },
+              signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+            },
+          ],
+        }),
+        req('PUT', `/_matrix/federation/v1/send/txn-sw-u-${i}`, env, {
+          pdus: [{ room_id: ROOM, type: 'm.room.message', content: { body: 'x' } }],
+        }),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect((results[1].body as { pdus: Record<string, { error: string }> }).pdus.unknown.error).toBe(
+        'Invalid PDU structure'
+      );
+    });
+  }
+});
+
+describe('race second-wave Cache-Control∥octet / typing∥noop / openid / origin after #271', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+  });
+
+  it('download Cache-Control hit∥octet-stream orphan isolation', async () => {
+    const MEDIA = 'fed_media_sw_hit';
+    const orphan = 'fed_media_sw_orphan';
+    const media = mockR2({
+      [MEDIA]: new Uint8Array([1, 2, 3]),
+      [orphan]: new Uint8Array([9, 9, 9]),
+    });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA, content_type: 'image/png', filename: 'hit.png' }],
+    });
+    const env = makeEnv(db, { media });
+    const [hit, octet] = await Promise.all([
+      req('GET', `/_matrix/federation/v1/media/download/${MEDIA}`, env),
+      req('GET', `/_matrix/federation/v1/media/download/${orphan}`, env),
+    ]);
+    expect(statusesOf([hit, octet])).toEqual([200, 200]);
+    expect(hit.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+    expect(hit.headers.get('Content-Type')).toBe('image/png');
+    expect(octet.headers.get('Content-Type')).toBe('application/octet-stream');
+    expect(octet.headers.get('Content-Disposition')).toBeNull();
+  });
+
+  it('typing∥noop EDU edu_type bind isolation', async () => {
+    const db = createFedDb();
+    const env = makeEnv(db);
+    const [typing, noop] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-sw-typing', env, {
+        pdus: [],
+        edus: [{ edu_type: 'm.typing', content: { room_id: ROOM, user_ids: [`@t:${FED_ORIGIN}`] } }],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-sw-noop', env, {
+        pdus: [],
+        edus: [{ edu_type: 'm.receipt', content: { n: 1 } }],
+      }),
+    ]);
+    expect(statusesOf([typing, noop])).toEqual([200, 200]);
+    const eduInserts = db.inserts.filter((ins) =>
+      String(ins.sql).includes('INSERT OR REPLACE INTO processed_edus')
+    );
+    expect(eduInserts.some((ins) => ins.args[1] === 'm.typing')).toBe(true);
+    expect(eduInserts.some((ins) => ins.args[1] === 'm.receipt')).toBe(true);
+  });
+
+  it('openid success∥invalid isolation + token retained', async () => {
+    const tok = 'sw_openid_ok';
+    const sessions = mockKv({
+      [`openid:${tok}`]: JSON.stringify({ user_id: LOCAL_USER, expires_at: Date.now() + 120_000 }),
+    });
+    const env = makeEnv(createFedDb(), { sessions });
+    const [ok, bad] = await Promise.all([
+      req('GET', `/_matrix/federation/v1/openid/userinfo?access_token=${tok}`, env),
+      req('GET', '/_matrix/federation/v1/openid/userinfo?access_token=missing_sw', env),
+    ]);
+    expect(ok.status).toBe(200);
+    expect(ok.body).toEqual({ sub: LOCAL_USER });
+    expect(sessions.data[`openid:${tok}`]).toBeTruthy();
+    expect(bad.status).toBe(401);
+    expect((bad.body as { errcode: string }).errcode).toBe('M_UNKNOWN_TOKEN');
+  });
+
+  it('missing-origin then empty-send serial dual bind', async () => {
+    const db = createFedDb();
+    const env = makeEnv(db);
+    federationOrigin = undefined;
+    const a = await req('PUT', '/_matrix/federation/v1/send/txn-sw-noorig2', env, { pdus: [] });
+    expect(a.status).toBe(401);
+    expect((a.body as { error: string }).error).toBe('Federation authentication required');
+    federationOrigin = FED_ORIGIN;
+    const b = await req('PUT', '/_matrix/federation/v1/send/txn-sw-empty2', env, { pdus: [], edus: [] });
+    expect(b.status).toBe(200);
+    expect(db.federationTxns[`${FED_ORIGIN}|txn-sw-empty2`]).toBeDefined();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`media/edu/openid second-wave flood-${i}`, async () => {
+      const MEDIA = 'fed_media_sw_f';
+      const media = mockR2({ [MEDIA]: new Uint8Array([i, i + 1]) });
+      const sessions = mockKv({
+        [`openid:swf_${i}`]: JSON.stringify({
+          user_id: LOCAL_USER,
+          expires_at: Date.now() + 60_000,
+        }),
+      });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA, content_type: 'image/png', filename: `f${i}.png` }],
+      });
+      const env = makeEnv(db, { media, sessions });
+      const results = await Promise.all([
+        req('GET', `/_matrix/federation/v1/media/download/${MEDIA}`, env),
+        req('GET', `/_matrix/federation/v1/openid/userinfo?access_token=swf_${i}`, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(results[0].headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+      expect(results[1].body).toEqual({ sub: LOCAL_USER });
     });
   }
 });
