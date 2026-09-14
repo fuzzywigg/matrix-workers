@@ -338,3 +338,209 @@ describe('extractAccessToken TOKENMAXX HEAVY leftovers after #226', () => {
     }
   });
 });
+
+describe('extractAccessToken TOKENMAXX HEAVY leftovers after #232', () => {
+  it('accepts vertical tab (\\v) between Bearer and token via \\s', () => {
+    const headers = new Headers();
+    headers.set('Authorization', 'Bearer\vt_vt');
+    const req = new Request('https://matrix.example.com/', { headers });
+    expect(req.headers.get('Authorization')).toBe('Bearer\vt_vt');
+    expect(extractAccessToken(req)).toBe('t_vt');
+  });
+
+  it('accepts form feed (\\f) between Bearer and token via \\s', () => {
+    const headers = new Headers();
+    headers.set('Authorization', 'Bearer\ft_ff');
+    const req = new Request('https://matrix.example.com/', { headers });
+    expect(extractAccessToken(req)).toBe('t_ff');
+  });
+
+  it('accepts NBSP (U+00A0) between Bearer and token (Latin-1 whitespace in \\s)', () => {
+    const headers = new Headers();
+    headers.set('Authorization', 'Bearer\u00a0nbsp_tok');
+    const req = new Request('https://matrix.example.com/', { headers });
+    expect(extractAccessToken(req)).toBe('nbsp_tok');
+  });
+
+  it('rejects CR/LF in Authorization values at the Headers boundary (invalid header)', () => {
+    for (const bad of ['Bearer\ntok', 'Bearer\rtok', 'Bearer\r\ntok']) {
+      expect(() => {
+        const headers = new Headers();
+        headers.set('Authorization', bad);
+      }).toThrow(/invalid header value/i);
+    }
+  });
+
+  it('rejects em-space (U+2003) Authorization as non-ByteString at Headers boundary', () => {
+    expect(() => {
+      const headers = new Headers();
+      headers.set('Authorization', 'Bearer\u2003em');
+    }).toThrow(/ByteString|greater than 255/i);
+  });
+
+  it('combines duplicate Authorization headers with ", "; greedy capture keeps the join', () => {
+    const headers = new Headers();
+    headers.append('Authorization', 'Bearer first');
+    headers.append('Authorization', 'Bearer second');
+    const req = new Request('https://matrix.example.com/', { headers });
+    expect(req.headers.get('Authorization')).toBe('Bearer first, Bearer second');
+    // /^Bearer\s+(.+)$/i → capture is everything after first scheme separator
+    expect(extractAccessToken(req)).toBe('first, Bearer second');
+  });
+
+  it('Fetch Headers trim trailing spaces on Authorization so trailing token spaces cannot survive', () => {
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Authorization: 'Bearer tok  ' },
+    });
+    expect(req.headers.get('Authorization')).toBe('Bearer tok');
+    expect(extractAccessToken(req)).toBe('tok');
+  });
+
+  it('preserves interior spaces in the greedy Bearer capture', () => {
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Authorization: 'Bearer  tok  mid' },
+    });
+    expect(extractAccessToken(req)).toBe('tok  mid');
+  });
+
+  it('preserves commas inside a single Authorization Bearer token', () => {
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Authorization: 'Bearer a,b,c' },
+    });
+    expect(extractAccessToken(req)).toBe('a,b,c');
+  });
+
+  it('treats access_token=+ as a single decoded space (truthy)', () => {
+    const req = new Request('https://matrix.example.com/?access_token=+');
+    expect(extractAccessToken(req)).toBe(' ');
+  });
+
+  it('treats access_token=%00 as a NUL string token (truthy)', () => {
+    const req = new Request('https://matrix.example.com/?access_token=%00');
+    expect(extractAccessToken(req)).toBe('\0');
+    expect(extractAccessToken(req)!.length).toBe(1);
+  });
+
+  it('treats access_token=false / true / null as literal truthy strings', () => {
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=false'))
+    ).toBe('false');
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=true'))
+    ).toBe('true');
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=null'))
+    ).toBe('null');
+  });
+
+  it('is case-sensitive on ACCESS_TOKEN / access-token query names (miss)', () => {
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?ACCESS_TOKEN=x'))
+    ).toBeNull();
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access-token=x'))
+    ).toBeNull();
+  });
+
+  it('decodes percent-encoded emoji in access_token', () => {
+    const req = new Request('https://matrix.example.com/?access_token=%F0%9F%94%91');
+    expect(extractAccessToken(req)).toBe('🔑');
+  });
+
+  it('ignores a bare fragment that only looks like access_token (no search)', () => {
+    const req = new Request('https://matrix.example.com/#access_token=frag');
+    expect(extractAccessToken(req)).toBeNull();
+  });
+
+  it('does not read credentials / userinfo from the request URL as a token', () => {
+    const req = new Request('https://user:pass@matrix.example.com/?foo=1');
+    expect(extractAccessToken(req)).toBeNull();
+  });
+
+  it('Request method and body do not affect token extraction', () => {
+    const req = new Request('https://matrix.example.com/?access_token=post_tok', {
+      method: 'POST',
+      body: 'access_token=body_tok',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    });
+    expect(extractAccessToken(req)).toBe('post_tok');
+  });
+
+  it('Bearer wins over query even when header token is a single character', () => {
+    const req = new Request('https://matrix.example.com/?access_token=long_query', {
+      headers: { Authorization: 'Bearer x' },
+    });
+    expect(extractAccessToken(req)).toBe('x');
+  });
+
+  it('falls through when Authorization is only whitespace after Fetch trim', () => {
+    const req = new Request('https://matrix.example.com/?access_token=from_q', {
+      headers: { Authorization: '   ' },
+    });
+    // Fetch Headers typically omit/empty a whitespace-only value
+    const auth = req.headers.get('Authorization');
+    expect(auth === null || auth === '' || auth.trim() === '').toBe(true);
+    expect(extractAccessToken(req)).toBe('from_q');
+  });
+
+  it('soft-floods 64 distinct Bearer tokens under Promise.all without cross-talk', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 64 }, (_, i) =>
+        extractAccessToken(
+          new Request('https://matrix.example.com/', {
+            headers: { Authorization: `Bearer flood_${i}` },
+          })
+        )
+      )
+    );
+    expect(results).toEqual(Array.from({ length: 64 }, (_, i) => `flood_${i}`));
+  });
+
+  it('soft-floods 64 distinct query tokens under Promise.all without cross-talk', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 64 }, (_, i) =>
+        extractAccessToken(new Request(`https://matrix.example.com/?access_token=qflood_${i}`))
+      )
+    );
+    expect(results).toEqual(Array.from({ length: 64 }, (_, i) => `qflood_${i}`));
+  });
+
+  it('mixed Authorization schemes in parallel stay isolated from Bearer successes', async () => {
+    const results = await Promise.all([
+      extractAccessToken(
+        new Request('https://matrix.example.com/', {
+          headers: { Authorization: 'Bearer ok' },
+        })
+      ),
+      extractAccessToken(
+        new Request('https://matrix.example.com/?access_token=q', {
+          headers: { Authorization: 'Basic abc' },
+        })
+      ),
+      extractAccessToken(
+        new Request('https://matrix.example.com/', {
+          headers: { Authorization: 'Bearer' },
+        })
+      ),
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=%20')),
+    ]);
+    expect(results).toEqual(['ok', 'q', null, ' ']);
+  });
+
+  it('URL with port and path still reads access_token from searchParams only', () => {
+    const req = new Request(
+      'https://matrix.example.com:8448/_matrix/client/v3/sync?access_token=port_tok'
+    );
+    expect(extractAccessToken(req)).toBe('port_tok');
+  });
+
+  it('empty search with lone "?" and no access_token yields null', () => {
+    expect(extractAccessToken(new Request('https://matrix.example.com/?'))).toBeNull();
+  });
+
+  it('decodes stacked percent-encoding literally once (no double-decode)', () => {
+    // %2561 → "%61" (not "a")
+    const req = new Request('https://matrix.example.com/?access_token=%2561');
+    expect(extractAccessToken(req)).toBe('%61');
+  });
+});
