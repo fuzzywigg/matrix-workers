@@ -1954,3 +1954,365 @@ describe('notify / auth-chain TOKENMAXX residual quaternary leftovers after #310
     expect(binds[1]).toEqual(['@alone:example.com', '@alone:example.com']);
   });
 });
+
+describe('notify / auth-chain TOKENMAXX residual quinary leftovers after #311', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeNotifyEnv(
+    membersByRoom: Record<string, string[]>,
+    opts?: { failUsers?: Set<string> }
+  ) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              const roomId = args[0] as string;
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    const members = membersByRoom[roomId] ?? [];
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('concurrent notify all-fail Sync DO ∥ empty room isolates fan-out', async () => {
+    const env = makeNotifyEnv(
+      {
+        '!fail:example.com': ['@a:example.com', '@b:example.com'],
+        '!empty:example.com': [],
+      },
+      { failUsers: new Set(['@a:example.com', '@b:example.com']) }
+    );
+    await Promise.all([
+      notifyUsersOfEvent(env, '!fail:example.com', '$f', 'm.room.message'),
+      notifyUsersOfEvent(env, '!empty:example.com', '$e', 'm.room.member'),
+    ]);
+    expect(env.notifies).toEqual([]);
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @a:example.com of event:',
+      expect.any(Error)
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @b:example.com of event:',
+      expect.any(Error)
+    );
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      0,
+      'users of event',
+      '$e',
+      'users:',
+      ''
+    );
+  });
+
+  it('concurrent getAuthChain self-referential auth ∥ short sibling stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      ['$loop', pdu('$loop', ['$loop'])],
+      ['$short', pdu('$short', [])],
+    ]);
+    const db = createAuthChainDb(events);
+    const [loop, short] = await Promise.all([
+      getAuthChain(db, ['$loop']),
+      getAuthChain(db, ['$short']),
+    ]);
+    expect(loop.map((e) => e.event_id)).toEqual(['$loop']);
+    expect(short.map((e) => e.event_id)).toEqual(['$short']);
+  });
+
+  it('concurrent getStateAtEvent duplicate state_key auth last-wins ∥ missing stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$leaf',
+        pdu('$leaf', ['$old', '$new'], {
+          type: 'm.room.message',
+          content: { body: 'x' },
+        }),
+      ],
+      [
+        '$old',
+        pdu('$old', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'Old' },
+        }),
+      ],
+      [
+        '$new',
+        pdu('$new', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'New' },
+        }),
+      ],
+    ]);
+    delete (events.get('$leaf') as { state_key?: string }).state_key;
+    const db = createAuthChainDb(events);
+    const [state, missing] = await Promise.all([
+      getStateAtEvent(db, '$leaf'),
+      getStateAtEvent(db, '$nope'),
+    ]);
+    expect(missing).toEqual([]);
+    expect(state).toHaveLength(1);
+    // Map iteration order follows auth_events fetch order; last set wins
+    expect(state[0].event_id).toBe('$new');
+    expect(state[0].content).toEqual({ name: 'New' });
+  });
+
+  it('getServersInRoomsWithUser empty-string keep ∥ multi-segment under race', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare() {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            const subject = args[0] as string;
+            return {
+              async all<T>() {
+                if (subject === '@keep:example.com') {
+                  return {
+                    results: [
+                      { server_name: '' },
+                      { server_name: 'peer.example.com' },
+                    ] as T[],
+                  };
+                }
+                if (subject === '@multi:example.com') {
+                  return {
+                    results: [
+                      { server_name: 'a.b.example.com' },
+                      { server_name: 'c.example.com' },
+                    ] as T[],
+                  };
+                }
+                return { results: [] as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const [keep, multi] = await Promise.all([
+      getServersInRoomsWithUser(db, '@keep:example.com'),
+      getServersInRoomsWithUser(db, '@multi:example.com'),
+    ]);
+    expect(keep).toEqual(['', 'peer.example.com']);
+    expect(multi).toEqual(['a.b.example.com', 'c.example.com']);
+    expect(binds).toHaveLength(2);
+  });
+});
+
+describe('notify / auth-chain TOKENMAXX residual senary leftovers after #315 tip-relaunch', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeNotifyEnv(
+    membersByRoom: Record<string, string[]>,
+    opts?: { failUsers?: Set<string> }
+  ) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              const roomId = args[0] as string;
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    const members = membersByRoom[roomId] ?? [];
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('concurrent notify payload event_id/type stay correct across two rooms', async () => {
+    const env = makeNotifyEnv({
+      '!a:example.com': ['@a:example.com'],
+      '!b:example.com': ['@b:example.com'],
+    });
+    await Promise.all([
+      notifyUsersOfEvent(env, '!a:example.com', '$evt-a', 'm.room.message'),
+      notifyUsersOfEvent(env, '!b:example.com', '$evt-b', 'm.room.member'),
+    ]);
+    expect(env.notifies).toHaveLength(2);
+    const byUser = Object.fromEntries(
+      env.notifies.map((n: { userId: string; body: Record<string, unknown> }) => [
+        n.userId,
+        n.body,
+      ])
+    );
+    expect(byUser['@a:example.com']).toMatchObject({
+      room_id: '!a:example.com',
+      event_id: '$evt-a',
+      type: 'm.room.message',
+    });
+    expect(byUser['@b:example.com']).toMatchObject({
+      room_id: '!b:example.com',
+      event_id: '$evt-b',
+      type: 'm.room.member',
+    });
+  });
+
+  it('concurrent getAuthChain diamond ∥ short sibling stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      ['$root', pdu('$root', [])],
+      ['$left', pdu('$left', ['$root'])],
+      ['$right', pdu('$right', ['$root'])],
+      ['$tip', pdu('$tip', ['$left', '$right'])],
+      ['$short', pdu('$short', [])],
+    ]);
+    const db = createAuthChainDb(events);
+    const [diamond, short] = await Promise.all([
+      getAuthChain(db, ['$tip']),
+      getAuthChain(db, ['$short']),
+    ]);
+    expect(diamond.map((e) => e.event_id).sort()).toEqual(
+      ['$left', '$right', '$root', '$tip'].sort()
+    );
+    expect(short.map((e) => e.event_id)).toEqual(['$short']);
+  });
+
+  it('concurrent getStateAtEvent non-state-only auth ∥ state auth stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$msg-auth',
+        pdu('$msg-auth', [], {
+          type: 'm.room.message',
+          content: { body: 'x' },
+        }),
+      ],
+      [
+        '$member',
+        pdu('$member', [], {
+          type: 'm.room.member',
+          state_key: '@s:ex.com',
+          content: { membership: 'join' },
+        }),
+      ],
+      [
+        '$tip-msg',
+        pdu('$tip-msg', ['$msg-auth'], {
+          type: 'm.room.message',
+          content: { body: 'tip' },
+        }),
+      ],
+      [
+        '$tip-state',
+        pdu('$tip-state', ['$member'], {
+          type: 'm.room.message',
+          content: { body: 'tip' },
+        }),
+      ],
+    ]);
+    delete (events.get('$msg-auth') as { state_key?: string }).state_key;
+    delete (events.get('$tip-msg') as { state_key?: string }).state_key;
+    delete (events.get('$tip-state') as { state_key?: string }).state_key;
+    const db = createAuthChainDb(events);
+    const [noState, withState] = await Promise.all([
+      getStateAtEvent(db, '$tip-msg'),
+      getStateAtEvent(db, '$tip-state'),
+    ]);
+    expect(noState).toEqual([]);
+    expect(withState).toHaveLength(1);
+    expect(withState[0].event_id).toBe('$member');
+    expect(withState[0].state_key).toBe('@s:ex.com');
+  });
+
+  it('getServersInRoomsWithUser filters null server_name ∥ multi under race', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare() {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            const subject = args[0] as string;
+            return {
+              async all<T>() {
+                if (subject === '@nocolon') {
+                  return {
+                    results: [{ server_name: null }, { server_name: 'peer.example.com' }] as T[],
+                  };
+                }
+                if (subject === '@multi:example.com') {
+                  return {
+                    results: [
+                      { server_name: 'a.example.com' },
+                      { server_name: 'b.example.com' },
+                    ] as T[],
+                  };
+                }
+                return { results: [] as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const [filtered, multi] = await Promise.all([
+      getServersInRoomsWithUser(db, '@nocolon'),
+      getServersInRoomsWithUser(db, '@multi:example.com'),
+    ]);
+    expect(filtered).toEqual(['peer.example.com']);
+    expect(multi).toEqual(['a.example.com', 'b.example.com']);
+    expect(binds).toHaveLength(2);
+  });
+});

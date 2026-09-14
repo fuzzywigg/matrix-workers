@@ -65,6 +65,8 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run test:crypto-db
+      # Lint the crypto/db residual shard only (keeps the focused job self-contained).
+      - run: npm run test:crypto-db:lint
 
   test:
     name: Tests
