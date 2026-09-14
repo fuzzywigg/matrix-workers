@@ -2394,3 +2394,197 @@ describe('keys TOKENMAXX leftover edges after #96', () => {
     expect(destinations).not.toContain(SERVER);
   });
 });
+
+
+describe('keys TOKENMAXX leftovers after #99/#101', () => {
+  it('returns 500 when DO cross-signing put fails on first-time MSC3967 upload', async () => {
+    const userKeys = createUserKeysStub({ failPut: true });
+    const env = createEnv({ userKeys, db: createKeysDb({ crossSigningKeys: [] }) });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/device_signing/upload',
+      jsonInit('POST', { master_key: masterKeyPayload() })
+    );
+    expect(res.status).toBe(500);
+  });
+
+  it('returns 500 when DO cross-signing get fails mid-query after devices loaded', async () => {
+    // failGet fails all /get including device-keys — already covered.
+    // Granular: fail only cross-signing get by wrapping stub.
+    const base = createUserKeysStub({
+      deviceKeys: {
+        [DEVICE]: {
+          algorithms: ['m.olm.v1.curve25519-aes-sha2'],
+          device_id: DEVICE,
+          user_id: USER,
+          keys: {},
+        },
+      },
+    });
+    const orig = base.fetch.bind(base);
+    base.fetch = async (req: Request) => {
+      const path = new URL(req.url).pathname;
+      if (path === '/cross-signing/get') {
+        return new Response('cs boom', { status: 500 });
+      }
+      return orig(req);
+    };
+    const env = createEnv({ userKeys: base });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/query',
+      jsonInit('POST', { device_keys: { [USER]: [] } })
+    );
+    expect(res.status).toBe(500);
+  });
+
+  it('omits specific device id when DO returns null', async () => {
+    const userKeys = createUserKeysStub({
+      deviceKeys: {
+        [DEVICE]: {
+          algorithms: ['m.olm.v1.curve25519-aes-sha2'],
+          device_id: DEVICE,
+          user_id: USER,
+          keys: { 'ed25519:DEVICEA': 'k' },
+        },
+      },
+    });
+    const env = createEnv({ userKeys });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/query',
+      jsonInit('POST', { device_keys: { [USER]: ['MISSING', DEVICE] } })
+    );
+    expect(res.status).toBe(200);
+    const body = res.body as { device_keys: Record<string, Record<string, unknown>> };
+    expect(body.device_keys[USER][DEVICE]).toBeTruthy();
+    expect(body.device_keys[USER].MISSING).toBeUndefined();
+  });
+
+  it('claims fallback even when used=1 (code does not check used)', async () => {
+    const db = createKeysDb({
+      fallbacks: [
+        {
+          user_id: BOB,
+          device_id: DEVICE_B,
+          algorithm: 'signed_curve25519',
+          key_id: 'signed_curve25519:USED',
+          key_data: JSON.stringify({ key: 'used-fb' }),
+          used: 1,
+        },
+      ],
+    });
+    const env = createEnv({ db, oneTimeKeysKv: mockKv() });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/claim',
+      jsonInit('POST', {
+        one_time_keys: { [BOB]: { [DEVICE_B]: 'signed_curve25519' } },
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = res.body as {
+      one_time_keys: Record<string, Record<string, Record<string, { fallback?: boolean }>>>;
+    };
+    expect(body.one_time_keys[BOB][DEVICE_B]['signed_curve25519:USED'].fallback).toBe(true);
+  });
+
+  it('falls through to D1 OTK when KV store exists without requested algorithm bucket', async () => {
+    const otkKv = mockKv({
+      [`otk:${BOB}:${DEVICE_B}`]: JSON.stringify({
+        curve25519: [{ keyId: 'curve25519:Z', keyData: { key: 'z' }, claimed: false }],
+      }),
+    });
+    const db = createKeysDb({
+      otks: [
+        {
+          id: 7,
+          user_id: BOB,
+          device_id: DEVICE_B,
+          algorithm: 'signed_curve25519',
+          key_id: 'signed_curve25519:D1',
+          key_data: JSON.stringify({ key: 'd1' }),
+          claimed: 0,
+        },
+      ],
+    });
+    const env = createEnv({ oneTimeKeysKv: otkKv, db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/claim',
+      jsonInit('POST', {
+        one_time_keys: { [BOB]: { [DEVICE_B]: 'signed_curve25519' } },
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = res.body as {
+      one_time_keys: Record<string, Record<string, Record<string, unknown>>>;
+    };
+    expect(body.one_time_keys[BOB][DEVICE_B]['signed_curve25519:D1']).toBeTruthy();
+    expect(db.otks[0].claimed).toBe(1);
+  });
+
+  it('accepts m.oauth completed stage for device_signing replacement', async () => {
+    const db = createKeysDb({
+      crossSigningKeys: [
+        { user_id: USER, key_type: 'master', key_id: 'm', key_data: '{}' },
+      ],
+    });
+    const cache = mockKv({
+      'uia_session:oauth-edge': JSON.stringify({
+        user_id: USER,
+        completed_stages: ['m.oauth'],
+      }),
+    });
+    const env = createEnv({ db, cacheKv: cache });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/device_signing/upload',
+      jsonInit('POST', {
+        master_key: masterKeyPayload(),
+        auth: { type: 'm.oauth', session: 'oauth-edge' },
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(cache.data['uia_session:oauth-edge']).toBeUndefined();
+  });
+
+  it('stores empty key_id when self_signing_key lacks keys map', async () => {
+    const db = createKeysDb({ crossSigningKeys: [] });
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/device_signing/upload',
+      jsonInit('POST', {
+        master_key: masterKeyPayload(),
+        self_signing_key: { user_id: USER, usage: ['self_signing'], signatures: {} },
+      })
+    );
+    expect(res.status).toBe(200);
+    const ss = db.crossSigningKeys.find((k) => k.key_type === 'self_signing');
+    expect(ss?.key_id).toBe('');
+  });
+
+  it('signatures/upload with no signatures[signer] still records key change', async () => {
+    const db = createKeysDb();
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/signatures/upload',
+      jsonInit('POST', {
+        [USER]: {
+          [DEVICE]: {
+            algorithms: [],
+            device_id: DEVICE,
+            user_id: USER,
+            keys: {},
+            // no signatures field for signer
+          },
+        },
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ failures: {} });
+    expect(db.keyChanges.length).toBeGreaterThan(0);
+  });
+});

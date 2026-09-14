@@ -1134,3 +1134,173 @@ describe('POST /_matrix/client/v3/search', () => {
     expect(ftsBind).not.toContain('!b:example.com');
   });
 });
+
+
+describe('search TOKENMAXX route leftovers after #94', () => {
+  let db: ReturnType<typeof createSearchDb>;
+
+  function fts(partial: Partial<FtsRow> & Pick<FtsRow, 'event_id'>): FtsRow {
+    return {
+      event_id: partial.event_id,
+      event_type: partial.event_type ?? 'm.room.message',
+      room_id: partial.room_id ?? '!a:example.com',
+      sender: partial.sender ?? '@bob:example.com',
+      origin_server_ts: partial.origin_server_ts ?? 1000,
+      content: partial.content ?? JSON.stringify({ body: 'hello world' }),
+      rank: partial.rank ?? 0.5,
+    };
+  }
+
+  async function postSearch(
+    body: unknown,
+    database: ReturnType<typeof createSearchDb>,
+    path = '/_matrix/client/v3/search'
+  ) {
+    const res = await search.request(
+      `http://localhost${path}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify(body),
+      },
+      env(database)
+    );
+    const text = await res.text();
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = text;
+    }
+    return { status: res.status, body: parsed };
+  }
+
+  it('does not short-circuit when escaped FTS term becomes empty (""")', async () => {
+    db = createSearchDb({
+      memberships: ['!a:example.com'],
+      ftsRows: [fts({ event_id: '$1' })],
+    });
+    const { status, body } = await postSearch(
+      { search_categories: { room_events: { search_term: '"""' } } },
+      db
+    );
+    expect(status).toBe(200);
+    // Membership bind is first; FTS MATCH bind uses escaped term as args[0]
+    const ftsBind = db.bindLog.find(
+      (b) => b.length >= 3 && b.includes('!a:example.com') && typeof b[0] === 'string'
+    );
+    expect(ftsBind?.[0]).toBe('');
+    expect(body.search_categories.room_events).toBeTruthy();
+  });
+
+  it('binds NaN OFFSET for non-numeric next_batch', async () => {
+    db = createSearchDb({
+      memberships: ['!a:example.com'],
+      ftsRows: [fts({ event_id: '$1' })],
+    });
+    const { status } = await postSearch(
+      { search_categories: { room_events: { search_term: 'x' } } },
+      db,
+      '/_matrix/client/v3/search?next_batch=nope'
+    );
+    expect(status).toBe(200);
+    const ftsBind = db.bindLog.find((b) => b.includes('x') || b[0] === 'x');
+    expect(Number.isNaN(ftsBind?.[ftsBind.length - 1] as number)).toBe(true);
+  });
+
+  it('skips empty senders/types filter arrays in SQL', async () => {
+    db = createSearchDb({
+      memberships: ['!a:example.com'],
+      ftsRows: [fts({ event_id: '$1' })],
+    });
+    await postSearch(
+      {
+        search_categories: {
+          room_events: {
+            search_term: 'x',
+            filter: { senders: [], not_senders: [], types: [], not_types: [] },
+          },
+        },
+      },
+      db
+    );
+    const ftsSql = db.sqlLog.find((s) => s.includes('bm25(events_fts)'));
+    expect(ftsSql).not.toMatch(/AND e\.sender IN/);
+    expect(ftsSql).not.toMatch(/AND e\.sender NOT IN/);
+    expect(ftsSql).not.toMatch(/AND e\.event_type IN/);
+    expect(ftsSql).not.toMatch(/AND e\.event_type NOT IN/);
+  });
+
+  it('surfaces context JSON.parse failures as HTTP 500', async () => {
+    db = createSearchDb({
+      memberships: ['!a:example.com'],
+      ftsRows: [fts({ event_id: '$1', origin_server_ts: 1000 })],
+      context: {
+        '!a:example.com|before|1000': [
+          {
+            event_id: '$c',
+            event_type: 'm.room.message',
+            sender: '@bob:example.com',
+            origin_server_ts: 900,
+            content: '{bad',
+          },
+        ],
+      },
+    });
+    const res = await search.request(
+      'http://localhost/_matrix/client/v3/search',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({
+          search_categories: {
+            room_events: {
+              search_term: 'x',
+              event_context: { before_limit: 1, after_limit: 0 },
+            },
+          },
+        }),
+      },
+      env(db)
+    );
+    expect(res.status).toBe(500);
+  });
+
+  it('omits groups when group_by is empty array', async () => {
+    db = createSearchDb({
+      memberships: ['!a:example.com'],
+      ftsRows: [fts({ event_id: '$1' })],
+    });
+    const { body } = await postSearch(
+      {
+        search_categories: {
+          room_events: {
+            search_term: 'x',
+            groupings: { group_by: [] },
+          },
+        },
+      },
+      db
+    );
+    expect(body.search_categories.room_events.groups).toBeUndefined();
+  });
+
+  it('paginates with next_batch=50 when 51 rows exist', async () => {
+    const rows = Array.from({ length: 51 }, (_, i) =>
+      fts({ event_id: `$${i}`, origin_server_ts: 2000 - i })
+    );
+    db = createSearchDb({ memberships: ['!a:example.com'], ftsRows: rows, total: 51 });
+    const { body } = await postSearch(
+      { search_categories: { room_events: { search_term: 'x' } } },
+      db,
+      '/_matrix/client/v3/search?next_batch=50'
+    );
+    expect(body.search_categories.room_events.results).toHaveLength(1);
+    expect(body.search_categories.room_events.next_batch).toBeUndefined();
+  });
+
+  it('formatSearchRank maps NaN to 0 and keeps Infinity', () => {
+    expect(formatSearchRank(Number.NaN)).toBe(0);
+    expect(formatSearchRank(Number.POSITIVE_INFINITY)).toBe(Number.POSITIVE_INFINITY);
+  });
+});

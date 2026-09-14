@@ -1132,3 +1132,100 @@ describe('email helpers TOKENMAXX HEAVY leftover edges after #89', () => {
     });
   });
 });
+
+
+describe('email helpers TOKENMAXX leftover edges after #92/#103', () => {
+  const NOW = 1_700_000_500_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('getValidatedSession returns expired-but-validated sessions (no expiry check)', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'old@ex.com',
+      user_id: '@u:ex.com',
+      client_secret: 'sec',
+      token: '123456',
+      send_attempt: 1,
+      validated: 1,
+      created_at: NOW - 10_000,
+      expires_at: NOW - 1,
+    });
+    expect(await getValidatedSession(db, 'sid', 'sec')).toEqual({
+      email: 'old@ex.com',
+      userId: '@u:ex.com',
+    });
+  });
+
+  it('createVerificationSession retries expired unvalidated session without consulting expires_at', async () => {
+    const db = createEmailDb();
+    db.store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '111111',
+      send_attempt: 3,
+      validated: 0,
+      created_at: NOW - 10_000,
+      expires_at: NOW - 1,
+    });
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 2)).toEqual({
+      sessionId: 'old',
+      token: '',
+    });
+  });
+
+  it('getValidatedSession rejects when first() throws (no try/catch)', async () => {
+    const db = {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async first() {
+                throw new Error('db down');
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    await expect(getValidatedSession(db, 'sid', 'sec')).rejects.toThrow('db down');
+  });
+
+  it('createVerificationSession with validated:0 and higher attempt replaces session', async () => {
+    const db = createEmailDb();
+    db.store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '111111',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 100,
+      expires_at: NOW + 1000,
+    });
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 7;
+      if (arr instanceof Uint8Array) arr.fill(0xcd);
+      return arr;
+    });
+    const result = await createVerificationSession(db, 'a@b.c', 'secret', 2);
+    expect(result).toEqual({
+      sessionId: 'cd'.repeat(16),
+      token: '100007',
+    });
+    expect(db.store.has('old')).toBe(false);
+    expect(db.store.has('cd'.repeat(16))).toBe(true);
+  });
+});
