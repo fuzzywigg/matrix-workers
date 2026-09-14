@@ -1,12 +1,14 @@
 /**
- * TOKENMAXX HEAVY deepen after #94/#96/#99 — different slice: login/register API routes.
- * Avoids keys (#99), key-backups (#96), search (#94). Tests-only — no product inventing.
+ * TOKENMAXX HEAVY deepen — different slice: login/register API routes.
+ * After #124 (devices). Prefer login leftovers over devices/relations/federation/sync/voip.
+ * Tests-only — no product inventing.
  * Exercises login flows, lockout, refresh rotation, register/guest, logout, whoami,
- * and get_token via Hono app.request().
+ * get_token, falsy device/display fields, SQL bind contracts, and grant isolation
+ * via Hono app.request().
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
-import { hashToken } from '../src/utils/crypto';
+import { hashToken, verifyPassword } from '../src/utils/crypto';
 
 vi.mock('../src/middleware/auth', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/middleware/auth')>();
@@ -2081,5 +2083,1405 @@ describe('login TOKENMAXX edge leftovers after #101', () => {
     expect(ta).not.toBe(tb);
     expect((a.body as { expires_in_ms: number }).expires_in_ms).toBe(120000);
     expect(Object.keys(sessions.data).filter((k) => k.startsWith('login_token:'))).toHaveLength(2);
+  });
+});
+
+describe('login TOKENMAXX edge leftovers after #124 devices', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // ---------- password login: identifier / body edges ----------
+
+  it('password login treats user starting with @ as full MXID even if malformed', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        passwordLoginBody({
+          identifier: { type: 'm.id.user', user: '@@alice:example.com' },
+        }),
+        ''
+      )
+    );
+    // startsWith('@') → lookup as-is → no hash → forbidden
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('password login with missing identifier.user currently throws (500)', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        {
+          type: 'm.login.password',
+          identifier: { type: 'm.id.user' },
+          password: 'secret123',
+        },
+        ''
+      )
+    );
+    // Product gap: identifier.user.startsWith without null-check
+    expect(res.status).toBe(500);
+  });
+
+  it('rejects null password as missing param (falsy)', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ password: null }), '')
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+  });
+
+  it('rejects empty-string identifier localpart path via missing password hash', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        passwordLoginBody({
+          identifier: { type: 'm.id.user', user: '' },
+        }),
+        ''
+      )
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('treats device_id empty string as falsy and generates a new device id', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ device_id: '' }), '')
+    );
+    expect(res.status).toBe(200);
+    const body = res.body as { device_id: string };
+    expect(body.device_id).toBeTruthy();
+    expect(body.device_id).not.toBe('');
+    expect(db.devices[0].device_id).toBe(body.device_id);
+  });
+
+  it('treats device_id null as falsy and generates a device id', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ device_id: null }), '')
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { device_id: string }).device_id).toBeTruthy();
+  });
+
+  it('passes through initial_device_display_name null to createDevice', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ initial_device_display_name: null }), '')
+    );
+    expect(res.status).toBe(200);
+    expect(db.devices[0].display_name).toBeNull();
+  });
+
+  it('stores empty-string initial_device_display_name as-is', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ initial_device_display_name: '' }), '')
+    );
+    expect(res.status).toBe(200);
+    expect(db.devices[0].display_name).toBe('');
+  });
+
+  it('stores unicode and long initial_device_display_name', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const name = `📱 ${'x'.repeat(200)}`;
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ initial_device_display_name: name }), '')
+    );
+    expect(res.status).toBe(200);
+    expect(db.devices[0].display_name).toBe(name);
+  });
+
+  it('ignores extra top-level login fields', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        passwordLoginBody({
+          extra_field: 'nope',
+          refresh_token: 'should-ignore',
+          user: 'not-an-identifier',
+        }),
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { user_id: string }).user_id).toBe(USER);
+  });
+
+  it('rejects array JSON body as unrecognized login type', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(env, '/_matrix/client/v3/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '[]',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_UNRECOGNIZED' });
+  });
+
+  it('rejects string JSON body as unrecognized login type', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(env, '/_matrix/client/v3/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '"m.login.password"',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_UNRECOGNIZED' });
+  });
+
+  it('password login with null password_hash user is forbidden', async () => {
+    const db = createLoginDb({
+      users: new Map([
+        [
+          USER,
+          userRow({
+            user_id: USER,
+            localpart: 'alice',
+            password_hash: null,
+          }),
+        ],
+      ]),
+    });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody(), '')
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('password login SQL bind order for device and access token inserts', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ device_id: 'SQLDEV' }), '')
+    );
+    expect(res.status).toBe(200);
+    const deviceIns = db.inserts.find((i) => i.sql.includes('INSERT INTO devices'));
+    expect(deviceIns?.args[0]).toBe(USER);
+    expect(deviceIns?.args[1]).toBe('SQLDEV');
+    expect(deviceIns?.args[2]).toBe('Test Device');
+    const tokenIns = db.inserts.find((i) => i.sql.includes('INSERT INTO access_tokens'));
+    expect(tokenIns?.args[2]).toBe(USER);
+    expect(tokenIns?.args[3]).toBe('SQLDEV');
+    expect(typeof tokenIns?.args[0]).toBe('string');
+    expect(typeof tokenIns?.args[1]).toBe('string');
+  });
+
+  it('two password logins with different device_ids create two sessions', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const a = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ device_id: 'A1' }), '')
+    );
+    const b = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ device_id: 'B2' }), '')
+    );
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    expect(db.devices.map((d) => d.device_id).sort()).toEqual(['A1', 'B2']);
+    expect(db.tokens).toHaveLength(2);
+    expect(
+      Object.keys(env._sessions.data).filter((k) => k.startsWith('refresh:'))
+    ).toHaveLength(2);
+  });
+
+  // ---------- lockout isolation ----------
+
+  it('lockout does not block m.login.token for the same user', async () => {
+    const raw = 'mlt_lock_bypass';
+    const tokenHash = await hashToken(raw);
+    const sessions = mockKv({
+      [`lockout:${USER}`]: JSON.stringify({
+        attempts: 5,
+        lockedUntil: Date.now() + 60_000,
+      }),
+      [`login_token:${tokenHash}`]: JSON.stringify({
+        user_id: USER,
+        expires_at: Date.now() + 60_000,
+      }),
+    });
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: raw, device_id: DEVICE }, '')
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { user_id: string }).user_id).toBe(USER);
+  });
+
+  it('lockout does not block m.login.dummy for the same user', async () => {
+    const sessions = mockKv({
+      [`lockout:${USER}`]: JSON.stringify({
+        attempts: 5,
+        lockedUntil: Date.now() + 60_000,
+      }),
+    });
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        {
+          type: 'm.login.dummy',
+          identifier: { type: 'm.id.user', user: 'alice' },
+          device_id: DEVICE,
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('lockout is keyed by resolved full MXID not localpart', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const sessions = mockKv();
+    const env = envFor(db, sessions);
+    await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ password: 'bad' }), '')
+    );
+    expect(sessions.data[`lockout:${USER}`]).toBeDefined();
+    expect(sessions.data['lockout:alice']).toBeUndefined();
+  });
+
+  it('failed password attempt logs warn only when locking at threshold', async () => {
+    const now = 1_700_001_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const sessions = mockKv({
+      [`lockout:${USER}`]: JSON.stringify({ attempts: 4 }),
+    });
+    const env = envFor(db, sessions);
+    await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody({ password: 'bad' }), '')
+    );
+    expect(warn).toHaveBeenCalled();
+    const hit = warn.mock.calls.some(
+      (c) => typeof c[0] === 'string' && String(c[0]).includes('[login]') && String(c[0]).includes(USER)
+    );
+    expect(hit).toBe(true);
+  });
+
+  it('attempts 1-4 do not set lockedUntil', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const sessions = mockKv();
+    const env = envFor(db, sessions);
+    for (let i = 1; i <= 4; i++) {
+      await request(
+        env,
+        '/_matrix/client/v3/login',
+        jsonInit('POST', passwordLoginBody({ password: 'bad' }), '')
+      );
+      const lock = JSON.parse(sessions.data[`lockout:${USER}`]);
+      expect(lock.attempts).toBe(i);
+      expect(lock.lockedUntil).toBeUndefined();
+    }
+  });
+
+  it('successful login does not touch lockout key when none exists', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const sessions = mockKv();
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody(), '')
+    );
+    expect(res.status).toBe(200);
+    expect(sessions.deletes.filter((k) => k.startsWith('lockout:'))).toHaveLength(0);
+  });
+
+  // ---------- token login edges ----------
+
+  it('rejects empty-string login token as missing', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: '' }, '')
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+  });
+
+  it('rejects null login token as missing', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: null }, '')
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+  });
+
+  it('expired token deletes only once and leaves other KV keys', async () => {
+    const raw = 'mlt_exp_iso';
+    const tokenHash = await hashToken(raw);
+    const sessions = mockKv({
+      [`login_token:${tokenHash}`]: JSON.stringify({
+        user_id: USER,
+        expires_at: Date.now() - 1,
+      }),
+      'refresh:other': JSON.stringify({ keep: true }),
+    });
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }), sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: raw }, '')
+    );
+    expect(res.status).toBe(403);
+    expect(sessions.data['refresh:other']).toBeDefined();
+    expect(sessions.deletes.filter((k) => k === `login_token:${tokenHash}`)).toHaveLength(1);
+  });
+
+  it('token login stores refresh TTL of 7 days', async () => {
+    const raw = 'mlt_ttl';
+    const tokenHash = await hashToken(raw);
+    const sessions = mockKv({
+      [`login_token:${tokenHash}`]: JSON.stringify({
+        user_id: USER,
+        expires_at: Date.now() + 60_000,
+      }),
+    });
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }), sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: raw, device_id: 'TDEV' }, '')
+    );
+    expect(res.status).toBe(200);
+    const refreshPut = sessions.puts.find((p) => p.key.startsWith('refresh:'));
+    expect(refreshPut?.options?.expirationTtl).toBe(7 * 24 * 60 * 60);
+  });
+
+  it('token login with custom device_id and display name', async () => {
+    const raw = 'mlt_dev';
+    const tokenHash = await hashToken(raw);
+    const sessions = mockKv({
+      [`login_token:${tokenHash}`]: JSON.stringify({
+        user_id: USER,
+        expires_at: Date.now() + 60_000,
+      }),
+    });
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        {
+          type: 'm.login.token',
+          token: raw,
+          device_id: 'QR1',
+          initial_device_display_name: 'Scan',
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect(db.devices[0]).toMatchObject({
+      device_id: 'QR1',
+      display_name: 'Scan',
+    });
+  });
+
+  // ---------- dummy login edges ----------
+
+  it('dummy login rejects null identifier', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.dummy', identifier: null }, '')
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+  });
+
+  it('dummy login with empty-string device_id generates one', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        {
+          type: 'm.login.dummy',
+          identifier: { type: 'm.id.user', user: 'alice' },
+          device_id: '',
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { device_id: string }).device_id).toBeTruthy();
+  });
+
+  it('dummy login does not call verifyPassword', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    vi.mocked(verifyPassword).mockClear();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        {
+          type: 'm.login.dummy',
+          identifier: { type: 'm.id.user', user: 'alice' },
+          password: 'irrelevant',
+          device_id: DEVICE,
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect(verifyPassword).not.toHaveBeenCalled();
+  });
+
+  // ---------- logout / logout.all ----------
+
+  it('logout/all is idempotent when user has no tokens', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]), tokens: [] });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/logout/all',
+      jsonInit('POST', {})
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+    expect(db.deletes.some((d) => d.sql.includes('DELETE FROM access_tokens WHERE user_id'))).toBe(
+      true
+    );
+  });
+
+  it('logout/all only deletes tokens for authenticated user', async () => {
+    const aliceHash = await hashToken('alice-tok');
+    const bobHash = await hashToken('bob-tok');
+    const db = createLoginDb({
+      users: new Map([[USER, seedAlice()]]),
+      tokens: [
+        {
+          token_id: 'a1',
+          token_hash: aliceHash,
+          user_id: USER,
+          device_id: 'D1',
+          created_at: 1,
+        },
+        {
+          token_id: 'b1',
+          token_hash: bobHash,
+          user_id: BOB,
+          device_id: 'D2',
+          created_at: 1,
+        },
+      ],
+    });
+    const env = envFor(db);
+    const res = await request(env, '/_matrix/client/v3/logout/all', jsonInit('POST', {}));
+    expect(res.status).toBe(200);
+    expect(db.tokens).toHaveLength(1);
+    expect(db.tokens[0].user_id).toBe(BOB);
+  });
+
+  it('logout with Authorization Bearer deletes matching hash only', async () => {
+    const keep = await hashToken('keep-me');
+    const drop = await hashToken('drop-me');
+    const db = createLoginDb({
+      tokens: [
+        { token_id: 'k', token_hash: keep, user_id: USER, device_id: 'K', created_at: 1 },
+        { token_id: 'd', token_hash: drop, user_id: USER, device_id: 'D', created_at: 1 },
+      ],
+    });
+    const env = envFor(db);
+    const res = await request(env, '/_matrix/client/v3/logout', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer drop-me', 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(db.tokens).toHaveLength(1);
+    expect(db.tokens[0].token_id).toBe('k');
+  });
+
+  it('logout returns empty object even when token hash not in DB', async () => {
+    const db = createLoginDb({ tokens: [] });
+    const env = envFor(db);
+    const res = await request(env, '/_matrix/client/v3/logout', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ghost', 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+  });
+
+  // ---------- refresh edges ----------
+
+  it('refresh rejects null refresh_token', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: null }, '')
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+  });
+
+  it('refresh rejects whitespace-only token as unknown (truthy but absent)', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: '   ' }, '')
+    );
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({ errcode: 'M_UNKNOWN_TOKEN' });
+  });
+
+  it('refresh rotation is single-use: second call fails', async () => {
+    const oldRefresh = 'syr_once';
+    const oldHash = await hashToken(oldRefresh);
+    const sessions = mockKv({
+      [`refresh:${oldHash}`]: JSON.stringify({
+        userId: USER,
+        deviceId: DEVICE,
+        accessTokenId: 'tok-old',
+        createdAt: 1,
+      }),
+    });
+    const db = createLoginDb({
+      tokens: [
+        {
+          token_id: 'tok-old',
+          token_hash: 'h-old',
+          user_id: USER,
+          device_id: DEVICE,
+          created_at: 1,
+        },
+      ],
+    });
+    const env = envFor(db, sessions);
+    const first = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: oldRefresh }, '')
+    );
+    expect(first.status).toBe(200);
+    const second = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: oldRefresh }, '')
+    );
+    expect(second.status).toBe(401);
+    expect(second.body).toMatchObject({ errcode: 'M_UNKNOWN_TOKEN' });
+  });
+
+  it('refresh preserves deviceId string through rotation', async () => {
+    const oldRefresh = 'syr_dev';
+    const oldHash = await hashToken(oldRefresh);
+    const sessions = mockKv({
+      [`refresh:${oldHash}`]: JSON.stringify({
+        userId: USER,
+        deviceId: 'KEEPME',
+        accessTokenId: 't1',
+        createdAt: 1,
+      }),
+    });
+    const db = createLoginDb({
+      tokens: [
+        { token_id: 't1', token_hash: 'h1', user_id: USER, device_id: 'KEEPME', created_at: 1 },
+      ],
+    });
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: oldRefresh }, '')
+    );
+    expect(res.status).toBe(200);
+    expect(db.tokens[0].device_id).toBe('KEEPME');
+    const newRefresh = (res.body as { refresh_token: string }).refresh_token;
+    const newHash = await hashToken(newRefresh);
+    const stored = JSON.parse(sessions.data[`refresh:${newHash}`]);
+    expect(stored.deviceId).toBe('KEEPME');
+    expect(stored.userId).toBe(USER);
+  });
+
+  it('refresh DELETE binds accessTokenId from KV payload', async () => {
+    const oldRefresh = 'syr_bind';
+    const oldHash = await hashToken(oldRefresh);
+    const sessions = mockKv({
+      [`refresh:${oldHash}`]: JSON.stringify({
+        userId: USER,
+        deviceId: DEVICE,
+        accessTokenId: 'exact-id-99',
+        createdAt: 1,
+      }),
+    });
+    const db = createLoginDb({
+      tokens: [
+        {
+          token_id: 'exact-id-99',
+          token_hash: 'hx',
+          user_id: USER,
+          device_id: DEVICE,
+          created_at: 1,
+        },
+        {
+          token_id: 'other',
+          token_hash: 'hy',
+          user_id: USER,
+          device_id: 'X',
+          created_at: 1,
+        },
+      ],
+    });
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: oldRefresh }, '')
+    );
+    expect(res.status).toBe(200);
+    const del = db.deletes.find((d) => d.sql.includes('WHERE token_id'));
+    expect(del?.args[0]).toBe('exact-id-99');
+    expect(db.tokens.some((t) => t.token_id === 'other')).toBe(true);
+    expect(db.tokens.some((t) => t.token_id === 'exact-id-99')).toBe(false);
+  });
+
+  it('refresh ignores extra body fields', async () => {
+    const oldRefresh = 'syr_extra';
+    const oldHash = await hashToken(oldRefresh);
+    const sessions = mockKv({
+      [`refresh:${oldHash}`]: JSON.stringify({
+        userId: USER,
+        deviceId: DEVICE,
+        accessTokenId: 'te',
+        createdAt: 1,
+      }),
+    });
+    const db = createLoginDb({
+      tokens: [
+        { token_id: 'te', token_hash: 'he', user_id: USER, device_id: DEVICE, created_at: 1 },
+      ],
+    });
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit(
+        'POST',
+        { refresh_token: oldRefresh, access_token: 'nope', device_id: 'HACK' },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { access_token: string }).access_token).toBeTruthy();
+  });
+
+  it('refresh response omits user_id and device_id', async () => {
+    const oldRefresh = 'syr_shape';
+    const oldHash = await hashToken(oldRefresh);
+    const sessions = mockKv({
+      [`refresh:${oldHash}`]: JSON.stringify({
+        userId: USER,
+        deviceId: DEVICE,
+        accessTokenId: 'ts',
+        createdAt: 1,
+      }),
+    });
+    const db = createLoginDb({
+      tokens: [
+        { token_id: 'ts', token_hash: 'hs', user_id: USER, device_id: DEVICE, created_at: 1 },
+      ],
+    });
+    const env = envFor(db, sessions);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: oldRefresh }, '')
+    );
+    expect(res.status).toBe(200);
+    const body = res.body as Record<string, unknown>;
+    expect(body).toHaveProperty('access_token');
+    expect(body).toHaveProperty('refresh_token');
+    expect(body).toHaveProperty('expires_in_ms');
+    expect(body).not.toHaveProperty('user_id');
+    expect(body).not.toHaveProperty('device_id');
+    expect(body).not.toHaveProperty('home_server');
+  });
+
+  // ---------- register/available ----------
+
+  it('register/available accepts localparts with = _ . / - digits', async () => {
+    const env = envFor(createLoginDb());
+    for (const u of ['a.b', 'a_b', 'a-b', 'a=b', 'a/b', 'user9', '9start']) {
+      const res = await request(
+        env,
+        `/_matrix/client/v3/register/available?username=${encodeURIComponent(u)}`
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ available: true });
+    }
+  });
+
+  it('register/available rejects uppercase letters', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(env, '/_matrix/client/v3/register/available?username=Alice');
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_INVALID_USERNAME' });
+  });
+
+  it('register/available rejects unicode localparts', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      `/_matrix/client/v3/register/available?username=${encodeURIComponent('alice☕')}`
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_INVALID_USERNAME' });
+  });
+
+  it('register/available accepts exactly 255-char localpart', async () => {
+    const env = envFor(createLoginDb());
+    const u = 'a'.repeat(255);
+    const res = await request(env, `/_matrix/client/v3/register/available?username=${u}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ available: true });
+  });
+
+  // ---------- register ----------
+
+  it('register UIA challenge includes unique session each time', async () => {
+    const env = envFor(createLoginDb());
+    const a = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit('POST', { username: 'u1', password: 'Password1' }, '')
+    );
+    const b = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit('POST', { username: 'u1', password: 'Password1' }, '')
+    );
+    expect(a.status).toBe(401);
+    expect(b.status).toBe(401);
+    const sa = (a.body as { session: string }).session;
+    const sb = (b.body as { session: string }).session;
+    expect(sa).toBeTruthy();
+    expect(sb).toBeTruthy();
+    expect(sa).not.toBe(sb);
+  });
+
+  it('register ignores auth.session value and still succeeds with dummy', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'sessuser',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy', session: 'client-invented' },
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { user_id: string }).user_id).toBe('@sessuser:example.com');
+  });
+
+  it('register with custom device_id and display name', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'devy',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          device_id: 'REGDEV',
+          initial_device_display_name: 'Reg Phone',
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { device_id: string }).device_id).toBe('REGDEV');
+    expect(db.devices[0]).toMatchObject({
+      device_id: 'REGDEV',
+      display_name: 'Reg Phone',
+    });
+  });
+
+  it('register SQL INSERT users binds is_guest=0 for normal users', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'normie',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: true,
+        },
+        ''
+      )
+    );
+    const ins = db.inserts.find((i) => i.sql.includes('INSERT INTO users'));
+    expect(ins?.args[0]).toBe('@normie:example.com');
+    expect(ins?.args[1]).toBe('normie');
+    expect(ins?.args[2]).toBe('mockok:Password1');
+    expect(ins?.args[3]).toBe(0);
+  });
+
+  it('guest register SQL INSERT users binds is_guest=1 and null hash when no password', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    await request(
+      env,
+      '/_matrix/client/v3/register?kind=guest',
+      jsonInit('POST', { inhibit_login: true }, '')
+    );
+    const ins = db.inserts.find((i) => i.sql.includes('INSERT INTO users'));
+    expect(ins?.args[2]).toBeNull();
+    expect(ins?.args[3]).toBe(1);
+    expect(String(ins?.args[1]).length).toBeGreaterThan(0);
+  });
+
+  it('guest register ignores provided username and uses opaque localpart', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register?kind=guest',
+      jsonInit(
+        'POST',
+        { username: 'should-ignore', password: 'Password1', inhibit_login: true },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    const uid = (res.body as { user_id: string }).user_id;
+    expect(uid).not.toBe('@should-ignore:example.com');
+    expect(uid.startsWith('@')).toBe(true);
+    expect(uid.endsWith(':example.com')).toBe(true);
+  });
+
+  it('register rejects kind=Guest (case-sensitive)', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register?kind=Guest',
+      jsonInit('POST', { username: 'x', password: 'Password1' }, '')
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_INVALID_PARAM' });
+  });
+
+  it('register rejects kind=admin', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register?kind=admin',
+      jsonInit('POST', {}, '')
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_INVALID_PARAM' });
+  });
+
+  it('register password strength: letter+digit accepted; letter+special accepted', async () => {
+    const env = envFor(createLoginDb());
+    const digit = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'pwdigit',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: true,
+        },
+        ''
+      )
+    );
+    expect(digit.status).toBe(200);
+
+    const special = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'pwspecial',
+          password: 'Password!',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: true,
+        },
+        ''
+      )
+    );
+    expect(special.status).toBe(200);
+  });
+
+  it('register password strength rejects letters-only and digits-only', async () => {
+    const env = envFor(createLoginDb());
+    const letters = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'pwlet',
+          password: 'OnlyLetters',
+          auth: { type: 'm.login.dummy' },
+        },
+        ''
+      )
+    );
+    expect(letters.status).toBe(400);
+    expect(letters.body).toMatchObject({ errcode: 'M_WEAK_PASSWORD' });
+
+    const digits = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'pwdig',
+          password: '12345678',
+          auth: { type: 'm.login.dummy' },
+        },
+        ''
+      )
+    );
+    expect(digits.status).toBe(400);
+    expect(digits.body).toMatchObject({ errcode: 'M_WEAK_PASSWORD' });
+  });
+
+  it('register inhibit_login true string is truthy and skips tokens', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'inhibstr',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: 'yes',
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { access_token?: string }).access_token).toBeUndefined();
+    expect(db.tokens).toHaveLength(0);
+  });
+
+  it('register inhibit_login false issues tokens', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'inhibfalse',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: false,
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { access_token: string }).access_token).toBeTruthy();
+    expect(db.tokens).toHaveLength(1);
+  });
+
+  it('register stores refresh payload with matching accessTokenId', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'refreshy',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          device_id: 'RD',
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(200);
+    const body = res.body as { refresh_token: string };
+    const rh = await hashToken(body.refresh_token);
+    const stored = JSON.parse(env._sessions.data[`refresh:${rh}`]);
+    expect(stored.accessTokenId).toBe(db.tokens[0].token_id);
+    expect(stored.deviceId).toBe('RD');
+    expect(stored.userId).toBe('@refreshy:example.com');
+  });
+
+  it('register collision uses formatUserId on SERVER_NAME', async () => {
+    const db = createLoginDb({
+      users: new Map([
+        [
+          '@taken:example.com',
+          userRow({ user_id: '@taken:example.com', localpart: 'taken', password_hash: 'x' }),
+        ],
+      ]),
+    });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'taken',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+        },
+        ''
+      )
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_USER_IN_USE' });
+  });
+
+  // ---------- get_token ----------
+
+  it('get_token stores hashed key login_token: with expires_at ~ now+120s', async () => {
+    const now = 1_700_002_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const sessions = mockKv();
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }), sessions);
+    const res = await request(env, '/_matrix/client/v1/login/get_token', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    const put = sessions.puts.find((p) => p.key.startsWith('login_token:'));
+    expect(put?.options?.expirationTtl).toBe(120);
+    const payload = JSON.parse(put!.value);
+    expect(payload.user_id).toBe(USER);
+    expect(payload.expires_at).toBe(now + 120_000);
+  });
+
+  it('get_token login_token is URL-safe base64 (no + / =)', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    for (let i = 0; i < 5; i++) {
+      const res = await request(env, '/_matrix/client/v1/login/get_token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer t' },
+      });
+      const tok = (res.body as { login_token: string }).login_token;
+      expect(tok).not.toMatch(/[+/=]/);
+      expect(tok.length).toBeGreaterThan(20);
+    }
+  });
+
+  it('get_token does not require a JSON body', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(env, '/_matrix/client/v1/login/get_token', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { login_token: string }).login_token).toBeTruthy();
+  });
+
+  // ---------- whoami ----------
+
+  it('whoami coerces DB is_guest=0 to boolean false via getUserById', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(env, '/_matrix/client/v3/account/whoami');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      user_id: USER,
+      device_id: DEVICE,
+      is_guest: false,
+    });
+  });
+
+  it('whoami returns device_id from auth middleware context', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(env, '/_matrix/client/v3/account/whoami', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer anything' },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { device_id: string }).device_id).toBe(DEVICE);
+  });
+
+  it('whoami does not expose password_hash or admin fields', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const res = await request(env, '/_matrix/client/v3/account/whoami');
+    const body = res.body as Record<string, unknown>;
+    expect(body).not.toHaveProperty('password_hash');
+    expect(body).not.toHaveProperty('admin');
+    expect(body).not.toHaveProperty('is_deactivated');
+    expect(Object.keys(body).sort()).toEqual(['device_id', 'is_guest', 'user_id']);
+  });
+
+  // ---------- GET /login shape ----------
+
+  it('GET /login returns exactly three flow types in order', async () => {
+    const env = envFor(createLoginDb());
+    const res = await request(env, '/_matrix/client/v3/login');
+    expect(res.status).toBe(200);
+    const flows = (res.body as { flows: { type: string }[] }).flows;
+    expect(flows.map((f) => f.type)).toEqual([
+      'm.login.password',
+      'm.login.token',
+      'm.login.dummy',
+    ]);
+    for (const f of flows) {
+      expect(Object.keys(f)).toEqual(['type']);
+    }
+  });
+
+  // ---------- end-to-end lifecycles ----------
+
+  it('lifecycle: register → login → refresh → logout', async () => {
+    const db = createLoginDb();
+    const sessions = mockKv();
+    const env = envFor(db, sessions);
+
+    const reg = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'cycle',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          device_id: 'C1',
+        },
+        ''
+      )
+    );
+    expect(reg.status).toBe(200);
+    const regBody = reg.body as { access_token: string; refresh_token: string };
+
+    const login = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit(
+        'POST',
+        {
+          type: 'm.login.password',
+          identifier: { type: 'm.id.user', user: 'cycle' },
+          password: 'Password1',
+          device_id: 'C2',
+        },
+        ''
+      )
+    );
+    expect(login.status).toBe(200);
+    const loginBody = login.body as { refresh_token: string; access_token: string };
+
+    const refreshed = await request(
+      env,
+      '/_matrix/client/v3/refresh',
+      jsonInit('POST', { refresh_token: loginBody.refresh_token }, '')
+    );
+    expect(refreshed.status).toBe(200);
+    const newAccess = (refreshed.body as { access_token: string }).access_token;
+
+    const logout = await request(env, '/_matrix/client/v3/logout', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${newAccess}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(logout.status).toBe(200);
+    // original register refresh still present; login refresh consumed
+    expect(sessions.data[`refresh:${await hashToken(regBody.refresh_token)}`]).toBeDefined();
+  });
+
+  it('lifecycle: get_token → redeem → token gone', async () => {
+    const sessions = mockKv();
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db, sessions);
+
+    const gt = await request(env, '/_matrix/client/v1/login/get_token', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+    const loginToken = (gt.body as { login_token: string }).login_token;
+    const th = await hashToken(loginToken);
+    expect(sessions.data[`login_token:${th}`]).toBeDefined();
+
+    const redeem = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: loginToken, device_id: 'R1' }, '')
+    );
+    expect(redeem.status).toBe(200);
+    expect(sessions.data[`login_token:${th}`]).toBeUndefined();
+
+    const again = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: loginToken }, '')
+    );
+    expect(again.status).toBe(403);
+  });
+
+  it('errcode vocabulary for login validation paths', async () => {
+    const env = envFor(createLoginDb({ users: new Map([[USER, seedAlice()]]) }));
+    const cases: Array<{ body: unknown; errcode: string; status: number }> = [
+      { body: { type: 'nope' }, errcode: 'M_UNRECOGNIZED', status: 400 },
+      {
+        body: { type: 'm.login.password', identifier: { type: 'm.id.user', user: 'a' } },
+        errcode: 'M_MISSING_PARAM',
+        status: 400,
+      },
+      {
+        body: {
+          type: 'm.login.password',
+          identifier: { type: 'm.id.email', user: 'a' },
+          password: 'x',
+        },
+        errcode: 'M_UNRECOGNIZED',
+        status: 400,
+      },
+      { body: { type: 'm.login.token' }, errcode: 'M_MISSING_PARAM', status: 400 },
+      { body: { type: 'm.login.dummy' }, errcode: 'M_MISSING_PARAM', status: 400 },
+    ];
+    for (const c of cases) {
+      const res = await request(
+        env,
+        '/_matrix/client/v3/login',
+        jsonInit('POST', c.body, '')
+      );
+      expect(res.status).toBe(c.status);
+      expect(res.body).toMatchObject({ errcode: c.errcode });
+    }
+  });
+
+  it('password login home_server matches SERVER_NAME binding', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody(), '')
+    );
+    expect((res.body as { home_server: string }).home_server).toBe(SERVER);
+  });
+
+  it('access_token and refresh_token prefixes are syt_ and syr_', async () => {
+    const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
+    const env = envFor(db);
+    const res = await request(
+      env,
+      '/_matrix/client/v3/login',
+      jsonInit('POST', passwordLoginBody(), '')
+    );
+    const body = res.body as { access_token: string; refresh_token: string };
+    expect(body.access_token.startsWith('syt_')).toBe(true);
+    expect(body.refresh_token.startsWith('syr_')).toBe(true);
+  });
+
+  it('register available then register then available returns in-use', async () => {
+    const db = createLoginDb();
+    const env = envFor(db);
+    const avail = await request(env, '/_matrix/client/v3/register/available?username=slot');
+    expect(avail.body).toEqual({ available: true });
+    const reg = await request(
+      env,
+      '/_matrix/client/v3/register',
+      jsonInit(
+        'POST',
+        {
+          username: 'slot',
+          password: 'Password1',
+          auth: { type: 'm.login.dummy' },
+          inhibit_login: true,
+        },
+        ''
+      )
+    );
+    expect(reg.status).toBe(200);
+    const again = await request(env, '/_matrix/client/v3/register/available?username=slot');
+    expect(again.status).toBe(400);
+    expect(again.body).toMatchObject({ errcode: 'M_USER_IN_USE' });
   });
 });
