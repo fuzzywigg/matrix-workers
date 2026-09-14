@@ -1,12 +1,13 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
  * / residual after #252 / residual after #265 / second-wave residual after tip
- * #271 (post-#270) / tertiary residual after tip #275 (post-#275 second-wave)
+ * #271 (post-#270) / tertiary residual after tip #275 (post-#275 second-wave) /
+ * quaternary residual after tip #279 (post-#279 IdP+invite tertiary)
  * — federation-api concurrent race / TOCTOU for leftover S2S routes
  * (non-catchup) that only had serial soft floods (#157 leftover). Distinct from
  * federation-keys-membership-account-data concurrent-race (OTK / make_join) and
  * federation-api-route-leftovers (serial floods). Distinct from tip
- * #241/#239/#265/#270/#275 prior deepens. Skip catchup residual covered by
+ * #241/#239/#265/#270/#275/#279 prior deepens. Skip catchup residual covered by
  * #249/#250.
  *
  * Residual after #241: hierarchy∥timestamp∥backfill triple; thumbnail∥download;
@@ -28,6 +29,10 @@
  * Tertiary residual after tip #275 (post-#275 second-wave, skip catchup):
  * invite not-invite∥signed-ok; not-local∥v2 bad-version; no-key∥ok serial dual;
  * v2 missing-param∥v1 mismatch — invite exact-string soft niches not dual-raced.
+ *
+ * Quaternary residual after tip #279 (skip catchup / invite / knock): legacy
+ * room_version=2∥missing-hash v10; timestamp empty exact∥hit; hierarchy
+ * empty-via skip∥next_batch — quaternary route soft niches dual-raced.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -3323,6 +3328,216 @@ describe('race tertiary invite not-invite∥ok / not-local∥bad-version / no-ke
       expect(statusesOf(results)).toEqual([400, 400]);
       expect((results[0].body as { error: string }).error).toBe('Event is not an invite event');
       expect((results[1].body as { error: string }).error).toBe('Unsupported room version: 99');
+    });
+  }
+});
+
+// quaternary residual concurrent races after tip #279
+
+describe('race quaternary legacy-v2∥timestamp empty∥hierarchy via+next_batch after #279', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    verifyContentHash.mockReset();
+    verifyContentHash.mockResolvedValue(true);
+  });
+
+  it('legacy v2 accept∥missing-hash v10 isolation', async () => {
+    verifyRemoteSignature.mockResolvedValue(true);
+    const roomV2 = '!v2:example.com';
+    const roomV10 = '!v10q:example.com';
+    const db = createFedDb({
+      rooms: [
+        { room_id: roomV2, room_version: '2', is_public: 1, created_at: 1 },
+        { room_id: roomV10, room_version: '10', is_public: 1, created_at: 2 },
+      ],
+    });
+    const env = makeEnv(db);
+    const [legacy, nohash] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-q-legacy2', env, {
+        pdus: [
+          {
+            event_id: '$qlegacy2',
+            room_id: roomV2,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'ok' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-q-nohash', env, {
+        pdus: [
+          {
+            event_id: '$qnohash',
+            room_id: roomV10,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf([legacy, nohash])).toEqual([200, 200]);
+    expect((legacy.body as { pdus: Record<string, unknown> }).pdus['$qlegacy2']).toEqual({});
+    expect((nohash.body as { pdus: Record<string, { error: string }> }).pdus['$qnohash'].error).toBe(
+      'Missing required hashes.sha256 (room_version=10)'
+    );
+  });
+
+  it('timestamp empty exact∥timestamp hit isolation', async () => {
+    const emptyDb = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      events: [],
+    });
+    const hitDb = createFedDb({
+      events: [
+        makeEvent({
+          event_id: '$hit',
+          event_type: 'm.room.message',
+          content: '{}',
+          origin_server_ts: 2000,
+        }),
+      ],
+    });
+    const [empty, hit] = await Promise.all([
+      req(
+        'GET',
+        `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1500&dir=f`,
+        makeEnv(emptyDb)
+      ),
+      req(
+        'GET',
+        `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1500&dir=f`,
+        makeEnv(hitDb)
+      ),
+    ]);
+    expect(empty.status).toBe(404);
+    expect((empty.body as { error: string }).error).toBe('No event found near timestamp');
+    expect(hit.status).toBe(200);
+    expect((hit.body as { event_id: string }).event_id).toBe('$hit');
+  });
+
+  it('hierarchy empty-via skip∥next_batch coherency', async () => {
+    const gone = '!goneq:example.com';
+    const keep = '!keepq:example.com';
+    const c1 = '!c1q:example.com';
+    const c2 = '!c2q:example.com';
+    const deleted = makeEvent({
+      event_id: '$goneq',
+      event_type: 'm.space.child',
+      state_key: gone,
+      content: JSON.stringify({ via: [] }),
+    });
+    const kept = makeEvent({
+      event_id: '$keepq',
+      event_type: 'm.space.child',
+      state_key: keep,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const e1 = makeEvent({
+      event_id: '$c1q',
+      event_type: 'm.space.child',
+      state_key: c1,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const e2 = makeEvent({
+      event_id: '$c2q',
+      event_type: 'm.space.child',
+      state_key: c2,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const name = makeEvent({
+      event_id: '$hqname',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'RaceSpace' }),
+    });
+    const emptyViaDb = createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: keep, room_version: '10', is_public: 1, created_at: 2 },
+      ],
+      events: [deleted, kept, name],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', gone), deleted.event_id],
+        [stateKey(ROOM, 'm.space.child', keep), kept.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+      ]),
+    });
+    const pageDb = createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: c1, room_version: '10', is_public: 1, created_at: 2 },
+        { room_id: c2, room_version: '10', is_public: 1, created_at: 3 },
+      ],
+      events: [e1, e2, name],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', c1), e1.event_id],
+        [stateKey(ROOM, 'm.space.child', c2), e2.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+      ]),
+    });
+    const [emptyVia, paged] = await Promise.all([
+      req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=20`,
+        makeEnv(emptyViaDb)
+      ),
+      req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=1`,
+        makeEnv(pageDb)
+      ),
+    ]);
+    expect(emptyVia.status).toBe(200);
+    const emptyBody = emptyVia.body as { children: Array<{ room_id: string }> };
+    expect(emptyBody.children.map((c) => c.room_id)).toEqual([keep]);
+    expect(paged.status).toBe(200);
+    const pageBody = paged.body as {
+      children: Array<{ room_id: string }>;
+      next_batch?: string;
+    };
+    expect(pageBody.children).toHaveLength(1);
+    expect(pageBody.next_batch).toBe('offset_1');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`quaternary legacy2/timestamp/hierarchy residual flood-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      const roomV2 = `!v2f${i}:example.com`;
+      const db = createFedDb({
+        rooms: [
+          { room_id: roomV2, room_version: '2', is_public: 1, created_at: 1 },
+          { room_id: ROOM, room_version: '10', is_public: 1, created_at: 2 },
+        ],
+        events: [],
+      });
+      const env = makeEnv(db);
+      const results = await Promise.all([
+        req('PUT', `/_matrix/federation/v1/send/txn-qf-legacy2-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$qfleg2${i}`,
+              room_id: roomV2,
+              sender: REMOTE_USER,
+              type: 'm.room.message',
+              content: { body: 'x' },
+              signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+            },
+          ],
+        }),
+        req(
+          'GET',
+          `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=99&dir=b`,
+          env
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 404]);
+      expect((results[0].body as { pdus: Record<string, unknown> }).pdus[`$qfleg2${i}`]).toEqual({});
+      expect((results[1].body as { error: string }).error).toBe('No event found near timestamp');
     });
   }
 });

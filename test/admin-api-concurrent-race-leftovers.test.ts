@@ -1,7 +1,8 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
  * / residual after #252 / residual after #265 / second-wave residual after tip
- * #271 (post-#270) / tertiary residual after tip #275 (post-#275 second-wave)
+ * #271 (post-#270) / tertiary residual after tip #275 (post-#275 second-wave) /
+ * quaternary residual after tip #279 (post-#279 IdP+invite tertiary)
  * — admin concurrent race / TOCTOU for leftover admin-api routes that only had
  * serial soft floods (#157 leftover) or mutate races (#189). Distinct from
  * admin-mutate-concurrent-race-leftovers (writes) and admin-api-route-leftovers
@@ -29,6 +30,11 @@
  * Tertiary residual after tip #275 (post-#275 second-wave): IdP create∥list;
  * update∥detail; delete∥list; test-ok∥test-404; create-fail∥create-ok isolation
  * — success/test soft niches from tertiary route leftovers not dual-raced.
+ *
+ * Quaternary residual after tip #279: keys Verified∥No-self-signing isolation;
+ * self-demote / self-purge exact product strings∥peer 200; deactivated
+ * login-token exact∥mint ok; registration non-bool exact∥GET — quaternary
+ * route soft niches dual-raced.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -3804,6 +3810,187 @@ describe('race tertiary IdP test-ok∥404 / create-fail∥create-ok after #275',
       expect(statusesOf(results)).toEqual([200, 404]);
       expect(results[0].body.message).toBe('Connection successful');
       expect(results[1].body.error).toBe('Identity provider not found');
+    });
+  }
+});
+
+// quaternary exact-string concurrent races after tip #279
+
+describe('race quaternary keys Verified∥No-self-signing after #279', () => {
+  it('keys Verified∥No self-signing key isolation', async () => {
+    const verifiedDb = createAdminDb();
+    const missingSsDb = createAdminDb({
+      crossSigningKeys: [
+        {
+          user_id: BOB,
+          key_type: 'master',
+          key_id: 'ed25519:master-q',
+          key_data: JSON.stringify({ keys: {} }),
+        },
+      ],
+      crossSigningSigs: [],
+    });
+    const [verified, missing] = await Promise.all([
+      jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/keys`, {}, createEnv({ db: verifiedDb })),
+      jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/keys`,
+        {},
+        createEnv({ db: missingSsDb })
+      ),
+    ]);
+    expect(statusesOf([verified, missing])).toEqual([200, 200]);
+    expect(
+      (verified.body.verification_status as Record<string, { verified: boolean; reason: string }>)
+        .BOBDEVICE
+    ).toEqual({ verified: true, reason: 'Verified' });
+    expect(
+      (missing.body.verification_status as Record<string, { verified: boolean; reason: string }>)
+        .BOBDEVICE
+    ).toEqual({ verified: false, reason: 'No self-signing key' });
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`keys Verified/No-self-signing residual flood-${i}`, async () => {
+      const verifiedDb = createAdminDb();
+      const missingSsDb = createAdminDb({
+        crossSigningKeys: [
+          {
+            user_id: BOB,
+            key_type: 'master',
+            key_id: `ed25519:master-qf${i}`,
+            key_data: JSON.stringify({ keys: {} }),
+          },
+        ],
+        crossSigningSigs: [],
+      });
+      const results = await Promise.all([
+        jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/keys`, {}, createEnv({ db: verifiedDb })),
+        jsonReq(
+          `/admin/api/users/${encodeURIComponent(BOB)}/keys`,
+          {},
+          createEnv({ db: missingSsDb })
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(
+        (results[0].body.verification_status as Record<string, { reason: string }>).BOBDEVICE.reason
+      ).toBe('Verified');
+      expect(
+        (results[1].body.verification_status as Record<string, { reason: string }>).BOBDEVICE.reason
+      ).toBe('No self-signing key');
+    });
+  }
+});
+
+describe('race quaternary self-demote / self-purge / whois / login-token / registration exact after #279', () => {
+  it('self-demote exact∥peer remove-admin 200', async () => {
+    const db = createAdminDb({
+      users: [defaultAdmin(), { ...defaultBob(), admin: 1 }],
+    });
+    const env = createEnv({ db });
+    const [self, peer] = await Promise.all([
+      jsonReq('/admin/api/remove-admin', jsonInit('POST', { user_id: ADMIN }), env),
+      jsonReq('/admin/api/remove-admin', jsonInit('POST', { user_id: BOB }), env),
+    ]);
+    expect(self.status).toBe(403);
+    expect(self.body.error).toBe('Cannot remove your own admin privileges');
+    expect(peer.status).toBe(200);
+    expect(peer.body.success).toBe(true);
+    expect(db.users.find((u) => u.user_id === BOB)?.admin).toBe(0);
+  });
+
+  it('self-purge exact∥peer purge 200', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [self, peer] = await Promise.all([
+      jsonReq(
+        `/admin/api/users/${encodeURIComponent(ADMIN)}/purge`,
+        { method: 'DELETE', headers: AUTH },
+        env
+      ),
+      jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/purge`,
+        { method: 'DELETE', headers: AUTH },
+        env
+      ),
+    ]);
+    expect(self.status).toBe(403);
+    expect(self.body.error).toBe('Cannot delete your own account');
+    expect(peer.status).toBe(200);
+    expect(db.users.find((u) => u.user_id === ADMIN)).toBeTruthy();
+    expect(db.users.find((u) => u.user_id === BOB)).toBeUndefined();
+  });
+
+  it('whois non-admin other exact∥self 200', async () => {
+    authState.userId = BOB;
+    const env = nonAdminEnv();
+    const [other, self] = await Promise.all([
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(ADMIN)}`, {}, env),
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(BOB)}`, {}, env),
+    ]);
+    expect(other.status).toBe(403);
+    expect(other.body.error).toBe('Admin privileges required to query other users');
+    expect(self.status).toBe(200);
+    expect(self.body.user_id).toBe(BOB);
+  });
+
+  it('login-token deactivated exact∥mint ok isolation', async () => {
+    const deactDb = createAdminDb({
+      users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+    });
+    const okDb = createAdminDb();
+    const sessions = mockKv();
+    const [deact, ok] = await Promise.all([
+      jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        jsonInit('POST', { ttl_minutes: 3 }),
+        createEnv({ db: deactDb })
+      ),
+      jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        jsonInit('POST', { ttl_minutes: 3 }),
+        createEnv({ db: okDb, sessions })
+      ),
+    ]);
+    expect(deact.status).toBe(400);
+    expect(deact.body.errcode).toBe('M_USER_DEACTIVATED');
+    expect(deact.body.error).toBe('User is deactivated');
+    expect(ok.status).toBe(200);
+    expect(ok.body.token).toBe('mlt_pinned_login_token');
+  });
+
+  it('registration non-bool exact∥GET isolation', async () => {
+    const adminDO = createAdminDO({ config: { registration_enabled: true } });
+    const env = createEnv({ adminDO });
+    const [bad, get] = await Promise.all([
+      jsonReq('/admin/api/registration', jsonInit('PUT', { enabled: 'yes' }), env),
+      jsonReq('/admin/api/registration', {}, env),
+    ]);
+    expect(bad.status).toBe(400);
+    expect(bad.body.errcode).toBe('M_MISSING_PARAM');
+    expect(bad.body.error).toBe('Missing required parameter: enabled (boolean) required');
+    expect(get.status).toBe(200);
+    expect(get.body.enabled).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`quaternary guard/registration residual flood-${i}`, async () => {
+      const db = createAdminDb({
+        users: [defaultAdmin(), { ...defaultBob(), admin: 1 }],
+      });
+      const adminDO = createAdminDO({ config: { registration_enabled: i % 2 === 0 } });
+      const env = createEnv({ db, adminDO });
+      const results = await Promise.all([
+        jsonReq('/admin/api/remove-admin', jsonInit('POST', { user_id: ADMIN }), env),
+        jsonReq('/admin/api/registration', jsonInit('PUT', { enabled: i }), env),
+      ]);
+      expect(statusesOf(results)).toEqual([400, 403]);
+      expect(results[0].status).toBe(403);
+      expect(results[0].body.error).toBe('Cannot remove your own admin privileges');
+      expect(results[1].status).toBe(400);
+      expect(results[1].body.error).toBe(
+        'Missing required parameter: enabled (boolean) required'
+      );
     });
   }
 });

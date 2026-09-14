@@ -1,9 +1,10 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
  * / residual after #265 / second-wave residual after tip #271 (post-#270) /
- * tertiary residual after tip #275 (post-#275 second-wave) — federation S2S
+ * tertiary residual after tip #275 (post-#275 second-wave) / quaternary
+ * residual after tip #279 (post-#279 IdP+invite tertiary) — federation S2S
  * soft/edge/reliability (non-catchup). Complements federation-api-routes.test.ts
- * and federation-api-concurrent-race leftovers (#239/#248/#265/#270/#275).
+ * and federation-api-concurrent-race leftovers (#239/#248/#265/#270/#275/#279).
  * Tests-only — no product inventing. Fixtures use example.com only. Skips
  * FederationCatchupWorkflow (#249/#250).
  *
@@ -33,6 +34,12 @@
  * bad state_key, not-local, user-missing, no signing key); v2 missing
  * room_version/event + Unsupported room version; v1/v2 success shapes —
  * base routes assert status/errcode only; leftovers soft floods never did.
+ *
+ * Quaternary residual after tip #279 (skip catchup / invite / knock): legacy
+ * room_version=2 accept without hash (v1 covered by #265; v2 never soft-flooded);
+ * timestamp empty-room exact "No event found near timestamp"; hierarchy empty
+ * via skip + next_batch pagination — base routes one-shot; leftovers soft floods
+ * never asserted these strings/shapes.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -4192,6 +4199,191 @@ describe('soft tertiary invite v2 exact validation after #275', () => {
       const body = r.body as { event: { signatures?: unknown; event_id?: string } };
       expect(body.event.signatures).toBeDefined();
       expect(body.event.event_id).toBe(eid);
+    });
+  }
+});
+
+// quaternary residual soft floods after tip #279 (exact leftover strings / hierarchy pagination)
+
+describe('soft quaternary legacy v2 accept / timestamp empty / hierarchy via+next_batch after #279', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    verifyContentHash.mockReset();
+    verifyContentHash.mockResolvedValue(true);
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`legacy v2 accept without hash soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      checkEventAuth.mockReturnValue({ allowed: true });
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '2', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$legacy2-${i}`;
+      const { status, body } = await req(
+        'PUT',
+        `/_matrix/federation/v1/send/txn-legacy2-${i}`,
+        makeEnv(db),
+        {
+          pdus: [
+            {
+              event_id: eid,
+              room_id: ROOM,
+              sender: REMOTE_USER,
+              type: 'm.room.message',
+              content: { body: 'hello-v2' },
+              signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+            },
+          ],
+        }
+      );
+      expect(status).toBe(200);
+      expect((body as { pdus: Record<string, unknown> }).pdus[eid]).toEqual({});
+      expect(db.inserts.some((ins) => String(ins.sql).includes('INSERT OR IGNORE INTO events'))).toBe(
+        true
+      );
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`timestamp empty room exact soft-${i}`, async () => {
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+        events: [],
+      });
+      const dir = i % 2 === 0 ? 'f' : 'b';
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=${1500 + i}&dir=${dir}`,
+        makeEnv(db)
+      );
+      expect(r.status).toBe(404);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_NOT_FOUND');
+      expect((r.body as { error: string }).error).toBe('No event found near timestamp');
+    });
+  }
+
+  function seedEmptyViaSpace() {
+    const gone = '!gone:example.com';
+    const keep = '!keep:example.com';
+    const deleted = makeEvent({
+      event_id: '$gone',
+      event_type: 'm.space.child',
+      state_key: gone,
+      content: JSON.stringify({ via: [] }),
+    });
+    const kept = makeEvent({
+      event_id: '$keep',
+      event_type: 'm.space.child',
+      state_key: keep,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const name = makeEvent({
+      event_id: '$sp',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Space' }),
+    });
+    const keepName = makeEvent({
+      event_id: '$kn',
+      room_id: keep,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Keep' }),
+    });
+    return createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: keep, room_version: '10', is_public: 1, created_at: 2 },
+      ],
+      events: [deleted, kept, name, keepName],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', gone), deleted.event_id],
+        [stateKey(ROOM, 'm.space.child', keep), kept.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+        [stateKey(keep, 'm.room.name', ''), keepName.event_id],
+      ]),
+    });
+  }
+
+  function seedPagedSpace() {
+    const c0 = '!c0:example.com';
+    const c1 = '!c1:example.com';
+    const c2 = '!c2:example.com';
+    const e0 = makeEvent({
+      event_id: '$c0',
+      event_type: 'm.space.child',
+      state_key: c0,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const e1 = makeEvent({
+      event_id: '$c1',
+      event_type: 'm.space.child',
+      state_key: c1,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const e2 = makeEvent({
+      event_id: '$c2',
+      event_type: 'm.space.child',
+      state_key: c2,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const name = makeEvent({
+      event_id: '$pname',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Paged' }),
+    });
+    return createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: c0, room_version: '10', is_public: 1, created_at: 2 },
+        { room_id: c1, room_version: '10', is_public: 1, created_at: 3 },
+        { room_id: c2, room_version: '10', is_public: 1, created_at: 4 },
+      ],
+      events: [e0, e1, e2, name],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', c0), e0.event_id],
+        [stateKey(ROOM, 'm.space.child', c1), e1.event_id],
+        [stateKey(ROOM, 'm.space.child', c2), e2.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+      ]),
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`hierarchy empty via skipped soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=20`,
+        makeEnv(seedEmptyViaSpace())
+      );
+      expect(r.status).toBe(200);
+      const body = r.body as { room: { room_id: string } | null; children: Array<{ room_id: string }> };
+      expect(body.room?.room_id).toBe(ROOM);
+      const childIds = body.children.map((c) => c.room_id);
+      expect(childIds).toEqual(['!keep:example.com']);
+      expect(childIds).not.toContain('!gone:example.com');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`hierarchy next_batch soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=1`,
+        makeEnv(seedPagedSpace())
+      );
+      expect(r.status).toBe(200);
+      const body = r.body as {
+        room: { room_id: string } | null;
+        children: Array<{ room_id: string }>;
+        next_batch?: string;
+      };
+      expect(body.room?.room_id).toBe(ROOM);
+      expect(body.children).toHaveLength(1);
+      expect(body.children[0].room_id).toBe('!c0:example.com');
+      expect(body.next_batch).toBe('offset_1');
     });
   }
 });
