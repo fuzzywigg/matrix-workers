@@ -4093,3 +4093,134 @@ describe('pushers SET — create then list data round-trip leftovers', () => {
     expect(list.body.pushers[0].data.format).toBe('event_id_only');
   });
 });
+
+describe('pushrules GET — response rule shape leftovers', () => {
+  it('custom override rule response includes default/enabled/actions/conditions', async () => {
+    const conditions = [{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }];
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          rule_id: 'shape',
+          conditions: JSON.stringify(conditions),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        }),
+      ],
+    });
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/shape',
+      authGet()
+    );
+    expect(res.body).toEqual({
+      rule_id: 'shape',
+      default: false,
+      enabled: true,
+      actions: ['notify'],
+      conditions,
+    });
+  });
+
+  it('default content rule exposes pattern localpart', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/content/.m.rule.contains_user_name',
+      authGet()
+    );
+    expect(res.body).toMatchObject({
+      rule_id: '.m.rule.contains_user_name',
+      default: true,
+      enabled: true,
+      pattern: 'alice',
+    });
+  });
+});
+
+describe('pushers SET — bind delete vs insert SQL leftovers', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('append:false issues DELETE pushkey then INSERT', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: VALID_PUSHER_BODY.pushkey, app_id: 'old' })],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, append: false })
+    );
+    expect(db.deletes.some((d) => d.sql.includes('DELETE FROM pushers') && d.args[1] === VALID_PUSHER_BODY.pushkey)).toBe(
+      true
+    );
+    expect(db.inserts.some((i) => i.sql.includes('INSERT INTO pushers'))).toBe(true);
+  });
+
+  it('append:true skips DELETE-by-pushkey-only', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: VALID_PUSHER_BODY.pushkey, app_id: 'old' })],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, append: true })
+    );
+    const pushkeyOnlyDelete = db.deletes.find(
+      (d) =>
+        d.sql.includes('DELETE FROM pushers WHERE user_id = ? AND pushkey = ?') &&
+        !d.sql.includes('app_id')
+    );
+    expect(pushkeyOnlyDelete).toBeUndefined();
+    expect(db.pushers).toHaveLength(2);
+  });
+});
+
+describe('pushrules PUT — conditions omitted vs null leftovers', () => {
+  it('omitted conditions bind as SQL null', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/nocond',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(db.rules[0].conditions).toBeNull();
+  });
+
+  it('conditions:null is falsy → SQL null (not string \"null\")', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/nullcond',
+      jsonInit('PUT', { actions: ['notify'], conditions: null })
+    );
+    expect(db.rules[0].conditions).toBeNull();
+  });
+});
+
+describe('notifications SELECT bind arity leftovers', () => {
+  it('no from/only → args [userId, limit]', async () => {
+    const db = createPushDb();
+    await request(db, '/_matrix/client/v3/notifications?limit=5', authGet());
+    const sel = db.selects.find((s) => s.sql.includes('notification_queue'));
+    expect(sel?.args).toEqual([USER, 5]);
+  });
+
+  it('from only → args [userId, since, limit]', async () => {
+    const db = createPushDb();
+    await request(db, '/_matrix/client/v3/notifications?from=9&limit=3', authGet());
+    const sel = db.selects.find((s) => s.sql.includes('notification_queue'));
+    expect(sel?.args).toEqual([USER, 9, 3]);
+  });
+
+  it('only highlight without from → args [userId, limit]', async () => {
+    const db = createPushDb();
+    await request(db, '/_matrix/client/v3/notifications?only=highlight&limit=4', authGet());
+    const sel = db.selects.find((s) => s.sql.includes('notification_queue'));
+    expect(sel!.sql).toContain("notification_type = 'highlight'");
+    expect(sel?.args).toEqual([USER, 4]);
+  });
+});
