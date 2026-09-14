@@ -639,3 +639,83 @@ describe('errors TOKENMAXX residual leftovers after #272', () => {
     await expect(custom.json()).resolves.toEqual({});
   });
 });
+
+describe('errors TOKENMAXX residual leftovers after #282', () => {
+  it('default-message factories stay isolated Response instances under race', async () => {
+    const [forbidden, missing, badJson, notFound, unrecognized] = await Promise.all([
+      Promise.resolve(Errors.forbidden().toResponse()),
+      Promise.resolve(Errors.missingToken().toResponse()),
+      Promise.resolve(Errors.badJson().toResponse()),
+      Promise.resolve(Errors.notFound().toResponse()),
+      Promise.resolve(Errors.unrecognized().toResponse()),
+    ]);
+    expect(new Set([forbidden, missing, badJson, notFound, unrecognized]).size).toBe(5);
+    expect(forbidden.status).toBe(403);
+    expect(missing.status).toBe(401);
+    expect(badJson.status).toBe(400);
+    expect(notFound.status).toBe(404);
+    expect(unrecognized.status).toBe(400);
+    await expect(forbidden.json()).resolves.toEqual({
+      errcode: 'M_FORBIDDEN',
+      error: 'Forbidden',
+    });
+    await expect(missing.json()).resolves.toEqual({
+      errcode: 'M_MISSING_TOKEN',
+      error: 'Missing access token',
+    });
+    await expect(badJson.json()).resolves.toEqual({
+      errcode: 'M_BAD_JSON',
+      error: 'Could not parse request body as JSON',
+    });
+    await expect(notFound.json()).resolves.toEqual({
+      errcode: 'M_NOT_FOUND',
+      error: 'Not found',
+    });
+    await expect(unrecognized.json()).resolves.toEqual({
+      errcode: 'M_UNRECOGNIZED',
+      error: 'Unrecognized request',
+    });
+  });
+
+  it('toJSON omit falsy retry_after_ms races with include-positive sibling', async () => {
+    const [omitZero, omitUndef, keep] = await Promise.all([
+      Promise.resolve(new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'z', 429, 0).toJSON()),
+      Promise.resolve(new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'u', 429).toJSON()),
+      Promise.resolve(new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'k', 429, 42).toJSON()),
+    ]);
+    expect(omitZero).toEqual({ errcode: 'M_LIMIT_EXCEEDED', error: 'z' });
+    expect(Object.prototype.hasOwnProperty.call(omitZero, 'retry_after_ms')).toBe(false);
+    expect(omitUndef).toEqual({ errcode: 'M_LIMIT_EXCEEDED', error: 'u' });
+    expect(keep).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'k',
+      retry_after_ms: 42,
+    });
+  });
+
+  it('missingParam / invalidParam / unsupportedRoomVersion defaults race in isolation', async () => {
+    const [missing, invalidDef, invalidCustom, unsupported] = await Promise.all([
+      Promise.resolve(Errors.missingParam('user_id').toResponse()),
+      Promise.resolve(Errors.invalidParam('limit').toResponse()),
+      Promise.resolve(Errors.invalidParam('limit', 'must be positive').toResponse()),
+      Promise.resolve(Errors.unsupportedRoomVersion().toResponse()),
+    ]);
+    expect(missing).not.toBe(invalidDef);
+    await expect(missing.json()).resolves.toEqual({
+      errcode: 'M_MISSING_PARAM',
+      error: 'Missing required parameter: user_id',
+    });
+    await expect(invalidDef.json()).resolves.toEqual({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Invalid parameter: limit',
+    });
+    await expect(invalidCustom.json()).resolves.toEqual({
+      errcode: 'M_INVALID_PARAM',
+      error: 'must be positive',
+    });
+    await expect(unsupported.json()).resolves.toEqual({
+      errcode: 'M_UNSUPPORTED_ROOM_VERSION',
+      error: 'Unsupported room version',
+    });
+  });
+});

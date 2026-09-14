@@ -1100,3 +1100,50 @@ describe('federation signing TOKENMAXX residual leftovers after #272', () => {
     expect(badCross).toBe(false);
   });
 });
+
+describe('crypto TOKENMAXX residual leftovers after #282', () => {
+  it('concurrent validatePasswordStrength rejects stay independent with no shared mutation', async () => {
+    const letter = '12345678';
+    const tooLong = 'a'.repeat(1001);
+    const noSpecial = 'password';
+    const ok = 'abcdefg1';
+    const [rLetter, rLong, rSpecial, rOk] = await Promise.all([
+      Promise.resolve(validatePasswordStrength(letter)),
+      Promise.resolve(validatePasswordStrength(tooLong)),
+      Promise.resolve(validatePasswordStrength(noSpecial)),
+      Promise.resolve(validatePasswordStrength(ok)),
+    ]);
+    expect(rLetter).toMatch(/letter/);
+    expect(rLong).toMatch(/at most 1000/);
+    expect(rSpecial).toMatch(/number or special/);
+    expect(rOk).toBeNull();
+    // Inputs unchanged
+    expect(letter).toBe('12345678');
+    expect(tooLong).toHaveLength(1001);
+    expect(noSpecial).toBe('password');
+    expect(ok).toBe('abcdefg1');
+  });
+
+  it('concurrent verifyPassword NaN/empty iteration logs independently of a valid verify', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const real = await hashPassword('match-me-1!');
+    const [nanReject, emptyReject, ok] = await Promise.all([
+      verifyPassword('match-me-1!', '$pbkdf2-sha256$abc$c2FsdA==$aGFzaA=='),
+      verifyPassword('match-me-1!', '$pbkdf2-sha256$$c2FsdA==$aGFzaA=='),
+      verifyPassword('match-me-1!', real),
+    ]);
+    expect(nanReject).toBe(false);
+    expect(emptyReject).toBe(false);
+    expect(ok).toBe(true);
+    expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2);
+    const messages = spy.mock.calls.map((c) => String(c[0]));
+    expect(messages.some((m) => m.includes('invalid iteration count: abc'))).toBe(true);
+    expect(messages.some((m) => m.includes('invalid iteration count: '))).toBe(true);
+    expect(
+      messages
+        .filter((m) => m.includes('invalid iteration count:'))
+        .every((m) => m.startsWith('[crypto] Rejecting stored hash with invalid iteration count:'))
+    ).toBe(true);
+    spy.mockRestore();
+  });
+});

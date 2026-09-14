@@ -1579,3 +1579,96 @@ describe('notify / auth-chain / servers TOKENMAXX residual leftovers after #272'
     );
   });
 });
+
+describe('auth-chain TOKENMAXX residual leftovers after #282', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('concurrent getAuthChain([]) → [] ∥ capped deep chain warn never poisons empty tips', async () => {
+    const deep = new Map<string, PDU>();
+    for (let i = 0; i < 520; i++) {
+      deep.set(`$d${i}`, pdu(`$d${i}`, i === 0 ? [] : [`$d${i - 1}`]));
+    }
+    const db = createAuthChainDb(deep);
+    const [empty, capped] = await Promise.all([
+      getAuthChain(db, []),
+      getAuthChain(db, ['$d519']),
+    ]);
+    expect(empty).toEqual([]);
+    expect(capped).toHaveLength(500);
+    expect(console.warn).toHaveBeenCalledWith(
+      '[getAuthChain] reached MAX_AUTH_CHAIN_SIZE cap',
+      500,
+      'aborting traversal'
+    );
+  });
+
+  it('concurrent getStateAtEvent ignores missing state_key while sibling last-wins colliding state', async () => {
+    const skipLeaf = '$skip-leaf';
+    const winLeaf = '$win-leaf';
+    const events = new Map<string, PDU>([
+      [
+        skipLeaf,
+        pdu(skipLeaf, ['$msg', '$name'], {
+          type: 'm.room.message',
+          content: { body: 'x' },
+        }),
+      ],
+      [
+        '$msg',
+        pdu('$msg', [], {
+          type: 'm.room.message',
+          content: { body: 'auth-msg' },
+        }),
+      ],
+      [
+        '$name',
+        pdu('$name', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'kept' },
+        }),
+      ],
+      [
+        winLeaf,
+        pdu(winLeaf, ['$a1', '$a2'], {
+          type: 'm.room.message',
+          content: { body: 'y' },
+        }),
+      ],
+      [
+        '$a1',
+        pdu('$a1', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'first' },
+        }),
+      ],
+      [
+        '$a2',
+        pdu('$a2', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'second' },
+        }),
+      ],
+    ]);
+    delete (events.get(skipLeaf) as { state_key?: string }).state_key;
+    delete (events.get('$msg') as { state_key?: string }).state_key;
+    delete (events.get(winLeaf) as { state_key?: string }).state_key;
+    const db = createAuthChainDb(events);
+    const [skipped, won] = await Promise.all([
+      getStateAtEvent(db, skipLeaf),
+      getStateAtEvent(db, winLeaf),
+    ]);
+    expect(skipped.map((e) => e.event_id)).toEqual(['$name']);
+    expect(skipped[0].content).toEqual({ name: 'kept' });
+    expect(won).toHaveLength(1);
+    expect(won[0].event_id).toBe('$a2');
+    expect(won[0].content).toEqual({ name: 'second' });
+  });
+});

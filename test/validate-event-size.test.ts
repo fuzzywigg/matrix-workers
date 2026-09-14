@@ -385,3 +385,49 @@ describe('validateEventSize TOKENMAXX residual leftovers after #272', () => {
     expect(JSON.stringify(bad)).toBe(beforeBad);
   });
 });
+
+describe('validateEventSize TOKENMAXX residual leftovers after #282', () => {
+  it('concurrent content null/undefined soft path ∥ hard-cap reject stays isolated', async () => {
+    const nullContent = baseEvent({ body: 'ignored' });
+    (nullContent as { content: unknown }).content = null;
+    const undefContent = baseEvent({ body: 'ignored' });
+    delete (undefContent as { content?: unknown }).content;
+
+    const hard = baseEvent({ body: 'hard' });
+    hard.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    expect(JSON.stringify(hard.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(hard).length).toBeGreaterThan(921_600);
+
+    const beforeNull = JSON.stringify(nullContent);
+    const beforeUndef = JSON.stringify(undefContent);
+    const beforeHard = JSON.stringify(hard);
+
+    const [nullResult, undefResult, hardResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(nullContent as PDU);
+        return 'null-ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(undefContent as PDU);
+        return 'undef-ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(hard);
+        return 'hard';
+      }),
+    ]);
+
+    expect(nullResult.status).toBe('fulfilled');
+    expect(undefResult.status).toBe('fulfilled');
+    expect(hardResult.status).toBe('rejected');
+    if (hardResult.status === 'rejected') {
+      expect(hardResult.reason).toBeInstanceOf(MatrixApiError);
+      expect((hardResult.reason as MatrixApiError).message).toMatch(/D1 row limit/);
+    }
+    // content ?? {} soft path: JSON.stringify(null) is "null" (4 bytes) / missing → "{}"
+    expect(JSON.stringify((nullContent as { content: unknown }).content)).toBe('null');
+    expect(JSON.stringify(nullContent)).toBe(beforeNull);
+    expect(JSON.stringify(undefContent)).toBe(beforeUndef);
+    expect(JSON.stringify(hard)).toBe(beforeHard);
+  });
+});
