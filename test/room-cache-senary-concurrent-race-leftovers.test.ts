@@ -39,7 +39,6 @@ const ROOM_B = '!beta:example.com';
 const ROOM_C = '!gamma:example.com';
 const ROOM_D = '!delta:example.com';
 const NOW = 1_700_000_000_000;
-const TTL_MS = 5 * 60 * 1000;
 const TTL_SECONDS = 60 * 5;
 
 type RoomSpec = {
@@ -533,10 +532,11 @@ describe('race senary gen 1e2/-0 get∥bump after #273', () => {
         bumpRoomCacheGeneration(kv, ROOM_B),
       ]);
 
-      // parseInt('1e2',10)→1; parseInt('-0',10)→0
+      // parseInt('1e2',10)→1; parseInt('-0',10)→-0 (Object.is distinct from +0)
       expect(gA).toBe(1);
       expect(bumpedA).toBe(2);
-      expect(gB).toBe(0);
+      expect(gB === 0).toBe(true);
+      expect(Object.is(gB, -0)).toBe(true);
       expect(bumpedB).toBe(1);
       expect(ctl.data[genKey(ROOM_A)]).toBe('2');
       expect(ctl.data[genKey(ROOM_B)]).toBe('1');
@@ -698,13 +698,16 @@ describe('race senary bump getThrows then putThrows reject after #273', () => {
         ],
       });
 
-      const [aSettled, b] = await Promise.allSettled([
+      const [aSettled, bSettled] = await Promise.allSettled([
         bumpRoomCacheGeneration(kv, ROOM_A),
         bumpRoomCacheGeneration(kv, ROOM_B),
       ]);
 
       expect(aSettled.status).toBe('rejected');
-      expect(b).toBe(4);
+      expect(bSettled.status).toBe('fulfilled');
+      if (bSettled.status === 'fulfilled') {
+        expect(bSettled.value).toBe(4);
+      }
       expect(ctl.data[genKey(ROOM_A)]).toBe('5'); // put never committed
       expect(ctl.data[genKey(ROOM_B)]).toBe('4');
     });
