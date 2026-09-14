@@ -176,7 +176,7 @@ function createFederationDO(edus: EduCapture[] = [], opts: { throwOnSend?: boole
     idFromName(name: string) {
       return { name };
     },
-    get(id: { name: string }) {
+    get(_id: { name: string }) {
       return {
         async fetch(req: Request): Promise<Response> {
           if (opts.throwOnSend) {
