@@ -773,3 +773,538 @@ describe('RoomDurableObject TOKENMAXX receipt/WS edges after #74', () => {
     expect(await res.text()).toBe('OK');
   });
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #240 — RoomDurableObject hibernation
+ * *concurrent race / TOCTOU*. Sequential WS/typing/receipt coverage lives
+ * above; concurrent Promise.all coverage was zero (distinct from CallRoom
+ * hibernation races in call-room-hibernation.test.ts).
+ */
+
+class RacingRoomStorage {
+  map = new Map<string, unknown>();
+  events: string[] = [];
+  putHold = new Set<string>();
+  putWaiters = new Map<string, Array<() => void>>();
+  listHold = false;
+  listWaiters: Array<() => void> = [];
+  listCalls = 0;
+
+  async get(key: string): Promise<unknown> {
+    return this.map.get(key);
+  }
+
+  async put(key: string, value: unknown): Promise<void> {
+    this.events.push(`put:${key}`);
+    if (this.putHold.has(key)) {
+      await new Promise<void>((resolve) => {
+        const arr = this.putWaiters.get(key) ?? [];
+        arr.push(resolve);
+        this.putWaiters.set(key, arr);
+      });
+    }
+    this.map.set(key, structuredClone(value));
+  }
+
+  releasePut(key: string): void {
+    this.putHold.delete(key);
+    const arr = this.putWaiters.get(key) ?? [];
+    this.putWaiters.delete(key);
+    for (const w of arr) w();
+  }
+
+  async delete(key: string): Promise<void> {
+    this.events.push(`delete:${key}`);
+    this.map.delete(key);
+  }
+
+  async deleteAll(): Promise<void> {
+    this.map.clear();
+  }
+
+  async list<T>(options: { prefix: string; limit?: number } = { prefix: '' }): Promise<Map<string, T>> {
+    this.listCalls += 1;
+    this.events.push(`list:${options.prefix}`);
+    if (this.listHold) {
+      await new Promise<void>((resolve) => {
+        this.listWaiters.push(resolve);
+      });
+    }
+    const out = new Map<string, T>();
+    for (const [k, v] of [...this.map.entries()].sort()) {
+      if (k.startsWith(options.prefix)) {
+        out.set(k, v as T);
+        if (options.limit !== undefined && out.size >= options.limit) break;
+      }
+    }
+    return out;
+  }
+
+  async getAlarm(): Promise<number | null> {
+    return null;
+  }
+
+  async setAlarm(_at: number): Promise<void> {}
+
+  async deleteAlarm(): Promise<void> {}
+}
+
+class RacingRoomState {
+  storage: RacingRoomStorage;
+  sockets: FakeWebSocket[] = [];
+
+  constructor(storage = new RacingRoomStorage()) {
+    this.storage = storage;
+  }
+
+  getWebSockets(): FakeWebSocket[] {
+    return this.sockets;
+  }
+
+  acceptWebSocket(ws: FakeWebSocket, tags?: string[]): void {
+    if (tags) ws.tags = tags;
+    this.sockets.push(ws);
+  }
+
+  setWebSocketAutoResponse(): void {}
+
+  blockConcurrencyWhile(cb: () => Promise<void>): Promise<void> {
+    return cb();
+  }
+}
+
+function makeRacingRoomDo(state = new RacingRoomState()) {
+  return {
+    state,
+    do: new RoomDurableObject(state as unknown as DurableObjectState, {} as Env),
+  };
+}
+
+function wsMsg(
+  room: RoomDurableObject,
+  ws: FakeWebSocket,
+  message: string | ArrayBuffer
+): Promise<void> {
+  return (
+    room as unknown as {
+      webSocketMessage: (ws: FakeWebSocket, m: string | ArrayBuffer) => Promise<void>;
+    }
+  ).webSocketMessage(ws, message);
+}
+
+function wsClose(
+  room: RoomDurableObject,
+  ws: FakeWebSocket,
+  code = 1000,
+  reason = 'bye'
+): Promise<void> {
+  return (
+    room as unknown as {
+      webSocketClose: (
+        ws: FakeWebSocket,
+        code: number,
+        reason: string,
+        wasClean: boolean
+      ) => Promise<void>;
+    }
+  ).webSocketClose(ws, code, reason, true);
+}
+
+function wsError(room: RoomDurableObject, ws: FakeWebSocket, err: unknown = new Error('x')): Promise<void> {
+  return (
+    room as unknown as {
+      webSocketError: (ws: FakeWebSocket, error: unknown) => Promise<void>;
+    }
+  ).webSocketError(ws, err);
+}
+
+describe('RoomDurableObject hibernation concurrent upgrade/state leftovers after #240', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`dual upgrade at cap-1: accept TOCTOU or 503 flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      for (let s = 0; s < 499; s++) state.sockets.push(new FakeWebSocket());
+      vi.stubGlobal(
+        'WebSocketPair',
+        class {
+          0 = new FakeWebSocket();
+          1 = new FakeWebSocket();
+        }
+      );
+
+      const results = await Promise.allSettled([
+        room.fetch(
+          new Request('https://do/websocket?user_id=@a:example.com&room_id=!r:example.com', {
+            headers: { Upgrade: 'websocket' },
+          })
+        ),
+        room.fetch(
+          new Request('https://do/websocket?user_id=@b:example.com&room_id=!r:example.com', {
+            headers: { Upgrade: 'websocket' },
+          })
+        ),
+      ]);
+
+      // Cap check is non-atomic: both may pass at 499 before either acceptWebSocket
+      // (documented TOCTOU → 501), or one accepts then the other gets 503.
+      // Response(101) throws in Node, so accepted legs often settle as 'throw'.
+      const accepted = state.sockets.length - 499;
+      expect(accepted).toBeGreaterThanOrEqual(1);
+      expect(accepted).toBeLessThanOrEqual(2);
+      const statuses = results.map((r) =>
+        r.status === 'fulfilled' ? r.value.status : 'throw'
+      );
+      if (accepted === 1) {
+        expect(statuses.filter((s) => s === 503)).toHaveLength(1);
+      } else {
+        expect(statuses.filter((s) => s === 503)).toHaveLength(0);
+      }
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`state∥upgrade eventual connected_users flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      vi.stubGlobal(
+        'WebSocketPair',
+        class {
+          0 = new FakeWebSocket();
+          1 = new FakeWebSocket();
+        }
+      );
+
+      const [stateRes] = await Promise.allSettled([
+        room.fetch(new Request('https://do/state')),
+        room.fetch(
+          new Request(
+            'https://do/websocket?user_id=@a:example.com&room_id=!r:example.com&device_id=D1',
+            { headers: { Upgrade: 'websocket' } }
+          )
+        ),
+      ]);
+      expect(stateRes.status).toBe('fulfilled');
+      if (stateRes.status === 'fulfilled') {
+        const body = (await stateRes.value.json()) as { connection_count: number };
+        expect(body.connection_count === 0 || body.connection_count === 1).toBe(true);
+      }
+      const after = (await (await room.fetch(new Request('https://do/state'))).json()) as {
+        connected_users: string[];
+        connection_count: number;
+        room_id: string;
+      };
+      expect(after.connection_count).toBe(1);
+      expect(after.connected_users).toEqual(['@a:example.com']);
+      expect(after.room_id).toBe('!r:example.com');
+      expect(state.sockets).toHaveLength(1);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`broadcast∥dual close peer isolation flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      const c = new FakeWebSocket();
+      c.serializeAttachment({ userId: '@c:example.com', id: '3' });
+      state.sockets.push(a, b, c);
+
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/broadcast', {
+            method: 'POST',
+            body: JSON.stringify({ type: 'event', id: '$e' }),
+          })
+        ),
+        wsClose(room, a),
+        wsClose(room, b),
+      ]);
+
+      expect(c.sent.some((s) => s.includes('user_disconnected'))).toBe(true);
+      expect(a.closed?.code).toBe(1000);
+      expect(b.closed?.code).toBe(1000);
+    });
+  }
+});
+
+describe('RoomDurableObject hibernation concurrent typing/receipt leftovers after #240', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(50_000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`typing A∥B isolation both present flood-${i}`, async () => {
+      const { do: room } = makeRacingRoomDo();
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({ user_id: '@a:example.com', typing: true, timeout: 5_000 }),
+          })
+        ),
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({ user_id: '@b:example.com', typing: true, timeout: 5_000 }),
+          })
+        ),
+      ]);
+      const body = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(new Set(body.user_ids)).toEqual(new Set(['@a:example.com', '@b:example.com']));
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`typing start∥stop same user last-writer flood-${i}`, async () => {
+      const { do: room } = makeRacingRoomDo();
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({ user_id: '@a:example.com', typing: true, timeout: 5_000 }),
+          })
+        ),
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({ user_id: '@a:example.com', typing: false }),
+          })
+        ),
+      ]);
+      const body = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(body.user_ids.length === 0 || body.user_ids.includes('@a:example.com')).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`A∥B receipt isolation distinct keys flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              event_id: '$a',
+              receipt_type: 'm.read',
+            }),
+          })
+        ),
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@b:example.com',
+              event_id: '$b',
+              receipt_type: 'm.read',
+            }),
+          })
+        ),
+      ]);
+      expect(state.storage.map.has('receipt:@a:example.com:m.read:unthreaded')).toBe(true);
+      expect(state.storage.map.has('receipt:@b:example.com:m.read:unthreaded')).toBe(true);
+      const get = (await (await room.fetch(new Request('https://do/receipts'))).json()) as {
+        receipts: Record<string, Record<string, Record<string, { ts: number }>>>;
+      };
+      expect(get.receipts.$a['m.read']['@a:example.com'].ts).toBe(50_000);
+      expect(get.receipts.$b['m.read']['@b:example.com'].ts).toBe(50_000);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`dual receipt same user last-writer event_id flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              event_id: '$one',
+              receipt_type: 'm.read',
+            }),
+          })
+        ),
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              event_id: '$two',
+              receipt_type: 'm.read',
+            }),
+          })
+        ),
+      ]);
+      const stored = state.storage.map.get('receipt:@a:example.com:m.read:unthreaded') as {
+        event_id: string;
+      };
+      expect(['$one', '$two']).toContain(stored.event_id);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`receipt put-hold vs GET /receipts mid-write flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      state.storage.putHold.add('receipt:@a:example.com:m.read:unthreaded');
+      const putP = room.fetch(
+        new Request('https://do/receipt', {
+          method: 'PUT',
+          body: JSON.stringify({
+            user_id: '@a:example.com',
+            event_id: '$held',
+            receipt_type: 'm.read',
+          }),
+        })
+      );
+      await vi.waitFor(() => {
+        expect(state.storage.events.some((e) => e.startsWith('put:receipt:'))).toBe(true);
+      });
+      const mid = (await (await room.fetch(new Request('https://do/receipts'))).json()) as {
+        receipts: Record<string, unknown>;
+      };
+      expect(mid.receipts.$held).toBeUndefined();
+      state.storage.releasePut('receipt:@a:example.com:m.read:unthreaded');
+      expect((await putP).status).toBe(200);
+      const after = (await (await room.fetch(new Request('https://do/receipts'))).json()) as {
+        receipts: Record<string, Record<string, Record<string, unknown>>>;
+      };
+      expect(after.receipts.$held['m.read']['@a:example.com']).toBeDefined();
+    });
+  }
+});
+
+describe('RoomDurableObject hibernation concurrent WS message leftovers after #240', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`ping∥close same socket pong or closed flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const ws = new FakeWebSocket();
+      ws.serializeAttachment({ userId: '@a:example.com', id: 's' });
+      const peer = new FakeWebSocket();
+      peer.serializeAttachment({ userId: '@b:example.com', id: 'p' });
+      state.sockets.push(ws, peer);
+
+      await Promise.all([wsMsg(room, ws, JSON.stringify({ type: 'ping' })), wsClose(room, ws)]);
+
+      expect(ws.closed?.code).toBe(1000);
+      expect(peer.sent.some((s) => s.includes('user_disconnected'))).toBe(true);
+      // ping may or may not land before close
+      expect(ws.sent.length === 0 || ws.sent.includes(JSON.stringify({ type: 'pong' }))).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`typing WS A∥B broadcast isolation flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com' });
+      state.sockets.push(a, b);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'typing', typing: true })),
+        wsMsg(room, b, JSON.stringify({ type: 'typing', typing: true })),
+      ]);
+
+      expect(b.sent.some((s) => s.includes('"user_id":"@a:example.com"'))).toBe(true);
+      expect(a.sent.some((s) => s.includes('"user_id":"@b:example.com"'))).toBe(true);
+      expect(a.sent.every((s) => !s.includes('"user_id":"@a:example.com"'))).toBe(true);
+      expect(b.sent.every((s) => !s.includes('"user_id":"@b:example.com"'))).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`read receipt WS∥close peer notifies flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com' });
+      state.sockets.push(a, b);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'read', event_id: '$e1' })),
+        wsClose(room, b),
+      ]);
+
+      expect(state.storage.map.has('receipt:@a:example.com:m.read:unthreaded')).toBe(true);
+      expect(a.sent.some((s) => s.includes('user_disconnected'))).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`close∥error dual sockets both drop flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      state.sockets.push(a, b);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await Promise.all([wsClose(room, a), wsError(room, b)]);
+
+      expect(a.closed?.code).toBe(1000);
+      expect(b.closed).toBeNull();
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`ArrayBuffer∥ping isolation flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com' });
+      state.sockets.push(a, b);
+
+      await Promise.all([
+        wsMsg(room, a, new ArrayBuffer(0)),
+        wsMsg(room, b, JSON.stringify({ type: 'ping' })),
+      ]);
+
+      expect(a.sent).toEqual([]);
+      expect(b.sent).toContain(JSON.stringify({ type: 'pong' }));
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`malformed JSON∥typing peer still receives flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com' });
+      state.sockets.push(a, b);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await Promise.all([
+        wsMsg(room, a, '{not-json'),
+        wsMsg(room, b, JSON.stringify({ type: 'typing', typing: true })),
+      ]);
+
+      expect(a.sent.some((s) => s.includes('"user_id":"@b:example.com"'))).toBe(true);
+      expect(b.sent).toEqual([]);
+    });
+  }
+});
