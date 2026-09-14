@@ -4,6 +4,9 @@
  * After #226 leftover pass: sequential route edges not covered by concurrent-race
  * leftovers (#193) — PL 0/equal/state_default-falsy, extra-colon split, extra
  * body fields, visibility-without-room, servers JSON non-array, bind contracts.
+ * Residual after #241: null/empty room_id, JOIN case, servers ""/JSON-string,
+ * string/negative/null PL coerce, events_default ignored, creator "", NaN
+ * is_public, visibility null/array.
  * Tests-only — no product inventing.
  * Exercises alias resolve/create/delete + room visibility directory list.
  */
@@ -1315,5 +1318,223 @@ describe('aliases leftover deepen after #232 — PL shapes / boolean servers / n
     expect(Number.isFinite(ts)).toBe(true);
     expect(ts).toBeGreaterThanOrEqual(before);
     expect(ts).toBeLessThanOrEqual(after);
+  });
+});
+
+describe('aliases leftover residual deepen after #241 — PL coerce / servers / membership case', () => {
+  it('rejects room_id null as M_MISSING_PARAM', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#n:example.com')}`,
+      jsonInit('PUT', { room_id: null })
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+    expect(db.inserts).toHaveLength(0);
+  });
+
+  it('rejects room_id empty string as M_MISSING_PARAM', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#e:example.com')}`,
+      jsonInit('PUT', { room_id: '' })
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+  });
+
+  it('membership JOIN (wrong case) forbids alias create', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'JOIN' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${ALIAS_ENC}`,
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(res.status).toBe(403);
+    expect(db.inserts).toHaveLength(0);
+  });
+
+  it('GET resolve servers "" falls back to SERVER_NAME', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ servers: '' })],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ room_id: ROOM, servers: [SERVER] });
+  });
+
+  it('GET resolve servers JSON string value returned as-is', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ servers: '"solo.example.org"' })],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`);
+    expect(res.status).toBe(200);
+    expect((res.body as { servers: unknown }).servers).toBe('solo.example.org');
+  });
+
+  it('string users power "100" allows non-creator DELETE', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: '100' },
+        state_default: 50,
+      }),
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect(db.aliases).toHaveLength(0);
+  });
+
+  it('negative userPower=-1 / state_default=50 forbids DELETE', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: -1 },
+        state_default: 50,
+      }),
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(403);
+    expect(db.aliases).toHaveLength(1);
+  });
+
+  it('negative userPower=-1 / state_default=-5 allows DELETE', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: -1 },
+        state_default: -5,
+      }),
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect(db.aliases).toHaveLength(0);
+  });
+
+  it('users[userId]=null falls through to users_default for DELETE', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: null },
+        users_default: 80,
+        state_default: 50,
+      }),
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('events_default does not substitute for state_default gate', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 0 },
+        users_default: 0,
+        events_default: 100,
+        state_default: 50,
+      }),
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(403);
+    // users[USER]=0 falls through → users_default 0 → 0 < 50
+    expect(res.body).toMatchObject({ error: 'Insufficient power level to delete alias' });
+  });
+
+  it('creator_id empty string is not the requester — forbids without PL', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: '' })],
+      powerLevelsContent: null,
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(403);
+    expect(db.aliases).toHaveLength(1);
+  });
+
+  it('visibility null / empty / array rejected as M_MISSING_PARAM', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: null,
+    });
+    for (const visibility of [null, '', ['public']] as unknown[]) {
+      const res = await request(
+        db,
+        `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+        jsonInit('PUT', { visibility })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+    }
+    expect(db.updates).toHaveLength(0);
+  });
+
+  it('maps is_public NaN (falsy) to private', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: Number.NaN }],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ visibility: 'private' });
+  });
+
+  it('room_id array is truthy so not missing-param — room 404', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#arr:example.com')}`,
+      jsonInit('PUT', { room_id: [ROOM] })
+    );
+    expect(res.status).toBe(404);
+    expect(db.inserts).toHaveLength(0);
+  });
+
+  it('string power allows visibility PUT', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: '60' },
+        state_default: 50,
+      }),
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+      jsonInit('PUT', { visibility: 'public' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rooms[0].is_public).toBe(1);
   });
 });
