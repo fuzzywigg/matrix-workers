@@ -97,6 +97,21 @@ jobs:
       - run: npm ci
       - run: npm run test:admin-federation
 
+  # Fail-fast canary for turn concurrent-race leftovers
+  # (first-wave #299 + second-wave #313 + third-wave deepen). Isolates
+  # flake attribution before the full vitest suite.
+  turn-concurrent:
+    name: Turn Concurrent Race Canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:turn-concurrent
+
   test:
     name: Tests
     runs-on: ubuntu-latest
