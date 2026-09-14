@@ -2199,3 +2199,63 @@ describe('RoomDurableObject hibernation septenary typing/thread leftovers after 
     });
   }
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #281 — RoomDurableObject hibernation
+ * *octonary* (dual ping same socket, typing timeout 0∥GET).
+ */
+
+describe('RoomDurableObject hibernation octonary ping/timeout leftovers after #281', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`dual ping same socket two pongs flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      state.sockets.push(a);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'ping' })),
+        wsMsg(room, a, JSON.stringify({ type: 'ping' })),
+      ]);
+
+      expect(a.sent).toEqual([
+        JSON.stringify({ type: 'pong' }),
+        JSON.stringify({ type: 'pong' }),
+      ]);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`typing timeout 0 expires immediately∥GET flood-${i}`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(20_000);
+      const { do: room } = makeRacingRoomDo();
+
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              typing: true,
+              timeout: 0,
+            }),
+          })
+        ),
+        room.fetch(new Request('https://do/typing')),
+      ]);
+
+      // expiresAt = now + min(0,120000) = now → already expired on GET cleanup
+      const typing = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(typing.user_ids).toEqual([]);
+    });
+  }
+});

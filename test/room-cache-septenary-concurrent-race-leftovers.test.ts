@@ -526,3 +526,72 @@ describe('race septenary triple invalidate mid getBatch after #273 senary', () =
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Octonary deepen (same PR): nested avatar + missing-count-row ∥ hot sibling
+// ---------------------------------------------------------------------------
+
+describe('race octonary nested avatar + missing count row after #281', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`nested avatar url∥missing joined row→0∥hot sibling flood-${i}`, async () => {
+      const { kv, ctl } = createRacingKv({
+        data: {
+          [metaKey(ROOM_C)]: JSON.stringify(freshMeta({ name: 'CachedC' })),
+        },
+        getBarrier: [
+          [metaKey(ROOM_A), 1],
+          [metaKey(ROOM_B), 1],
+          [metaKey(ROOM_C), 1],
+        ],
+      });
+      const db = {
+        batchCalls: 0,
+        prepare(_sql: string) {
+          return {
+            bind(roomId: string) {
+              return { _roomId: roomId };
+            },
+          };
+        },
+        batch: vi.fn(async (stmts: Array<{ _roomId: string }>) => {
+          db.batchCalls += 1;
+          const roomId = stmts[0]?._roomId ?? '';
+          if (roomId === ROOM_A) {
+            return [
+              { results: [] },
+              { results: [{ content: JSON.stringify({ url: { nested: true } }) }] },
+              { results: [] },
+              { results: [] },
+              { results: [{ count: 2 }] },
+              { results: [{ count: 0 }] },
+            ];
+          }
+          // ROOM_B: missing joined count row → undefined?.count || 0
+          return [
+            { results: [] },
+            { results: [] },
+            { results: [] },
+            { results: [] },
+            { results: [] },
+            { results: [{ count: 3 }] },
+          ];
+        }),
+      } as unknown as D1Database & { batchCalls: number };
+
+      const [a, b, c] = await Promise.all([
+        getRoomMetadata(kv, db, ROOM_A),
+        getRoomMetadata(kv, db, ROOM_B),
+        getRoomMetadata(kv, db, ROOM_C),
+      ]);
+
+      expect(a?.avatar).toEqual({ nested: true });
+      expect(a?.joinedCount).toBe(2);
+      expect(b?.joinedCount).toBe(0);
+      expect(b?.invitedCount).toBe(3);
+      expect(b?.isDm).toBe(true);
+      expect(c?.name).toBe('CachedC');
+      expect(db.batchCalls).toBe(2);
+      expect(ctl.putCount.get(metaKey(ROOM_C)) ?? 0).toBe(0);
+    });
+  }
+});
