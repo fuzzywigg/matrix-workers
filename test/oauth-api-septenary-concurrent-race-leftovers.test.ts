@@ -26,7 +26,6 @@ import type { Env } from '../src/types';
 const SERVER = 'example.com';
 const USER_ID = `@alice:${SERVER}`;
 const BOB_ID = `@bob:${SERVER}`;
-const REDIRECT = 'https://element.example.com/callback';
 const NOW = 1_730_000_000_000;
 
 vi.mock('../src/utils/crypto', async (importOriginal) => {
@@ -381,30 +380,10 @@ async function request(path: string, init: RequestInit = {}, env: Env = makeEnv(
   return { status: res.status, body, headers: res.headers, text };
 }
 
-function statusesOf(results: Array<{ status: number }>): number[] {
-  return results.map((r) => r.status).sort((a, b) => a - b);
-}
-
 function formInit(fields: Record<string, string>): RequestInit {
   const fd = new FormData();
   for (const [k, v] of Object.entries(fields)) fd.set(k, v);
   return { method: 'POST', body: fd };
-}
-
-function seedClient(cache: RaceKv, clientId: string, patch: Record<string, unknown> = {}) {
-  const client = {
-    client_id: clientId,
-    client_secret_hash: null,
-    client_name: 'Element Web',
-    redirect_uris: [REDIRECT],
-    grant_types: ['authorization_code', 'refresh_token'],
-    response_types: ['code'],
-    token_endpoint_auth_method: 'none',
-    created_at: NOW,
-    ...patch,
-  };
-  cache.data[`oauth_client:${clientId}`] = JSON.stringify(client);
-  return client;
 }
 
 beforeEach(() => {
@@ -419,23 +398,6 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
-
-function seedAuthRequest(
-  sessions: RaceKv,
-  id: string,
-  patch: Record<string, unknown> = {}
-) {
-  const req = {
-    client_id: 'cid-1',
-    redirect_uri: REDIRECT,
-    scope: 'openid',
-    state: 'st',
-    nonce: 'n',
-    ...patch,
-  };
-  sessions.data[`oauth_auth_request:${id}`] = JSON.stringify(req);
-  return req;
-}
 
 function seedUiaSession(cache: RaceKv, id: string, patch: Record<string, unknown> = {}) {
   const session = { user_id: USER_ID, completed_stages: [] as string[], ...patch };

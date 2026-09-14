@@ -59,19 +59,14 @@ vi.mock('../src/utils/ids', async (importOriginal) => {
   };
 });
 
-import devicesApp from '../src/api/devices';
 import keysApp from '../src/api/keys';
 import { verifyPassword } from '../src/utils/crypto';
 
 const USER = '@alice:example.com';
 const BOB = '@bob:example.com';
 const SERVER = 'example.com';
-const PASS = 's3cret';
 const AUTH = { Authorization: 'Bearer test-token' };
-const DEVICES = '/_matrix/client/v3/devices';
-const DELETE_DEVICES = '/_matrix/client/v3/delete_devices';
 const DEVICE_SIGNING = '/_matrix/client/v3/keys/device_signing/upload';
-const SSO_REDIRECT = '/_matrix/client/v3/auth/m.login.sso/redirect';
 const SSO_CALLBACK = '/_matrix/client/v3/auth/m.login.sso/callback';
 const TOKEN_SUBMIT = '/_matrix/client/v3/auth/m.login.token/submit';
 
@@ -89,14 +84,6 @@ const SESSION_MISMATCH = {
   errcode: 'M_FORBIDDEN',
   error: 'Session user mismatch',
 } as const;
-
-type DeviceRow = {
-  device_id: string;
-  user_id: string;
-  display_name: string | null;
-  last_seen_ts: number | null;
-  last_seen_ip: string | null;
-};
 
 type KvPut = { key: string; value: string; options?: { expirationTtl?: number } };
 
@@ -139,138 +126,6 @@ function mockKv(data: Record<string, string> = {}) {
     data: Record<string, string>;
     puts: KvPut[];
     deletes: string[];
-  };
-}
-
-function createDevicesDb(opts: {
-  devices?: DeviceRow[];
-  passwordHash?: string | null;
-  missingUser?: boolean;
-  deleted?: string[];
-} = {}) {
-  const deviceRows = opts.devices ?? [];
-  const passwordHash =
-    opts.passwordHash === undefined ? `mockok:${PASS}` : opts.passwordHash;
-  const missingUser = opts.missingUser ?? false;
-  const deleted = opts.deleted ?? [];
-
-  return {
-    devices: deviceRows,
-    deleted,
-    prepare(sql: string) {
-      return {
-        bind(...args: unknown[]) {
-          return {
-            async first<T>() {
-              if (sql.includes('SELECT password_hash FROM users')) {
-                if (missingUser) return null as T;
-                return { password_hash: passwordHash } as T;
-              }
-              if (
-                sql.includes('FROM devices') &&
-                sql.includes('device_id = ?') &&
-                sql.includes('display_name')
-              ) {
-                const [userId, deviceId] = args as string[];
-                const row = deviceRows.find(
-                  (d) => d.user_id === userId && d.device_id === deviceId
-                );
-                if (!row) return null as T;
-                return {
-                  device_id: row.device_id,
-                  display_name: row.display_name,
-                  last_seen_ts: row.last_seen_ts,
-                  last_seen_ip: row.last_seen_ip,
-                } as T;
-              }
-              if (
-                sql.includes('SELECT device_id FROM devices') &&
-                sql.includes('device_id = ?')
-              ) {
-                const [userId, deviceId] = args as string[];
-                const row = deviceRows.find(
-                  (d) => d.user_id === userId && d.device_id === deviceId
-                );
-                return (row ? { device_id: row.device_id } : null) as T;
-              }
-              throw new Error(`Unhandled first() SQL: ${sql.slice(0, 140)}`);
-            },
-            async all<T>() {
-              if (
-                sql.includes('FROM devices') &&
-                sql.includes('WHERE user_id = ?') &&
-                !sql.includes('device_id = ?')
-              ) {
-                const userId = args[0] as string;
-                const results = deviceRows
-                  .filter((d) => d.user_id === userId)
-                  .map((d) => ({
-                    device_id: d.device_id,
-                    display_name: d.display_name,
-                    last_seen_ts: d.last_seen_ts,
-                    last_seen_ip: d.last_seen_ip,
-                  }));
-                return { results: results as T[] };
-              }
-              throw new Error(`Unhandled all() SQL: ${sql.slice(0, 140)}`);
-            },
-            async run() {
-              if (sql.includes('UPDATE devices SET display_name')) {
-                return { success: true, meta: { changes: 0, last_row_id: 0 } };
-              }
-              if (sql.includes('DELETE FROM devices')) {
-                deleted.push(String(args[1]));
-                return { success: true, meta: { changes: 1, last_row_id: 0 } };
-              }
-              if (
-                sql.includes('DELETE FROM access_tokens') ||
-                sql.includes('DELETE FROM device_keys')
-              ) {
-                return { success: true, meta: { changes: 1, last_row_id: 0 } };
-              }
-              throw new Error(`Unhandled run() SQL: ${sql.slice(0, 140)}`);
-            },
-          };
-        },
-      };
-    },
-  };
-}
-
-type DevicesDb = ReturnType<typeof createDevicesDb>;
-
-function devicesEnv(db: DevicesDb): Env {
-  return {
-    DB: db as unknown as D1Database,
-    SERVER_NAME: SERVER,
-  } as unknown as Env;
-}
-
-async function devicesRequest(
-  db: DevicesDb,
-  path: string,
-  init: RequestInit = {}
-): Promise<{ status: number; body: unknown }> {
-  const res = await devicesApp.request(`http://localhost${path}`, init, devicesEnv(db));
-  const text = await res.text();
-  let body: unknown = null;
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
-    }
-  }
-  return { status: res.status, body };
-}
-
-function seedDevice(overrides: Partial<DeviceRow> = {}): DeviceRow {
-  return {
-    device_id: overrides.device_id ?? 'PHONE',
-    user_id: overrides.user_id ?? USER,
-    display_name: overrides.display_name ?? null,
-    last_seen_ts: overrides.last_seen_ts ?? null,
-    last_seen_ip: overrides.last_seen_ip ?? null,
   };
 }
 
