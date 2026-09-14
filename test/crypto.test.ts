@@ -450,3 +450,184 @@ describe('federation signing TOKENMAXX leftovers after #226', () => {
     expect(await verifySignature(tamperedUnsigned, 'ex.com', keyId, publicKey)).toBe(true);
   });
 });
+
+/** Craft a PBKDF2 stored hash at an arbitrary iteration count (for boundary checks). */
+async function craftPbkdf2Hash(password: string, iterations: number): Promise<string> {
+  const salt = new Uint8Array(16).fill(7);
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(password),
+    'PBKDF2',
+    false,
+    ['deriveBits']
+  );
+  const hash = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  const saltB64 = btoa(String.fromCharCode(...salt));
+  const hashB64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
+  return `$pbkdf2-sha256$${iterations}$${saltB64}$${hashB64}`;
+}
+
+describe('crypto TOKENMAXX leftovers after #232', () => {
+  it(
+    'accepts verifyPassword at the exact 2000000 iteration upper bound',
+    async () => {
+      const hash = await craftPbkdf2Hash('bound-hi-1', 2_000_000);
+      expect(await verifyPassword('bound-hi-1', hash)).toBe(true);
+      // Corrupt hash segment instead of re-deriving — avoids a third 2M-iteration PBKDF2
+      const parts = hash.split('$');
+      parts[4] = parts[4] === 'AAAA' ? 'BBBB' : 'AAAA';
+      expect(await verifyPassword('bound-hi-1', parts.join('$'))).toBe(false);
+    },
+    60_000
+  );
+
+  it('rejects whitespace-only and letter+digit short-of-eight passwords', () => {
+    expect(validatePasswordStrength('        ')).toMatch(/letter/);
+    expect(validatePasswordStrength('abcdef7')).toMatch(/at least 8/);
+    expect(validatePasswordStrength('abcdefg1')).toBeNull();
+  });
+
+  it('timingSafeEqual handles equal unicode strings and unequal code-unit lengths', () => {
+    expect(timingSafeEqual('café', 'café')).toBe(true);
+    expect(timingSafeEqual('café', 'cafe')).toBe(false);
+    expect(timingSafeEqual('😀😀', '😀😀')).toBe(true);
+    // JS string length is UTF-16 code units — emoji is length 2 each
+    expect(timingSafeEqual('😀', 'ab')).toBe(false);
+  });
+
+  it('sha256 of multi-byte UTF-8 string matches encoding the same bytes', async () => {
+    const s = '東京🔐';
+    const fromString = await sha256(s);
+    const fromBytes = await sha256(new TextEncoder().encode(s));
+    expect(fromString).toBe(fromBytes);
+    expect(await hashToken(s)).toBe(fromString);
+  });
+
+  it('canonicalJson maps undefined array elements to null', () => {
+    expect(canonicalJson([1, undefined, null])).toBe('[1,null,null]');
+  });
+
+  it('calculateContentHash strips signatures and unsigned together', async () => {
+    const bare = { type: 'm.test', content: { n: 2 } };
+    const decorated = {
+      ...bare,
+      signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+      unsigned: { age: 1, redacted_because: { a: 1 } },
+    };
+    expect(await calculateContentHash(bare)).toBe(await calculateContentHash(decorated));
+    expect(await verifyContentHash(decorated, await calculateContentHash(bare))).toBe(true);
+  });
+
+  it('base64UrlEncode/Decode round-trip empty and all-zero signing material', () => {
+    expect(Array.from(base64UrlDecode(base64UrlEncode(new Uint8Array())))).toEqual([]);
+    const zeros = new Uint8Array(32);
+    expect(Array.from(base64UrlDecode(base64UrlEncode(zeros)))).toEqual(Array.from(zeros));
+  });
+
+  it('hashPassword / verifyPassword stay isolated under Promise.all', async () => {
+    const [a, b, c] = await Promise.all([
+      hashPassword('parallel-a-1'),
+      hashPassword('parallel-b-1'),
+      hashPassword('parallel-a-1'),
+    ]);
+    expect(a).not.toBe(b);
+    expect(a).not.toBe(c);
+    const [okA, okB, bad] = await Promise.all([
+      verifyPassword('parallel-a-1', a),
+      verifyPassword('parallel-b-1', b),
+      verifyPassword('parallel-a-1', b),
+    ]);
+    expect(okA).toBe(true);
+    expect(okB).toBe(true);
+    expect(bad).toBe(false);
+    expect(await verifyPassword('parallel-a-1', c)).toBe(true);
+  });
+
+  it('generateRandomString(128) stays in alphabet and differs across calls', () => {
+    const a = generateRandomString(128);
+    const b = generateRandomString(128);
+    expect(a).toHaveLength(128);
+    expect(b).toHaveLength(128);
+    expect(a).toMatch(/^[A-Za-z0-9]+$/);
+    expect(a).not.toBe(b);
+  });
+});
+
+describe('federation signing TOKENMAXX leftovers after #232', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('signJson does not mutate the input object signatures map', async () => {
+    const { privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const obj: Record<string, unknown> = {
+      type: 'm.test',
+      content: {},
+      signatures: { 'other.example.com': { 'ed25519:old': 'keep' } },
+    };
+    const before = JSON.stringify(obj.signatures);
+    const signed = await signJson(obj, 'ex.com', keyId, privateKeyJwk);
+    expect(JSON.stringify(obj.signatures)).toBe(before);
+    expect(signed).not.toBe(obj);
+    expect((signed.signatures as Record<string, unknown>)['other.example.com']).toEqual({
+      'ed25519:old': 'keep',
+    });
+  });
+
+  it('verifySignature returns false for empty-string signature bytes', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test' }, 'ex.com', keyId, privateKeyJwk);
+    const sigs = signed.signatures as Record<string, Record<string, string>>;
+    sigs['ex.com'][keyId] = '';
+    expect(await verifySignature(signed, 'ex.com', keyId, publicKey)).toBe(false);
+    vi.restoreAllMocks();
+  });
+
+  it('verifySignature returns false when signatures map lacks the keyId under the server', async () => {
+    const { publicKey, keyId } = await generateSigningKeyPair();
+    const obj = {
+      type: 'm.test',
+      signatures: { 'ex.com': { 'ed25519:other': 'AA' } },
+    };
+    expect(await verifySignature(obj, 'ex.com', keyId, publicKey)).toBe(false);
+  });
+
+  it('generateSigningKeyPair produces distinct keyIds across calls', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    expect(a.keyId).not.toBe(b.keyId);
+    expect(a.publicKey).not.toBe(b.publicKey);
+  });
+
+  it('parallel signJson on disjoint servers preserves both signatures', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const base = { type: 'm.test', content: { n: 1 } };
+    const [signedA, signedB] = await Promise.all([
+      signJson(base, 'a.example.com', a.keyId, a.privateKeyJwk),
+      signJson(base, 'b.example.com', b.keyId, b.privateKeyJwk),
+    ]);
+    // Each call starts from the unsigned base — merge manually to verify both keys work
+    const merged = {
+      ...base,
+      signatures: {
+        ...(signedA.signatures as object),
+        ...(signedB.signatures as object),
+      },
+    };
+    expect(await verifySignature(merged, 'a.example.com', a.keyId, a.publicKey)).toBe(true);
+    expect(await verifySignature(merged, 'b.example.com', b.keyId, b.publicKey)).toBe(true);
+  });
+});
