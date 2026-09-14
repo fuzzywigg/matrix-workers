@@ -595,3 +595,37 @@ describe('race octonary nested avatar + missing count row after #281', () => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Nonary deepen (same PR): empty-string / whitespace count coercions
+// ---------------------------------------------------------------------------
+
+describe('race nonary empty-string/whitespace count coercions after #281', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`joinedRaw ''→0∥invitedRaw ' ' truthy under parallel miss flood-${i}`, async () => {
+      const { kv, ctl } = createRacingKv({
+        getBarrier: [
+          [metaKey(ROOM_A), 1],
+          [metaKey(ROOM_B), 1],
+        ],
+      });
+      const db = mockDb({
+        [ROOM_A]: { joinedRaw: '', invitedRaw: 2 },
+        [ROOM_B]: { joinedRaw: 1, invitedRaw: ' ' },
+      });
+
+      const [a, b] = await Promise.all([
+        getRoomMetadata(kv, db, ROOM_A),
+        getRoomMetadata(kv, db, ROOM_B),
+      ]);
+
+      // '' || 0 → 0; ' ' || 0 → ' ' (truthy whitespace string)
+      expect(a?.joinedCount).toBe(0);
+      expect(a?.invitedCount).toBe(2);
+      expect(a?.isDm).toBe(true);
+      expect(b?.joinedCount).toBe(1);
+      expect(b?.invitedCount).toBe(' ');
+      expect(ctl.putTtl.get(metaKey(ROOM_A))).toBe(TTL_SECONDS);
+    });
+  }
+});

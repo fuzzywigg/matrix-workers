@@ -2259,3 +2259,37 @@ describe('RoomDurableObject hibernation octonary ping/timeout leftovers after #2
     });
   }
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #281 — RoomDurableObject hibernation
+ * *nonary* (ping∥close same socket).
+ */
+
+describe('RoomDurableObject hibernation nonary ping/close leftovers after #281', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`ping∥close same socket pong-or-closed LWW flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      state.sockets.push(a, b);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'ping' })),
+        wsClose(room, a, 1000, 'bye'),
+      ]);
+
+      // Ping may land before close (pong) or after (no send); close always sets closed
+      expect(a.closed?.code).toBe(1000);
+      expect(a.sent.length === 0 || a.sent[0] === JSON.stringify({ type: 'pong' })).toBe(
+        true
+      );
+      expect(b.sent.some((s) => JSON.parse(s).type === 'user_disconnected')).toBe(true);
+    });
+  }
+});

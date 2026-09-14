@@ -2861,3 +2861,61 @@ describe('CallRoom hibernation octonary ALREADY_JOINED/unmute after #281', () =>
     });
   }
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #281 — CallRoom hibernation *nonary*
+ * (createSession reject∥sibling join isolation).
+ */
+
+describe('CallRoom hibernation nonary createSession reject after #281', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    renegotiateMock.mockResolvedValue(undefined);
+    addTracksMock.mockResolvedValue({
+      sessionDescription: { type: 'answer', sdp: 'v=a' },
+      tracks: [{ mid: '9' }],
+    });
+    closeTracksMock.mockResolvedValue(undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`createSession reject∥sibling join welcome isolation flood-${i}`, async () => {
+      createSessionMock
+        .mockRejectedValueOnce(new Error('sfu-create-down'))
+        .mockResolvedValueOnce({ sessionId: 'sess-ok' });
+      const state = new RacingState();
+      const wsA = new FakeWebSocket();
+      const wsB = new FakeWebSocket();
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(
+          wsA,
+          JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+        ),
+        room.webSocketMessage(
+          wsB,
+          JSON.stringify({ type: 'join', userId: 'u2', deviceId: 'd2' })
+        ),
+      ]);
+
+      const aCodes = wsA.sent.map((s) => JSON.parse(s));
+      const bCodes = wsB.sent.map((s) => JSON.parse(s));
+      // One fails INTERNAL_ERROR, one welcomes (order of mockRejectedValueOnce races)
+      const errors = [...aCodes, ...bCodes].filter((m) => m.code === 'INTERNAL_ERROR');
+      const welcomes = [...aCodes, ...bCodes].filter((m) => m.type === 'welcome');
+      expect(errors.length).toBe(1);
+      expect(welcomes.length).toBe(1);
+      expect(room.participants.size).toBe(1);
+    });
+  }
+});
