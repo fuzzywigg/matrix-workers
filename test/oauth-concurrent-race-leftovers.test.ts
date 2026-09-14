@@ -1,18 +1,18 @@
 /**
  * TOKENMAXX HEAVY leftovers after #215 / deepen after #232 / residual after #238
- * / tip deepen after #252 — oauth *concurrent race / TOCTOU* for
- * `src/api/oauth.ts` (register / authorize / token / refresh / revoke /
- * introspect / userinfo / UIA).
+ * / tip deepen after #252 / residual after #260 — oauth *concurrent race /
+ * TOCTOU* for `src/api/oauth.ts` (register / authorize / token / refresh /
+ * revoke / introspect / userinfo / UIA).
  *
  * Soft/contract leftovers for oauth are deep (#177/#186 and oauth-api-* files)
  * but concurrent-race coverage was near-zero: only a sequential "distinct auth
  * codes" case in oauth-api-route-leftovers (no Promise.all / KV get-barrier
  * double-spend / refresh rotation races).
  *
- * Distinct from tip #252 (crypto+db+errors), #244 (this slice residual after
- * #238), #241/#240/#239 siblings, and saturated keys/devices/to-device/media/
- * rooms/voip/sync/push concurrent-race files. Orthogonal to login-qr-identity
- * races (#163) and account OpenID mint (#209).
+ * Distinct from tip #260 (oauth+oidc deleteBarrier tip), #252 (crypto+db+
+ * errors), #244/#238 prior oauth race deepens, and saturated keys/devices/
+ * to-device/media/rooms/voip/sync/push concurrent-race files. Orthogonal to
+ * login-qr-identity races (#163) and account OpenID mint (#209).
  *
  * Focus: auth-code double-redeem get-barrier TOCTOU; refresh rotate∥rotate;
  * authorize auth_request single-flight consume; register∥register distinct
@@ -23,8 +23,12 @@
  * corrupt code+refresh, refresh device/scope preserve, register/GET defaults,
  * userinfo vanish, UIA mid-wipe, public-client secret skip.
  * Residual after #252 tip: deleteBarrier redeem/rotate, Location omit-state,
- * escapeHtml client_name, Basic URL-decode, opaque iat, OIDC UIA wrong-
- * session, register auth-method default, code_challenge_method default.
+ * escapeHtml client_name, Basic URL-decode secret, opaque iat, OIDC UIA
+ * wrong-session, register auth-method default, code_challenge_method default.
+ * Residual after #260 tip: auth_request deleteBarrier, wrong-pw recreate
+ * deleteBarrier, post-delete code burn vs refresh non-burn, Basic client_id
+ * URL-decode, revoke∥refresh deleteBarrier, UIA putBarrier dual-approve,
+ * nonce→code bind, MSC2967 same-device dual redeem.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -4977,6 +4981,505 @@ describe('race residual Basic URL-decode + opaque iat + UIA OIDC after #252 tip'
       ]);
       expect(results[0].body.active).toBe(true);
       expect(results[0].body.iat).toBe(Math.floor(created / 1000));
+      expect(results[1].body.active).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// After #260 tip: residual auth_request deleteBarrier / wrong-pw recreate /
+// post-delete code burn vs refresh non-burn / Basic client_id URL-decode /
+// revoke∥refresh deleteBarrier / UIA putBarrier / nonce→code / same-device
+// dual redeem niches unsaturated by #260/#252/#244.
+// ---------------------------------------------------------------------------
+
+describe('race residual auth_request deleteBarrier + wrong-pw recreate after #260 tip', () => {
+  it('dual POST same auth_request under deleteBarrier — both observe then burn', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv(
+      {},
+      { deleteBarrier: { count: 2, match: (k) => k.startsWith('oauth_auth_request:') } }
+    );
+    seedAuthRequest(sessions, 'ar-del-shared', { state: 'st-del' });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-del-shared' }),
+        env
+      ),
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-del-shared' }),
+        env
+      ),
+    ]);
+    expect(results.every((r) => r.status === 302 || r.status === 400)).toBe(true);
+    expect(results.filter((r) => r.status === 302).length).toBeGreaterThanOrEqual(1);
+    expect(
+      sessions.deletes.filter((k) => k === 'oauth_auth_request:ar-del-shared').length
+    ).toBeGreaterThanOrEqual(1);
+    expect(sessions.data['oauth_auth_request:ar-del-shared']).toBeUndefined();
+    const codes = Object.keys(sessions.data).filter((k) => k.startsWith('oauth_code:'));
+    expect(codes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('dual wrong-password recreate under deleteBarrier — two new auth_request keys', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1', { client_name: 'Element Web' });
+    const sessions = mockKv(
+      {},
+      { deleteBarrier: { count: 2, match: (k) => k === 'oauth_auth_request:ar-wp-del' } }
+    );
+    seedAuthRequest(sessions, 'ar-wp-del', { state: 'st-wp' });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'WRONG', auth_request_id: 'ar-wp-del' }),
+        env
+      ),
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'ALSOWRONG', auth_request_id: 'ar-wp-del' }),
+        env
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => String(r.body).includes('Invalid username or password'))).toBe(
+      true
+    );
+    expect(sessions.data['oauth_auth_request:ar-wp-del']).toBeUndefined();
+    const newReqs = Object.keys(sessions.data).filter((k) => k.startsWith('oauth_auth_request:'));
+    expect(newReqs).toHaveLength(2);
+    expect(newReqs.every((k) => k !== 'oauth_auth_request:ar-wp-del')).toBe(true);
+    for (const k of newReqs) {
+      const put = sessions.puts.find((p) => p.key === k);
+      expect(put?.options?.expirationTtl).toBe(600);
+      expect(JSON.parse(sessions.data[k]).state).toBe('st-wp');
+    }
+  });
+
+  it('nonce from auth_request binds into oauth_code under dual distinct authorize', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv();
+    seedAuthRequest(sessions, 'ar-n-a', { state: 'na', nonce: 'nonce-alpha' });
+    seedAuthRequest(sessions, 'ar-n-b', { state: 'nb', nonce: 'nonce-beta' });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-n-a' }),
+        env
+      ),
+      request(
+        '/oauth/authorize',
+        formInit({ username: 'alice', password: 'secret', auth_request_id: 'ar-n-b' }),
+        env
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([302, 302]);
+    const locs = results.map((r) => new URL(r.headers.get('Location') || ''));
+    const codes = locs.map((l) => l.searchParams.get('code')!);
+    expect(codes[0]).not.toBe(codes[1]);
+    const byNonce = Object.fromEntries(
+      codes.map((code) => {
+        const parsed = JSON.parse(sessions.data[`oauth_code:${code}`]);
+        return [parsed.nonce as string, code];
+      })
+    );
+    expect(byNonce['nonce-alpha']).toBeTruthy();
+    expect(byNonce['nonce-beta']).toBeTruthy();
+    expect(byNonce['nonce-alpha']).not.toBe(byNonce['nonce-beta']);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`auth_request deleteBarrier residual flood-${i}`, async () => {
+      const cache = mockKv();
+      seedClient(cache, 'cid-1');
+      const sessions = mockKv(
+        {},
+        { deleteBarrier: { count: 2, match: (k) => k === `oauth_auth_request:ar-f-${i}` } }
+      );
+      seedAuthRequest(sessions, `ar-f-${i}`, { state: `sf-${i}` });
+      const env = makeEnv({ cache, sessions, db: aliceDb() });
+      const results = await Promise.all([
+        request(
+          '/oauth/authorize',
+          formInit({
+            username: 'alice',
+            password: 'secret',
+            auth_request_id: `ar-f-${i}`,
+          }),
+          env
+        ),
+        request(
+          '/oauth/authorize',
+          formInit({
+            username: 'alice',
+            password: 'secret',
+            auth_request_id: `ar-f-${i}`,
+          }),
+          env
+        ),
+      ]);
+      expect(results.filter((r) => r.status === 302).length).toBeGreaterThanOrEqual(1);
+      expect(results.every((r) => r.status === 302 || r.status === 400)).toBe(true);
+      expect(sessions.data[`oauth_auth_request:ar-f-${i}`]).toBeUndefined();
+    });
+  }
+});
+
+describe('race residual post-delete code burn vs refresh non-burn after #260 tip', () => {
+  it('wrong∥right client on same code under deleteBarrier — code burned even on mismatch', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    seedClient(cache, 'cid-2');
+    const sessions = mockKv(
+      {},
+      { deleteBarrier: { count: 2, match: (k) => k === 'oauth_code:code-burn' } }
+    );
+    seedAuthCode(sessions, 'code-burn', {
+      client_id: 'cid-1',
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:BURN',
+    });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'authorization_code', client_id: 'cid-2', code: 'code-burn' }),
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'authorization_code', client_id: 'cid-1', code: 'code-burn' }),
+        env
+      ),
+    ]);
+    expect(results.every((r) => r.status === 200 || r.status === 400)).toBe(true);
+    expect(results.some((r) => r.status === 400 && r.body.error === 'invalid_grant')).toBe(true);
+    expect(sessions.data['oauth_code:code-burn']).toBeUndefined();
+    expect(sessions.deletes.filter((k) => k === 'oauth_code:code-burn').length).toBeGreaterThanOrEqual(
+      1
+    );
+  });
+
+  it('missing PKCE verifier ∥ valid under deleteBarrier — code burned before verifier check', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv(
+      {},
+      { deleteBarrier: { count: 2, match: (k) => k === 'oauth_code:code-pkce-burn' } }
+    );
+    seedAuthCode(sessions, 'code-pkce-burn', {
+      code_challenge: 'verifier-ok',
+      code_challenge_method: 'plain',
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:PKCE',
+    });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/token',
+        urlencoded({
+          grant_type: 'authorization_code',
+          client_id: 'cid-1',
+          code: 'code-pkce-burn',
+        }),
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({
+          grant_type: 'authorization_code',
+          client_id: 'cid-1',
+          code: 'code-pkce-burn',
+          code_verifier: 'verifier-ok',
+        }),
+        env
+      ),
+    ]);
+    expect(results.every((r) => r.status === 200 || r.status === 400)).toBe(true);
+    expect(
+      results.some(
+        (r) =>
+          r.status === 400 &&
+          (r.body.error === 'invalid_request' || r.body.error === 'invalid_grant')
+      )
+    ).toBe(true);
+    expect(sessions.data['oauth_code:code-pkce-burn']).toBeUndefined();
+  });
+
+  it('refresh wrong client_id does NOT burn token (asymmetric vs auth-code delete-before-validate)', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    seedClient(cache, 'cid-2');
+    const sessions = mockKv();
+    seedRefresh(sessions, 'rt-noburn', { client_id: 'cid-1' });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    // Wrong client first: validate client_id BEFORE delete — key must remain
+    const wrong = await request(
+      '/oauth/token',
+      urlencoded({
+        grant_type: 'refresh_token',
+        client_id: 'cid-2',
+        refresh_token: 'rt-noburn',
+      }),
+      env
+    );
+    expect(wrong.status).toBe(400);
+    expect(wrong.body.error).toBe('invalid_grant');
+    expect(sessions.data['oauth_refresh:rt-noburn']).toBeTruthy();
+    expect(sessions.deletes.filter((k) => k === 'oauth_refresh:rt-noburn')).toHaveLength(0);
+    // Right client still rotates after wrong-client miss
+    const right = await request(
+      '/oauth/token',
+      urlencoded({
+        grant_type: 'refresh_token',
+        client_id: 'cid-1',
+        refresh_token: 'rt-noburn',
+      }),
+      env
+    );
+    expect(right.status).toBe(200);
+    expect(sessions.data['oauth_refresh:rt-noburn']).toBeUndefined();
+  });
+
+  it('revoke∥refresh same token under deleteBarrier — old key gone; ambiguous winner', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv(
+      {},
+      { deleteBarrier: { count: 2, match: (k) => k === 'oauth_refresh:rt-rev-del' } }
+    );
+    seedRefresh(sessions, 'rt-rev-del');
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request(
+        '/oauth/revoke',
+        urlencoded({ token: 'rt-rev-del', token_type_hint: 'refresh_token' }),
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({
+          grant_type: 'refresh_token',
+          client_id: 'cid-1',
+          refresh_token: 'rt-rev-del',
+        }),
+        env
+      ),
+    ]);
+    expect(results[0].status).toBe(200);
+    expect(results[1].status === 200 || results[1].status === 400).toBe(true);
+    expect(sessions.data['oauth_refresh:rt-rev-del']).toBeUndefined();
+    expect(
+      sessions.deletes.filter((k) => k === 'oauth_refresh:rt-rev-del').length
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  it('dual redeem same MSC2967 device scope under deleteBarrier — ≥1 token; may double-issue', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    const sessions = mockKv(
+      {},
+      { deleteBarrier: { count: 2, match: (k) => k === 'oauth_code:code-devx' } }
+    );
+    seedAuthCode(sessions, 'code-devx', {
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:DEVX',
+    });
+    const db = aliceDb();
+    const env = makeEnv({ cache, sessions, db });
+    const results = await Promise.all([
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'authorization_code', client_id: 'cid-1', code: 'code-devx' }),
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({ grant_type: 'authorization_code', client_id: 'cid-1', code: 'code-devx' }),
+        env
+      ),
+    ]);
+    expect(results.filter((r) => r.status === 200).length).toBeGreaterThanOrEqual(1);
+    expect(results.every((r) => r.status === 200 || r.status === 400)).toBe(true);
+    const ok = results.filter((r) => r.status === 200);
+    expect(ok.every((r) => r.body.device_id === 'DEVX')).toBe(true);
+    expect(db.devices.filter((d) => d.device_id === 'DEVX').length).toBeGreaterThanOrEqual(1);
+    expect(sessions.data['oauth_code:code-devx']).toBeUndefined();
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`post-delete code burn residual flood-${i}`, async () => {
+      const cache = mockKv();
+      seedClient(cache, 'cid-1');
+      seedClient(cache, 'cid-2');
+      const sessions = mockKv(
+        {},
+        { deleteBarrier: { count: 2, match: (k) => k === `oauth_code:code-bf-${i}` } }
+      );
+      seedAuthCode(sessions, `code-bf-${i}`, {
+        client_id: 'cid-1',
+        scope: `openid urn:matrix:org.matrix.msc2967.client:device:BF${i}`,
+      });
+      const env = makeEnv({ cache, sessions, db: aliceDb() });
+      const results = await Promise.all([
+        request(
+          '/oauth/token',
+          urlencoded({
+            grant_type: 'authorization_code',
+            client_id: 'cid-2',
+            code: `code-bf-${i}`,
+          }),
+          env
+        ),
+        request(
+          '/oauth/token',
+          urlencoded({
+            grant_type: 'authorization_code',
+            client_id: 'cid-1',
+            code: `code-bf-${i}`,
+          }),
+          env
+        ),
+      ]);
+      expect(sessions.data[`oauth_code:code-bf-${i}`]).toBeUndefined();
+      expect(results.some((r) => r.status === 400)).toBe(true);
+    });
+  }
+});
+
+describe('race residual Basic client_id URL-decode + UIA putBarrier after #260 tip', () => {
+  it('Basic auth URL-decodes client_id with special chars ∥ body plain under parallel', async () => {
+    const cache = mockKv();
+    const clientId = 'cid+enc';
+    const secret = 's3cret+/=y';
+    const hash = await hashClientSecret(secret);
+    seedClient(cache, clientId, {
+      client_secret_hash: hash,
+      token_endpoint_auth_method: 'client_secret_basic',
+    });
+    const sessions = mockKv();
+    seedAuthCode(sessions, 'code-id-enc-a', {
+      client_id: clientId,
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:IDA',
+    });
+    seedAuthCode(sessions, 'code-id-enc-b', {
+      client_id: clientId,
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:IDB',
+    });
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const basic = btoa(`${encodeURIComponent(clientId)}:${encodeURIComponent(secret)}`);
+    const results = await Promise.all([
+      request(
+        '/oauth/token',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${basic}`,
+          },
+          body: new URLSearchParams({
+            grant_type: 'authorization_code',
+            code: 'code-id-enc-a',
+          }).toString(),
+        },
+        env
+      ),
+      request(
+        '/oauth/token',
+        urlencoded({
+          grant_type: 'authorization_code',
+          client_id: clientId,
+          client_secret: secret,
+          code: 'code-id-enc-b',
+        }),
+        env
+      ),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.map((r) => r.body.device_id).sort()).toEqual(['IDA', 'IDB'].sort());
+  });
+
+  it('UIA dual approve under putBarrier — both success; completed_stages last-writer', async () => {
+    const cache = mockKv(
+      {},
+      { putBarrier: { count: 2, match: (k) => k === 'uia_session:put-dual' } }
+    );
+    cache.data['uia_session:put-dual'] = JSON.stringify({
+      user_id: USER_ID,
+      completed_stages: [],
+    });
+    const env = makeEnv({ cache, db: aliceDb() });
+    const a = new FormData();
+    a.set('session', 'put-dual');
+    a.set('username', 'alice');
+    a.set('password', 'secret');
+    const b = new FormData();
+    b.set('session', 'put-dual');
+    b.set('username', 'alice');
+    b.set('password', 'secret');
+    const results = await Promise.all([
+      request('/oauth/authorize/uia', { method: 'POST', body: a }, env),
+      request('/oauth/authorize/uia', { method: 'POST', body: b }, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => String(r.body).toLowerCase().includes('approved'))).toBe(true);
+    expect(cache.puts.filter((p) => p.key === 'uia_session:put-dual').length).toBeGreaterThanOrEqual(
+      2
+    );
+    const session = JSON.parse(cache.data['uia_session:put-dual']);
+    expect(session.completed_stages).toEqual(
+      expect.arrayContaining(['org.matrix.cross_signing_reset', 'm.oauth', 'm.login.oauth'])
+    );
+    expect(session.oauth_completed_at).toBe(NOW);
+    const put = cache.puts.find((p) => p.key === 'uia_session:put-dual');
+    expect(put?.options?.expirationTtl).toBe(300);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`Basic client_id URL-decode residual flood-${i}`, async () => {
+      const cache = mockKv();
+      const clientId = `cid+f${i}`;
+      const secret = `sec+/=${i}`;
+      const hash = await hashClientSecret(secret);
+      seedClient(cache, clientId, {
+        client_secret_hash: hash,
+        token_endpoint_auth_method: 'client_secret_basic',
+      });
+      const sessions = mockKv();
+      seedAuthCode(sessions, `code-idf-${i}`, {
+        client_id: clientId,
+        scope: `openid urn:matrix:org.matrix.msc2967.client:device:IDF${i}`,
+      });
+      const env = makeEnv({ cache, sessions, db: aliceDb() });
+      const basic = btoa(`${encodeURIComponent(clientId)}:${encodeURIComponent(secret)}`);
+      const results = await Promise.all([
+        request(
+          '/oauth/token',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              Authorization: `Basic ${basic}`,
+            },
+            body: new URLSearchParams({
+              grant_type: 'authorization_code',
+              code: `code-idf-${i}`,
+            }).toString(),
+          },
+          env
+        ),
+        request(
+          '/oauth/introspect',
+          urlencoded({ token: `missing-idf-${i}` }),
+          env
+        ),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[0].body.device_id).toBe(`IDF${i}`);
       expect(results[1].body.active).toBe(false);
     });
   }
