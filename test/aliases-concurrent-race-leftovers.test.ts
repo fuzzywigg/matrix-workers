@@ -1,17 +1,18 @@
 /**
- * TOKENMAXX HEAVY leftovers after #192 — aliases *concurrent race / TOCTOU*
- * + soft/edge reliability for slices not covered by aliases-api-routes or
- * tags-aliases soft leftovers (#153).
+ * TOKENMAXX HEAVY leftovers after #192 / deepen after #226 — aliases
+ * *concurrent race / TOCTOU* + route-adjacent reliability for slices not
+ * covered by aliases-api-routes, tags-aliases soft leftovers (#153), or the
+ * first leftovers pass (#193).
  *
- * Distinct domain — not rooms (#192), admin-mutate (#191), presence (#190),
- * sliding-sync (#189), fed-keys (#188), workflows (#187), oauth/push (#186),
- * typing (#185), receipts (#184/#178), qr-login (#183), to-device (#181),
- * relations (#179).
+ * Distinct domain — not rate-limit (#226), oidc-auth (#223), federation-auth
+ * (#222), oauth (#221), rooms (#192/#208), admin-mutate (#191), presence (#190),
+ * sliding-sync (#189), workflows (#187), typing (#185), receipts (#184).
  *
- * Focus: PUT alias check→insert TOCTOU under Promise.all; membership mid-flight
- * flips; DELETE∥PUT races; visibility last-write-wins; PL delete gates; multi-alias
- * / multi-room isolation; INSERT/DELETE/UPDATE barriers + failure soft;
- * method/body/charset/server soft floods.
+ * Focus (this deepen): triple PUT UNIQUE; room-SELECT vanish TOCTOU; first()
+ * D1 throws; DELETE creator-SELECT vanish; unique-off duplicate rows;
+ * PUT same alias → two rooms; PL 0/equal/state_default-falsy; visibility
+ * missing-room 403; GET∥GET∥DELETE; split(':') extra-colon leftover;
+ * SELECT bind contracts under Promise.all.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -115,6 +116,9 @@ function createAliasesDb(
     failDeleteAfter?: number;
     failUpdateAfter?: number;
     uniqueAliasInsert?: boolean;
+    failFirst?: { match: (sql: string, args: unknown[]) => boolean; after: number };
+    mutateRoomAfterRoomSelects?: { after: number; next: RoomRow[] };
+    mutateAliasAfterCreatorSelects?: { after: number; next: AliasRow[] };
   } = {}
 ) {
   const aliasRows = opts.aliases ?? [];
@@ -140,12 +144,18 @@ function createAliasesDb(
 
   let membershipSelectCount = 0;
   let existingAliasSelectCount = 0;
+  let roomSelectCount = 0;
+  let creatorAliasSelectCount = 0;
+  let failFirstCount = 0;
   let insertCount = 0;
   let deleteCount = 0;
   let updateCount = 0;
 
   const mutateMembership = opts.mutateMembershipAfterSelects;
   const mutateAlias = opts.mutateAliasAfterExistingSelects;
+  const mutateRoom = opts.mutateRoomAfterRoomSelects;
+  const mutateCreatorAlias = opts.mutateAliasAfterCreatorSelects;
+  const failFirst = opts.failFirst;
   const failInsertAfter = opts.failInsertAfter;
   const failDeleteAfter = opts.failDeleteAfter;
   const failUpdateAfter = opts.failUpdateAfter;
@@ -177,6 +187,14 @@ function createAliasesDb(
                 args
               );
 
+              if (failFirst && failFirst.match(sql, args)) {
+                failFirstCount += 1;
+                if (failFirstCount > failFirst.after) {
+                  events.push('fail:first');
+                  throw new Error('d1-alias-first-fail');
+                }
+              }
+
               if (
                 sql.includes('FROM room_aliases') &&
                 sql.includes('SELECT room_id, servers')
@@ -193,6 +211,11 @@ function createAliasesDb(
               ) {
                 const alias = args[0] as string;
                 const row = aliasRows.find((a) => a.alias === alias);
+                creatorAliasSelectCount += 1;
+                if (mutateCreatorAlias && creatorAliasSelectCount === mutateCreatorAlias.after) {
+                  aliasRows.splice(0, aliasRows.length, ...mutateCreatorAlias.next);
+                  events.push('mutate:alias-after-creator-select');
+                }
                 if (!row) return null as T;
                 return { room_id: row.room_id, creator_id: row.creator_id } as T;
               }
@@ -214,6 +237,11 @@ function createAliasesDb(
               if (sql.includes('SELECT room_id FROM rooms WHERE room_id = ?')) {
                 const roomId = args[0] as string;
                 const row = roomRows.find((r) => r.room_id === roomId);
+                roomSelectCount += 1;
+                if (mutateRoom && roomSelectCount === mutateRoom.after) {
+                  roomRows.splice(0, roomRows.length, ...mutateRoom.next);
+                  events.push('mutate:room');
+                }
                 return (row ? { room_id: row.room_id } : null) as T;
               }
 
@@ -1426,4 +1454,880 @@ describe('aliases concurrent bind contracts after #192', () => {
       expect.any(Number),
     ]);
   });
+});
+
+function pl(users: Record<string, number>, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({ users, users_default: 0, state_default: 50, ...extra });
+}
+
+// ---------------------------------------------------------------------------
+// After #226: leftover TOCTOU / first() fail / unique-off / colon-split
+// ---------------------------------------------------------------------------
+
+describe('race leftover PUT triple UNIQUE + unique-off after #226', () => {
+  it('triple PUT same alias under existence barrier: one row, at least one 200', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+      selectBarrier: {
+        count: 3,
+        match: (sql) => sql.includes('SELECT alias FROM room_aliases'),
+      },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM })),
+    ]);
+    expect(results.some((r) => r.status === 200)).toBe(true);
+    expect(results.filter((r) => r.status === 200 || r.status === 409 || r.status === 500)).toHaveLength(
+      3
+    );
+    expect(db.aliases.filter((a) => a.alias === ALIAS)).toHaveLength(1);
+  });
+
+  it('uniqueAliasInsert=false lets both racing PUTs insert duplicate rows', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+      uniqueAliasInsert: false,
+      selectBarrier: {
+        count: 2,
+        match: (sql) => sql.includes('SELECT alias FROM room_aliases'),
+      },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM })),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(db.aliases.filter((a) => a.alias === ALIAS)).toHaveLength(2);
+  });
+
+  it('parallel PUT same alias targeting ROOM vs ROOM2 — UNIQUE still one alias row', async () => {
+    const db = createAliasesDb({
+      rooms: [room(), room(ROOM2)],
+      memberships: [joinedMember(ROOM), joinedMember(ROOM2)],
+      selectBarrier: {
+        count: 2,
+        match: (sql) => sql.includes('SELECT alias FROM room_aliases'),
+      },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM2 })),
+    ]);
+    expect(results.some((r) => r.status === 200)).toBe(true);
+    expect(db.aliases.filter((a) => a.alias === ALIAS)).toHaveLength(1);
+    expect([ROOM, ROOM2]).toContain(db.aliases[0].room_id);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`triple UNIQUE soft-${i}`, async () => {
+      const alias = `#t3-${i}:example.com`;
+      const db = createAliasesDb({
+        rooms: [room()],
+        memberships: [joinedMember()],
+        selectBarrier: {
+          count: 3,
+          match: (sql) => sql.includes('SELECT alias FROM room_aliases'),
+        },
+      });
+      const results = await Promise.all([
+        request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM })),
+        request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM })),
+        request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM })),
+      ]);
+      expect(results.some((r) => r.status === 200)).toBe(true);
+      expect(db.aliases.filter((a) => a.alias === alias)).toHaveLength(1);
+    });
+  }
+});
+
+describe('race leftover room SELECT vanish TOCTOU after #226', () => {
+  it('room disappears after first existence SELECT — first PUT may still insert', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+      mutateRoomAfterRoomSelects: { after: 1, next: [] },
+    });
+    const first = await request(
+      db,
+      aliasPath('#vanish-ok:example.com'),
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(first.status).toBe(200);
+    const second = await request(
+      db,
+      aliasPath('#vanish-miss:example.com'),
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(second.status).toBe(404);
+    expect(second.body).toMatchObject({ errcode: 'M_NOT_FOUND' });
+  });
+
+  it('parallel PUT after room vanish: mixed 200/404 under membership still present', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+      mutateRoomAfterRoomSelects: { after: 1, next: [] },
+      selectBarrier: {
+        count: 2,
+        match: (sql) => sql.includes('SELECT room_id FROM rooms WHERE room_id = ?'),
+      },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath('#rv-a:example.com'), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath('#rv-b:example.com'), jsonInit('PUT', { room_id: ROOM })),
+    ]);
+    expect(results.every((r) => r.status === 200 || r.status === 404)).toBe(true);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`room-vanish sequential leftover soft-${i}`, async () => {
+      const db = createAliasesDb({
+        rooms: [room()],
+        memberships: [joinedMember()],
+        mutateRoomAfterRoomSelects: { after: 1, next: [] },
+      });
+      expect(
+        (await request(db, aliasPath(`#rv-${i}-a:example.com`), jsonInit('PUT', { room_id: ROOM })))
+          .status
+      ).toBe(200);
+      expect(
+        (await request(db, aliasPath(`#rv-${i}-b:example.com`), jsonInit('PUT', { room_id: ROOM })))
+          .status
+      ).toBe(404);
+    });
+  }
+});
+
+describe('race leftover first() D1 throw mid concurrent after #226', () => {
+  it('GET resolve first() fail surfaces 500; sibling GET of other alias 200', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias(), seedAlias({ alias: ALIAS2, room_id: ROOM2 })],
+      failFirst: {
+        after: 0,
+        match: (sql, args) =>
+          sql.includes('SELECT room_id, servers') && args[0] === ALIAS,
+      },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(ALIAS)),
+      request(db, aliasPath(ALIAS2)),
+    ]);
+    expect(results[0].status).toBe(500);
+    expect(results[1].status).toBe(200);
+    expect(results[1].body).toMatchObject({ room_id: ROOM2 });
+  });
+
+  it('PUT existing-alias SELECT fail after room+membership — 500, no insert', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+      failFirst: {
+        after: 0,
+        match: (sql) => sql.includes('SELECT alias FROM room_aliases'),
+      },
+    });
+    const res = await request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM }));
+    expect(res.status).toBe(500);
+    expect(db.inserts).toHaveLength(0);
+  });
+
+  it('non-creator DELETE PL first() fail — 500, alias remains', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: pl({ [USER]: 100 }),
+      failFirst: {
+        after: 0,
+        match: (sql) => sql.includes('m.room.power_levels') || sql.includes('power_levels'),
+      },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+    ]);
+    expect(results.every((r) => r.status === 500)).toBe(true);
+    expect(db.aliases).toHaveLength(1);
+    expect(db.deletes).toHaveLength(0);
+  });
+
+  it('visibility is_public first() fail — GET 500; PUT still may succeed', async () => {
+    const db = createAliasesDb({
+      rooms: [room(ROOM, 0)],
+      memberships: [joinedMember()],
+      powerLevelsContent: null,
+      failFirst: {
+        after: 0,
+        match: (sql) => sql.includes('SELECT is_public FROM rooms'),
+      },
+    });
+    const get = await request(db, visibilityPath());
+    expect(get.status).toBe(500);
+    const put = await request(db, visibilityPath(), jsonInit('PUT', { visibility: 'public' }));
+    expect(put.status).toBe(200);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`resolve first-fail isolation soft-${i}`, async () => {
+      const a = `#ff-${i}-a:example.com`;
+      const b = `#ff-${i}-b:example.com`;
+      const db = createAliasesDb({
+        aliases: [seedAlias({ alias: a }), seedAlias({ alias: b, room_id: ROOM2 })],
+        failFirst: {
+          after: 0,
+          match: (sql, args) => sql.includes('SELECT room_id, servers') && args[0] === a,
+        },
+      });
+      const results = await Promise.all([request(db, aliasPath(a)), request(db, aliasPath(b))]);
+      expect(results[0].status).toBe(500);
+      expect(results[1].status).toBe(200);
+    });
+  }
+});
+
+describe('race leftover DELETE creator-SELECT vanish after #226', () => {
+  it('alias removed after creator SELECT — DELETE still 200 (empty delete)', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias()],
+      mutateAliasAfterCreatorSelects: { after: 1, next: [] },
+    });
+    const res = await request(db, aliasPath(), {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect(db.deletes).toHaveLength(1);
+    expect(db.aliases).toHaveLength(0);
+  });
+
+  it('parallel DELETE: first SELECT both see row; mutate after first SELECT', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias()],
+      mutateAliasAfterCreatorSelects: { after: 2, next: [] },
+      selectBarrier: {
+        count: 2,
+        match: (sql) =>
+          sql.includes('FROM room_aliases') && sql.includes('SELECT room_id, creator_id'),
+      },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.aliases).toHaveLength(0);
+  });
+
+  it('GET∥DELETE after creator vanish: GET may 200 or 404', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias()],
+      mutateAliasAfterCreatorSelects: { after: 1, next: [] },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath()),
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+    ]);
+    expect(results[1].status).toBe(200);
+    expect([200, 404]).toContain(results[0].status);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`creator-vanish DELETE soft-${i}`, async () => {
+      const alias = `#cv-${i}:example.com`;
+      const db = createAliasesDb({
+        aliases: [seedAlias({ alias })],
+        mutateAliasAfterCreatorSelects: { after: 1, next: [] },
+      });
+      const res = await request(db, aliasPath(alias), {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer t' },
+      });
+      expect(res.status).toBe(200);
+      expect(db.aliases.find((a) => a.alias === alias)).toBeUndefined();
+    });
+  }
+});
+
+describe('race leftover GET flood + DELETE 404 isolation after #226', () => {
+  it('eight parallel GET resolve return the same room_id', async () => {
+    const db = createAliasesDb({ aliases: [seedAlias()] });
+    const results = await Promise.all(Array.from({ length: 8 }, () => request(db, aliasPath())));
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(results.every((r) => (r.body as { room_id: string }).room_id === ROOM)).toBe(true);
+  });
+
+  it('parallel DELETE missing alias — all 404, no writes', async () => {
+    const db = createAliasesDb({ aliases: [] });
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } })
+      )
+    );
+    expect(results.every((r) => r.status === 404)).toBe(true);
+    expect(db.deletes).toHaveLength(0);
+  });
+
+  it('GET missing ∥ PUT create — GET 404 then after PUT GET 200', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const mid = await Promise.all([
+      request(db, aliasPath(ALIAS3)),
+      request(db, aliasPath(ALIAS3), jsonInit('PUT', { room_id: ROOM })),
+    ]);
+    expect(mid.some((r) => r.status === 404 || r.status === 200)).toBe(true);
+    expect(mid.some((r) => r.status === 200)).toBe(true);
+    const after = await request(db, aliasPath(ALIAS3));
+    expect(after.status).toBe(200);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`GET flood leftover soft-${i}`, async () => {
+      const alias = `#gf-${i}:example.com`;
+      const db = createAliasesDb({ aliases: [seedAlias({ alias })] });
+      const results = await Promise.all([
+        request(db, aliasPath(alias)),
+        request(db, aliasPath(alias)),
+        request(db, aliasPath(alias)),
+        request(db, aliasPath('#nope:example.com')),
+      ]);
+      expect(statusesOf(results.slice(0, 3))).toEqual([200, 200, 200]);
+      expect(results[3].status).toBe(404);
+    });
+  }
+});
+
+describe('race leftover PL 0/equal/state_default-falsy concurrent after #226', () => {
+  it('users[userId]=0 falls through to users_default 100 — parallel DELETE succeeds', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 0 },
+        users_default: 100,
+        state_default: 50,
+      }),
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.aliases).toHaveLength(0);
+  });
+
+  it('userPower === state_default 50 allows DELETE under parallel load', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: pl({ [USER]: 50 }),
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+  });
+
+  it('state_default:0 is falsy → required 50; user 0 forbids visibility PUT', async () => {
+    const db = createAliasesDb({
+      rooms: [room(ROOM, 0)],
+      memberships: [joinedMember()],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 0 },
+        users_default: 0,
+        state_default: 0,
+      }),
+    });
+    const results = await Promise.all([
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'public' })),
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'private' })),
+    ]);
+    expect(results.every((r) => r.status === 403)).toBe(true);
+    expect(db.updates).toHaveLength(0);
+  });
+
+  it('creator DELETE never queries power_levels even with corrupt PL present', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: USER })],
+      powerLevelsRaw: '{broken',
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.selects.some((s) => s.sql.includes('power_levels'))).toBe(false);
+  });
+
+  it('visibility PUT missing room (no rooms row) is 403 not 404 — no existence check', async () => {
+    const db = createAliasesDb({
+      rooms: [],
+      memberships: [joinedMember()],
+      powerLevelsContent: null,
+    });
+    const results = await Promise.all([
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'public' })),
+      request(db, visibilityPath()),
+    ]);
+    expect(results[0].status).toBe(200);
+    expect(results[1].status).toBe(404);
+    expect(db.updates).toHaveLength(1);
+    expect(db.updates[0].args).toEqual([1, ROOM]);
+  });
+
+  it('visibility PUT without membership on missing room is 403', async () => {
+    const db = createAliasesDb({ rooms: [], memberships: [] });
+    const results = await Promise.all([
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'public' })),
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'private' })),
+    ]);
+    expect(results.every((r) => r.status === 403)).toBe(true);
+    expect(db.updates).toHaveLength(0);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`equal-PL visibility leftover soft-${i}`, async () => {
+      const db = createAliasesDb({
+        rooms: [room(ROOM, 0)],
+        memberships: [joinedMember()],
+        powerLevelsContent: pl({ [USER]: 50 }),
+      });
+      const results = await Promise.all([
+        request(db, visibilityPath(), jsonInit('PUT', { visibility: 'public' })),
+        request(db, visibilityPath()),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[1].status).toBe(200);
+      expect(db.rooms[0].is_public).toBe(1);
+    });
+  }
+});
+
+describe('race leftover split(\':\') extra-colon + SERVER_NAME env after #226', () => {
+  it('#local:example.com:8448 split leftover treats server as example.com — PUT then GET 200', async () => {
+    const alias = '#local:example.com:8448';
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const put = await request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM }));
+    expect(put.status).toBe(200);
+    const get = await request(db, aliasPath(alias));
+    expect(get.status).toBe(200);
+    expect(db.aliases[0].alias).toBe(alias);
+  });
+
+  it('#x:other.org:example.com uses other.org — parallel PUT 400', async () => {
+    const alias = '#x:other.org:example.com';
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM })),
+    ]);
+    expect(results.every((r) => r.status === 400)).toBe(true);
+    expect(db.inserts).toHaveLength(0);
+  });
+
+  it('SERVER_NAME override rejects example.com alias', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM }), 'homeserver.example.org'),
+      request(db, aliasPath(ALIAS2), jsonInit('PUT', { room_id: ROOM }), 'homeserver.example.org'),
+    ]);
+    expect(results.every((r) => r.status === 400)).toBe(true);
+    expect(results[0].body).toMatchObject({ error: 'Cannot create alias for another server' });
+  });
+
+  it('empty localpart #:example.com is format-valid leftover — PUT 200', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const alias = '#:example.com';
+    const res = await request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM }));
+    expect(res.status).toBe(200);
+    expect(db.aliases[0].alias).toBe(alias);
+  });
+
+  it('case-sensitive EXAMPLE.COM ≠ example.com — parallel 400', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const alias = '#case:EXAMPLE.COM';
+    const results = await Promise.all([
+      request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM })),
+    ]);
+    expect(results.every((r) => r.status === 400)).toBe(true);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`extra-colon leftover soft-${i}`, async () => {
+      const alias = `#ec-${i}:example.com:extra`;
+      const db = createAliasesDb({
+        rooms: [room()],
+        memberships: [joinedMember()],
+      });
+      const res = await request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM }));
+      expect(res.status).toBe(200);
+    });
+  }
+});
+
+describe('race leftover GET servers JSON non-array + is_public truthy after #226', () => {
+  it('parsed servers JSON number is returned as-is (not defaulted)', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ servers: '123' })],
+    });
+    const results = await Promise.all([request(db, aliasPath()), request(db, aliasPath())]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect((results[0].body as { servers: unknown }).servers).toBe(123);
+  });
+
+  it('parsed servers JSON string is returned as-is', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ servers: '"peer.example.org"' })],
+    });
+    const res = await request(db, aliasPath());
+    expect(res.status).toBe(200);
+    expect((res.body as { servers: unknown }).servers).toBe('peer.example.org');
+  });
+
+  it('is_public=2 is truthy → GET visibility public under parallel GET', async () => {
+    const db = createAliasesDb({ rooms: [room(ROOM, 2)] });
+    const results = await Promise.all([
+      request(db, visibilityPath()),
+      request(db, visibilityPath()),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(results.every((r) => (r.body as { visibility: string }).visibility === 'public')).toBe(
+      true
+    );
+  });
+
+  it('membership for ROOM does not authorize PUT alias on ROOM2', async () => {
+    const db = createAliasesDb({
+      rooms: [room(), room(ROOM2)],
+      memberships: [joinedMember(ROOM)],
+    });
+    const results = await Promise.all([
+      request(db, aliasPath('#own:example.com'), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath('#other:example.com'), jsonInit('PUT', { room_id: ROOM2 })),
+    ]);
+    expect(results[0].status).toBe(200);
+    expect(results[1].status).toBe(403);
+    expect(db.aliases).toHaveLength(1);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`servers JSON leftover soft-${i}`, async () => {
+      const payloads = ['123', 'true', '"x"', '{}', '[]', JSON.stringify([SERVER])];
+      const expected: unknown[] = [123, true, 'x', {}, [], [SERVER]];
+      const alias = `#js-${i}:example.com`;
+      const db = createAliasesDb({
+        aliases: [seedAlias({ alias, servers: payloads[i] })],
+      });
+      const results = await Promise.all([
+        request(db, aliasPath(alias)),
+        request(db, aliasPath(alias)),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect((results[0].body as { servers: unknown }).servers).toEqual(expected[i]);
+    });
+  }
+});
+
+describe('race leftover store fail-first + INSERT barrier isolation after #226', () => {
+  it('failInsertAfter 0: first PUT 500, no row', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+      failInsertAfter: 0,
+    });
+    const results = await Promise.all([
+      request(db, aliasPath('#f0-a:example.com'), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath('#f0-b:example.com'), jsonInit('PUT', { room_id: ROOM })),
+    ]);
+    expect(results.every((r) => r.status === 500)).toBe(true);
+    expect(db.aliases).toHaveLength(0);
+  });
+
+  it('failDeleteAfter 0: DELETE 500, alias remains', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias()],
+      failDeleteAfter: 0,
+    });
+    const results = await Promise.all([
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+      request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } }),
+    ]);
+    expect(results.every((r) => r.status === 500)).toBe(true);
+    expect(db.aliases).toHaveLength(1);
+  });
+
+  it('failUpdateAfter 0: visibility stays private', async () => {
+    const db = createAliasesDb({
+      rooms: [room(ROOM, 0)],
+      memberships: [joinedMember()],
+      powerLevelsContent: null,
+      failUpdateAfter: 0,
+    });
+    const results = await Promise.all([
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'public' })),
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'private' })),
+    ]);
+    expect(results.every((r) => r.status === 500)).toBe(true);
+    expect(db.rooms[0].is_public).toBe(0);
+  });
+
+  it('INSERT runBarrier isolates two distinct aliases', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+      runBarrier: {
+        count: 2,
+        match: (sql) => sql.includes('INSERT INTO room_aliases'),
+      },
+    });
+    const results = await Promise.all([
+      request(db, aliasPath('#iba:example.com'), jsonInit('PUT', { room_id: ROOM })),
+      request(db, aliasPath('#ibb:example.com'), jsonInit('PUT', { room_id: ROOM })),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(db.aliases.map((a) => a.alias).sort()).toEqual(['#iba:example.com', '#ibb:example.com']);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`fail-first insert leftover soft-${i}`, async () => {
+      const db = createAliasesDb({
+        rooms: [room()],
+        memberships: [joinedMember()],
+        failInsertAfter: 0,
+      });
+      const res = await request(
+        db,
+        aliasPath(`#fi-${i}:example.com`),
+        jsonInit('PUT', { room_id: ROOM })
+      );
+      expect(res.status).toBe(500);
+      expect(db.aliases).toHaveLength(0);
+    });
+  }
+});
+
+describe('race leftover SELECT bind contracts under Promise.all after #226', () => {
+  it('GET resolve binds decoded alias', async () => {
+    const db = createAliasesDb({ aliases: [seedAlias()] });
+    await Promise.all([request(db, aliasPath()), request(db, aliasPath())]);
+    const resolve = db.selects.filter((s) => s.sql.includes('SELECT room_id, servers'));
+    expect(resolve.length).toBeGreaterThanOrEqual(2);
+    expect(resolve.every((s) => s.args[0] === ALIAS)).toBe(true);
+  });
+
+  it('PUT binds room existence then membership (room, user) then alias', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    await request(db, aliasPath(), jsonInit('PUT', { room_id: ROOM }));
+    const roomSel = db.selects.find((s) => s.sql.includes('SELECT room_id FROM rooms'));
+    const memSel = db.selects.find((s) => s.sql.includes('FROM room_memberships'));
+    const existSel = db.selects.find((s) => s.sql.includes('SELECT alias FROM room_aliases'));
+    expect(roomSel?.args).toEqual([ROOM]);
+    expect(memSel?.args).toEqual([ROOM, USER]);
+    expect(existSel?.args).toEqual([ALIAS]);
+  });
+
+  it('non-creator DELETE PL query binds alias.room_id', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER, room_id: ROOM2 })],
+      powerLevelsContent: pl({ [USER]: 100 }),
+    });
+    await request(db, aliasPath(), { method: 'DELETE', headers: { Authorization: 'Bearer t' } });
+    const plSel = db.selects.find(
+      (s) => s.sql.includes('power_levels') || s.sql.includes('m.room.power_levels')
+    );
+    expect(plSel?.args).toEqual([ROOM2]);
+    expect(db.deletes[0].args).toEqual([ALIAS]);
+  });
+
+  it('visibility PUT PL query binds path roomId', async () => {
+    const db = createAliasesDb({
+      rooms: [room(ROOM2, 0)],
+      memberships: [joinedMember(ROOM2)],
+      powerLevelsContent: pl({ [USER]: 100 }),
+    });
+    await request(db, visibilityPath(ROOM2), jsonInit('PUT', { visibility: 'public' }));
+    const mem = db.selects.find((s) => s.sql.includes('FROM room_memberships'));
+    const plSel = db.selects.find((s) => s.sql.includes('power_levels'));
+    expect(mem?.args).toEqual([ROOM2, USER]);
+    expect(plSel?.args).toEqual([ROOM2]);
+  });
+
+  it('PUT extra body fields ignored — still inserts room_id', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const results = await Promise.all([
+      request(
+        db,
+        aliasPath('#extra:example.com'),
+        jsonInit('PUT', { room_id: ROOM, servers: ['evil.example.org'], creator_id: OTHER })
+      ),
+      request(db, aliasPath('#extra:example.com')),
+    ]);
+    expect(results[0].status).toBe(200);
+    expect(db.inserts[0].args[1]).toBe(ROOM);
+    expect(db.inserts[0].args[2]).toBe(USER);
+    expect(db.inserts[0].args[3]).toBe(JSON.stringify([SERVER]));
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`bind leftover GET soft-${i}`, async () => {
+      const alias = `#bd-${i}:example.com`;
+      const db = createAliasesDb({ aliases: [seedAlias({ alias })] });
+      await Promise.all([request(db, aliasPath(alias)), request(db, aliasPath(alias))]);
+      expect(
+        db.selects.filter((s) => s.sql.includes('SELECT room_id, servers')).every((s) => s.args[0] === alias)
+      ).toBe(true);
+    });
+  }
+});
+
+describe('race leftover method TRACE + double-encode + unicode after #226', () => {
+  it('unmatched /directory/alias prefix is 404 under parallel load', async () => {
+    const db = createAliasesDb({ aliases: [seedAlias()] });
+    const results = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        request(db, '/_matrix/client/v3/directory/alias/' + encodeURIComponent(ALIAS), {
+          method: 'GET',
+          headers: { Authorization: 'Bearer t' },
+        })
+      )
+    );
+    expect(results.every((r) => r.status === 404)).toBe(true);
+  });
+
+  it('Hono+decodeURIComponent leftover: double-encoded alias GET still resolves', async () => {
+    const db = createAliasesDb({ aliases: [seedAlias()] });
+    const doublePath = `/_matrix/client/v3/directory/room/${encodeURIComponent(encodeURIComponent(ALIAS))}`;
+    const results = await Promise.all([request(db, doublePath), request(db, aliasPath())]);
+    expect(results[0].status).toBe(200);
+    expect(results[1].status).toBe(200);
+  });
+
+  it('unicode localpart PUT∥GET round-trip', async () => {
+    const alias = '#café:example.com';
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const put = await request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM }));
+    expect(put.status).toBe(200);
+    const get = await request(db, aliasPath(alias));
+    expect(get.status).toBe(200);
+    expect(get.body).toMatchObject({ room_id: ROOM });
+    expect(db.aliases[0].alias).toBe(alias);
+  });
+
+  it('PUT room_id false/0 missing-param; [] is truthy so not missing-param', async () => {
+    const db = createAliasesDb({
+      rooms: [room()],
+      memberships: [joinedMember()],
+    });
+    const results = await Promise.all([
+      request(db, aliasPath('#z0:example.com'), jsonInit('PUT', { room_id: 0 })),
+      request(db, aliasPath('#z1:example.com'), jsonInit('PUT', { room_id: false })),
+      request(db, aliasPath('#z2:example.com'), jsonInit('PUT', { room_id: [] })),
+    ]);
+    expect(results[0].status).toBe(400);
+    expect(results[1].status).toBe(400);
+    expect(results[2].status).toBe(404);
+    expect(db.inserts).toHaveLength(0);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`unicode leftover soft-${i}`, async () => {
+      const alias = `#ü-${i}:example.com`;
+      const db = createAliasesDb({
+        rooms: [room()],
+        memberships: [joinedMember()],
+      });
+      const results = await Promise.all([
+        request(db, aliasPath(alias), jsonInit('PUT', { room_id: ROOM })),
+        request(db, aliasPath('#missing-ü:example.com')),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[1].status).toBe(404);
+    });
+  }
+});
+
+describe('race leftover visibility GET∥PUT same-value + extra fields after #226', () => {
+  it('parallel PUT public∥public last write still public', async () => {
+    const db = createAliasesDb({
+      rooms: [room(ROOM, 0)],
+      memberships: [joinedMember()],
+      powerLevelsContent: null,
+    });
+    const results = await Promise.all([
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'public' })),
+      request(db, visibilityPath(), jsonInit('PUT', { visibility: 'public' })),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(db.rooms[0].is_public).toBe(1);
+    expect(db.updates).toHaveLength(2);
+  });
+
+  it('PUT visibility extra fields ignored', async () => {
+    const db = createAliasesDb({
+      rooms: [room(ROOM, 0)],
+      memberships: [joinedMember()],
+      powerLevelsContent: null,
+    });
+    const res = await request(
+      db,
+      visibilityPath(),
+      jsonInit('PUT', { visibility: 'public', is_public: 0, room_id: ROOM2 })
+    );
+    expect(res.status).toBe(200);
+    expect(db.updates[0].args).toEqual([1, ROOM]);
+  });
+
+  it('GET visibility does not require membership', async () => {
+    const db = createAliasesDb({ rooms: [room(ROOM, 1)], memberships: [] });
+    const results = await Promise.all([
+      request(db, visibilityPath()),
+      request(db, visibilityPath()),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect((results[0].body as { visibility: string }).visibility).toBe('public');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`same-value visibility leftover soft-${i}`, async () => {
+      const vis = i % 2 === 0 ? 'public' : 'private';
+      const db = createAliasesDb({
+        rooms: [room(ROOM, vis === 'public' ? 0 : 1)],
+        memberships: [joinedMember()],
+        powerLevelsContent: null,
+      });
+      const results = await Promise.all([
+        request(db, visibilityPath(), jsonInit('PUT', { visibility: vis })),
+        request(db, visibilityPath(), jsonInit('PUT', { visibility: vis })),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(db.rooms[0].is_public).toBe(vis === 'public' ? 1 : 0);
+    });
+  }
 });

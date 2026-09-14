@@ -1,6 +1,9 @@
 /**
  * TOKENMAXX HEAVY deepen — different slice: room aliases / directory API routes.
  * Avoids search (#94), key-backups (#96), oauth (#90), spaces (#89), devices (sibling).
+ * After #226 leftover pass: sequential route edges not covered by concurrent-race
+ * leftovers (#193) — PL 0/equal/state_default-falsy, extra-colon split, extra
+ * body fields, visibility-without-room, servers JSON non-array, bind contracts.
  * Tests-only — no product inventing.
  * Exercises alias resolve/create/delete + room visibility directory list.
  */
@@ -756,5 +759,403 @@ describe('aliases PUT /directory/list/room/:roomId', () => {
     );
     expect(res.status).toBe(200);
     expect(db.rooms[0].is_public).toBe(0);
+  });
+});
+
+describe('aliases leftover GET resolve edges after #226', () => {
+  it('returns parsed empty servers array without defaulting', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ servers: '[]' })],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ room_id: ROOM, servers: [] });
+  });
+
+  it('returns JSON.parse number as servers (non-array leftover)', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ servers: '0' })],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`);
+    expect(res.status).toBe(200);
+    expect((res.body as { servers: unknown }).servers).toBe(0);
+  });
+
+  it('returns JSON.parse object as servers', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ servers: '{"ok":true}' })],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`);
+    expect(res.status).toBe(200);
+    expect((res.body as { servers: unknown }).servers).toEqual({ ok: true });
+  });
+
+  it('JSON.parse("null") leftover: servers field is null', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ servers: 'null' })],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`);
+    expect(res.status).toBe(200);
+    expect((res.body as { servers: unknown }).servers).toBeNull();
+  });
+
+  it('Hono+decodeURIComponent leftover: double-encoded alias still resolves', async () => {
+    const db = createAliasesDb({ aliases: [seedAlias()] });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent(ALIAS_ENC)}`
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ room_id: ROOM });
+  });
+
+  it('GET resolve SELECT binds the decoded alias', async () => {
+    const db = createAliasesDb({ aliases: [seedAlias()] });
+    await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`);
+    const sel = db.selects.find((s) => s.sql.includes('SELECT room_id, servers'));
+    expect(sel?.args).toEqual([ALIAS]);
+  });
+});
+
+describe('aliases leftover PUT create edges after #226', () => {
+  it('ignores extra JSON fields and still binds local SERVER_NAME servers list', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${ALIAS_ENC}`,
+      jsonInit('PUT', { room_id: ROOM, extra: true, servers: ['evil.example.org'] })
+    );
+    expect(res.status).toBe(200);
+    expect(db.inserts[0].args[1]).toBe(ROOM);
+    expect(db.inserts[0].args[2]).toBe(USER);
+    expect(db.inserts[0].args[3]).toBe(JSON.stringify([SERVER]));
+  });
+
+  it('rejects room_id 0 / false as missing param', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const a = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#z0:example.com')}`,
+      jsonInit('PUT', { room_id: 0 })
+    );
+    const b = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#z1:example.com')}`,
+      jsonInit('PUT', { room_id: false })
+    );
+    expect(a.status).toBe(400);
+    expect(a.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+    expect(b.status).toBe(400);
+    expect(db.inserts).toHaveLength(0);
+  });
+
+  it('split leftover: extra :8448 still matches SERVER_NAME', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const alias = '#ops:example.com:8448';
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent(alias)}`,
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(res.status).toBe(200);
+    expect(db.aliases[0].alias).toBe(alias);
+  });
+
+  it('split leftover: middle server other.org is foreign', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#x:other.org:example.com')}`,
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ error: 'Cannot create alias for another server' });
+  });
+
+  it('empty localpart #:example.com is accepted as format-valid', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#:example.com')}`,
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(res.status).toBe(200);
+    expect(db.aliases[0].alias).toBe('#:example.com');
+  });
+
+  it('server name compare is case-sensitive (EXAMPLE.COM rejected)', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#x:EXAMPLE.COM')}`,
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_INVALID_PARAM' });
+  });
+
+  it('joined on ROOM does not allow alias on another existing room', async () => {
+    const db = createAliasesDb({
+      rooms: [
+        { room_id: ROOM, is_public: 0 },
+        { room_id: '!other:example.com', is_public: 0 },
+      ],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent('#x:example.com')}`,
+      jsonInit('PUT', { room_id: '!other:example.com' })
+    );
+    expect(res.status).toBe(403);
+    expect(db.inserts).toHaveLength(0);
+  });
+
+  it('unicode localpart stores decoded alias', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const alias = '#café:example.com';
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${encodeURIComponent(alias)}`,
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(res.status).toBe(200);
+    expect(db.aliases[0].alias).toBe(alias);
+  });
+
+  it('invite membership is not join — forbidden', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'invite' }],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/room/${ALIAS_ENC}`,
+      jsonInit('PUT', { room_id: ROOM })
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+});
+
+describe('aliases leftover DELETE PL edges after #226', () => {
+  it('creator deletes even when power_levels JSON is corrupt (skips PL)', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: USER })],
+      powerLevelsRaw: '{broken',
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect(db.aliases).toHaveLength(0);
+    expect(db.selects.some((s) => s.sql.includes('power_levels'))).toBe(false);
+  });
+
+  it('users[userId]=0 falls through to users_default 100 and allows delete', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 0 },
+        users_default: 100,
+        state_default: 50,
+      }),
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+    expect(db.aliases).toHaveLength(0);
+  });
+
+  it('equal power userPower === state_default allows delete', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 50 },
+        state_default: 50,
+      }),
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('state_default 0 is falsy so required stays 50 — user 0 forbidden', async () => {
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER })],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 0 },
+        users_default: 0,
+        state_default: 0,
+      }),
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ error: 'Insufficient power level to delete alias' });
+    expect(db.aliases).toHaveLength(1);
+  });
+
+  it('PL query binds the alias room_id not the requester', async () => {
+    const otherRoom = '!other:example.com';
+    const db = createAliasesDb({
+      aliases: [seedAlias({ creator_id: OTHER, room_id: otherRoom })],
+      powerLevelsContent: JSON.stringify({ users: { [USER]: 100 }, state_default: 50 }),
+    });
+    await request(db, `/_matrix/client/v3/directory/room/${ALIAS_ENC}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    const plSel = db.selects.find((s) => s.sql.includes('power_levels'));
+    expect(plSel?.args).toEqual([otherRoom]);
+  });
+});
+
+describe('aliases leftover visibility edges after #226', () => {
+  it('maps is_public=2 (truthy) to public', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 2 }],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ visibility: 'public' });
+  });
+
+  it('GET visibility does not require membership', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 1 }],
+      memberships: [],
+    });
+    const res = await request(db, `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ visibility: 'public' });
+  });
+
+  it('PUT visibility with membership but no rooms row still 200 (no existence check)', async () => {
+    const db = createAliasesDb({
+      rooms: [],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: null,
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+      jsonInit('PUT', { visibility: 'public' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.updates[0].args).toEqual([1, ROOM]);
+  });
+
+  it('PUT visibility extra fields ignored', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: null,
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+      jsonInit('PUT', { visibility: 'private', extra: 1 })
+    );
+    expect(res.status).toBe(200);
+    expect(db.updates[0].args).toEqual([0, ROOM]);
+  });
+
+  it('users[userId]=0 falls through to users_default for visibility', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 0 },
+        users_default: 80,
+        state_default: 50,
+      }),
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+      jsonInit('PUT', { visibility: 'public' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rooms[0].is_public).toBe(1);
+  });
+
+  it('state_default 0 falsy leftover requires 50 — user 10 forbidden', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 10 },
+        state_default: 0,
+      }),
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+      jsonInit('PUT', { visibility: 'public' })
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ error: 'Insufficient power level' });
+  });
+
+  it('equal power 50 allows visibility change', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: JSON.stringify({
+        users: { [USER]: 50 },
+        state_default: 50,
+      }),
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+      jsonInit('PUT', { visibility: 'public' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rooms[0].is_public).toBe(1);
+  });
+
+  it('PUT visibility SELECT membership binds roomId from path', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: null,
+    });
+    await request(
+      db,
+      `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+      jsonInit('PUT', { visibility: 'public' })
+    );
+    const mem = db.selects.find((s) => s.sql.includes('FROM room_memberships'));
+    expect(mem?.args).toEqual([ROOM, USER]);
   });
 });
