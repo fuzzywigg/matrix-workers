@@ -38,6 +38,21 @@ jobs:
       - run: npm ci
       - run: npm run lint
 
+  # Fail-fast canary for media + presence/receipts/typing soft∥success
+  # concurrent leftovers (first wave #301 + residual second wave). Isolates
+  # flake attribution before the full vitest suite.
+  media-presence-soft-concurrent:
+    name: Media/Presence Soft Concurrent Canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:media-presence-soft-concurrent
+
   test:
     name: Tests
     runs-on: ubuntu-latest
