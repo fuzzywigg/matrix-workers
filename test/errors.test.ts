@@ -1011,3 +1011,144 @@ describe('errors TOKENMAXX residual quinary leftovers after #319', () => {
     await expect(empty.json()).resolves.toEqual({});
   });
 });
+
+describe('errors TOKENMAXX residual senary leftovers after #330', () => {
+  it('missingParam/invalidParam/conflict/tooLarge/unrecognized default exacts under race', async () => {
+    const [miss, inv, conf, large, unrec] = await Promise.all([
+      Promise.resolve(Errors.missingParam('user_id').toResponse()),
+      Promise.resolve(Errors.invalidParam('limit').toResponse()),
+      Promise.resolve(Errors.conflict().toResponse()),
+      Promise.resolve(Errors.tooLarge().toResponse()),
+      Promise.resolve(Errors.unrecognized().toResponse()),
+    ]);
+    expect(new Set([miss, inv, conf, large, unrec]).size).toBe(5);
+    expect(miss.status).toBe(400);
+    expect(inv.status).toBe(400);
+    expect(conf.status).toBe(409);
+    expect(large.status).toBe(413);
+    expect(unrec.status).toBe(400);
+    await expect(miss.json()).resolves.toEqual({
+      errcode: 'M_MISSING_PARAM',
+      error: 'Missing required parameter: user_id',
+    });
+    await expect(inv.json()).resolves.toEqual({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Invalid parameter: limit',
+    });
+    await expect(conf.json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'State changed concurrently; retry the operation',
+    });
+    await expect(large.json()).resolves.toEqual({
+      errcode: 'M_TOO_LARGE',
+      error: 'Request too large',
+    });
+    await expect(unrec.json()).resolves.toEqual({
+      errcode: 'M_UNRECOGNIZED',
+      error: 'Unrecognized request',
+    });
+  });
+
+  it('withErrorHandler races missingParam + conflict + tooLarge + unrecognized customs', async () => {
+    const [a, b, c, d] = await Promise.all([
+      withErrorHandler(async () => {
+        throw Errors.missingParam('device_id');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.conflict('lost-race');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.tooLarge('huge');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.unrecognized('nope');
+      }),
+    ]);
+    expect((a as Response).status).toBe(400);
+    expect((b as Response).status).toBe(409);
+    expect((c as Response).status).toBe(413);
+    expect((d as Response).status).toBe(400);
+    await expect((a as Response).json()).resolves.toEqual({
+      errcode: 'M_MISSING_PARAM',
+      error: 'Missing required parameter: device_id',
+    });
+    await expect((b as Response).json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'lost-race',
+    });
+    await expect((c as Response).json()).resolves.toEqual({
+      errcode: 'M_TOO_LARGE',
+      error: 'huge',
+    });
+    await expect((d as Response).json()).resolves.toEqual({
+      errcode: 'M_UNRECOGNIZED',
+      error: 'nope',
+    });
+  });
+
+  it('MatrixApiError.name ∥ errcode ∥ custom status stay independent under race', async () => {
+    const [a, b, c] = await Promise.all([
+      Promise.resolve(new MatrixApiError(ErrorCodes.M_FORBIDDEN, 'x', 403)),
+      Promise.resolve(new MatrixApiError(ErrorCodes.M_NOT_FOUND, 'y', 404)),
+      Promise.resolve(new MatrixApiError(ErrorCodes.M_UNKNOWN, 'z', 502)),
+    ]);
+    expect(a.name).toBe('MatrixApiError');
+    expect(b.name).toBe('MatrixApiError');
+    expect(c.name).toBe('MatrixApiError');
+    expect(a.errcode).toBe(ErrorCodes.M_FORBIDDEN);
+    expect(b.errcode).toBe(ErrorCodes.M_NOT_FOUND);
+    expect(c.errcode).toBe(ErrorCodes.M_UNKNOWN);
+    expect(a.status).toBe(403);
+    expect(b.status).toBe(404);
+    expect(c.status).toBe(502);
+    const [ra, rb, rc] = await Promise.all([
+      Promise.resolve(a.toResponse()),
+      Promise.resolve(b.toResponse()),
+      Promise.resolve(c.toResponse()),
+    ]);
+    expect(ra.status).toBe(403);
+    expect(rb.status).toBe(404);
+    expect(rc.status).toBe(502);
+    await expect(ra.json()).resolves.toEqual({ errcode: 'M_FORBIDDEN', error: 'x' });
+    await expect(rb.json()).resolves.toEqual({ errcode: 'M_NOT_FOUND', error: 'y' });
+    await expect(rc.json()).resolves.toEqual({ errcode: 'M_UNKNOWN', error: 'z' });
+  });
+
+  it('invalidParam custom ∥ missingParam ∥ conflict custom toJSON under race', async () => {
+    const [inv, miss, conf] = await Promise.all([
+      Promise.resolve(Errors.invalidParam('room_id', 'must be room id').toJSON()),
+      Promise.resolve(Errors.missingParam('access_token').toJSON()),
+      Promise.resolve(Errors.conflict('retry').toJSON()),
+    ]);
+    expect(inv).toEqual({
+      errcode: 'M_INVALID_PARAM',
+      error: 'must be room id',
+    });
+    expect(miss).toEqual({
+      errcode: 'M_MISSING_PARAM',
+      error: 'Missing required parameter: access_token',
+    });
+    expect(conf).toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'retry',
+    });
+  });
+
+  it('jsonResponse primitive bodies ∥ emptyResponse 203 stay independent under race', async () => {
+    const [num, str, bool, empty] = await Promise.all([
+      Promise.resolve(jsonResponse(0, 200)),
+      Promise.resolve(jsonResponse('hi', 201)),
+      Promise.resolve(jsonResponse(false, 202)),
+      Promise.resolve(emptyResponse(203)),
+    ]);
+    expect(new Set([num, str, bool, empty]).size).toBe(4);
+    expect(num.status).toBe(200);
+    expect(str.status).toBe(201);
+    expect(bool.status).toBe(202);
+    expect(empty.status).toBe(203);
+    await expect(num.json()).resolves.toBe(0);
+    await expect(str.json()).resolves.toBe('hi');
+    await expect(bool.json()).resolves.toBe(false);
+    await expect(empty.json()).resolves.toEqual({});
+  });
+});
