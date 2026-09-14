@@ -1,14 +1,17 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 — admin *GET concurrent race / TOCTOU*
- * for leftover admin-api routes that only had serial soft floods (#157 leftover)
- * or mutate races (#189). Distinct from admin-mutate-concurrent-race-leftovers
- * (writes) and admin-api-route-leftovers (serial GET floods).
+ * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 — admin *GET
+ * concurrent race / TOCTOU* for leftover admin-api routes that only had serial
+ * soft floods (#157 leftover) or mutate races (#189). Distinct from
+ * admin-mutate-concurrent-race-leftovers (writes) and admin-api-route-leftovers
+ * (serial GET floods).
  *
- * Focus: parallel stats Admin DO; history periods; users∥rooms∥config isolation;
- * federation/status CACHE get barrier + corrupt key; federation/servers;
- * federation/test fetch; analytics; whois; synapse destinations/event_reports;
- * registration GET; IdP list; media∥reports∥audit; sessions∥keys; rooms detail∥events;
- * non-admin 403 Promise.all; method-matrix concurrent.
+ * Distinct from tip #232 (room-cache KV generation) and #226 (rate-limit DO).
+ *
+ * Focus (this deepen): federation/status CACHE mutate mid-flight; DEVICE_KEYS
+ * get-barrier keys debug; IdP GET by id; synapse user/room detail; whois
+ * non-admin self∥other; users search∥guests filter; audit/report query
+ * isolation; room events before=; history invalid period pin; federation/test
+ * fetch fail; 404 isolation; destinations next_token; keys corrupt JSON.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -2368,6 +2371,470 @@ describe('race admin GET leftover lifecycle Promise.all after #214', () => {
         jsonReq('/admin/api/config', {}, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200, 200]);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// After #232: leftover GET TOCTOU / filter isolation / 404 / CACHE mutate
+// ---------------------------------------------------------------------------
+
+describe('race leftover federation/status CACHE mutate mid-flight after #232', () => {
+  it('first GET sees cached keyId; later GET falls back after mutate', async () => {
+    const cache = mockKv(
+      { server_signing_key: JSON.stringify({ keyId: 'ed25519:live' }) },
+      {
+        getBarrier: { count: 2, match: (key) => key === 'server_signing_key' },
+        mutateAfterGets: { after: 1, next: {} },
+      }
+    );
+    const env = createEnv({ cache });
+    const results = await Promise.all([
+      jsonReq('/admin/api/federation/status', {}, env),
+      jsonReq('/admin/api/federation/status', {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    const ids = results.map((r) => r.body.signing_key_id as string).sort();
+    expect(ids).toContain('ed25519:live');
+    expect(ids).toContain('ed25519:a_exam');
+  });
+
+  it('empty keyId object uses serverName split fallback under race', async () => {
+    const cache = mockKv(
+      { server_signing_key: JSON.stringify({ notKeyId: true }) },
+      { getBarrier: { count: 2, match: (key) => key === 'server_signing_key' } }
+    );
+    const env = createEnv({ cache });
+    const results = await Promise.all([
+      jsonReq('/admin/api/federation/status', {}, env),
+      jsonReq('/admin/api/federation/status', {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => r.body.signing_key_id === 'ed25519:example')).toBe(true);
+  });
+
+  it('servers COUNT barrier: both status calls share known_servers_count', async () => {
+    const db = createAdminDb({
+      selectBarrier: {
+        count: 2,
+        match: (sql) => sql.includes('SELECT COUNT(*) as count FROM servers'),
+      },
+    });
+    const env = createEnv({ db });
+    const results = await Promise.all([
+      jsonReq('/admin/api/federation/status', {}, env),
+      jsonReq('/admin/api/federation/status', {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => r.body.known_servers_count === 1)).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`status CACHE mutate leftover flood-${i}`, async () => {
+      const cache = mockKv(
+        { server_signing_key: JSON.stringify({ keyId: `ed25519:f${i}` }) },
+        {
+          getBarrier: { count: 2, match: (key) => key === 'server_signing_key' },
+          mutateAfterGets: { after: 1, next: { server_signing_key: 'not-json{' } },
+        }
+      );
+      const env = createEnv({ cache });
+      const results = await Promise.all([
+        jsonReq('/admin/api/federation/status', {}, env),
+        jsonReq('/admin/api/federation/status', {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      const ids = results.map((r) => r.body.signing_key_id as string);
+      expect(ids).toContain(`ed25519:f${i}`);
+      expect(ids).toContain('ed25519:a_exam');
+    });
+  }
+});
+
+describe('race leftover DEVICE_KEYS get-barrier keys debug after #232', () => {
+  it('parallel keys GET both observe BOBDEVICE signatures', async () => {
+    const deviceKeys = mockKv(
+      {
+        [`device:${BOB}:BOBDEVICE`]: JSON.stringify({
+          algorithms: ['m.olm.v1.curve25519-aes-sha2'],
+          device_id: 'BOBDEVICE',
+          user_id: BOB,
+          keys: { 'ed25519:BOBDEVICE': 'DEVKEY' },
+          signatures: { [BOB]: { 'ed25519:ss': 'sig' } },
+        }),
+      },
+      { getBarrier: { count: 2, match: (key) => key === `device:${BOB}:BOBDEVICE` } }
+    );
+    const env = createEnv({ deviceKeys });
+    const path = `/admin/api/users/${encodeURIComponent(BOB)}/keys`;
+    const results = await Promise.all([jsonReq(path, {}, env), jsonReq(path, {}, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    for (const r of results) {
+      expect(r.body.user_id).toBe(BOB);
+      expect((r.body.verification_status as Record<string, { verified: boolean }>).BOBDEVICE.verified).toBe(
+        true
+      );
+    }
+  });
+
+  it('corrupt DEVICE_KEYS JSON surfaces 500 under race (unhandled parse)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const deviceKeys = mockKv({ [`device:${BOB}:BOBDEVICE`]: 'not-json{' });
+    const env = createEnv({ deviceKeys });
+    const path = `/admin/api/users/${encodeURIComponent(BOB)}/keys`;
+    const results = await Promise.all([jsonReq(path, {}, env), jsonReq(path, {}, env)]);
+    expect(statusesOf(results)).toEqual([500, 500]);
+  });
+
+  it('keys∥sessions isolation under DEVICE_KEYS barrier', async () => {
+    const deviceKeys = mockKv(
+      {
+        [`device:${BOB}:BOBDEVICE`]: JSON.stringify({
+          device_id: 'BOBDEVICE',
+          signatures: { [BOB]: { 'ed25519:ss': 'sig' } },
+        }),
+      },
+      { getBarrier: { count: 1, match: (key) => key.startsWith('device:') } }
+    );
+    const env = createEnv({ deviceKeys });
+    const bobEnc = encodeURIComponent(BOB);
+    const [keys, sessions] = await Promise.all([
+      jsonReq(`/admin/api/users/${bobEnc}/keys`, {}, env),
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+    ]);
+    expect(keys.status).toBe(200);
+    expect(sessions.status).toBe(200);
+    expect(Array.isArray(sessions.body.sessions)).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`keys debug leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const results = await Promise.all([
+        jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/keys`, {}, env),
+        jsonReq(`/admin/api/users/${encodeURIComponent(ADMIN)}/keys`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(results[0].body.user_id).toBe(BOB);
+      expect(results[1].body.user_id).toBe(ADMIN);
+    });
+  }
+});
+
+describe('race leftover IdP GET by id + synapse detail after #232', () => {
+  it('idp list∥detail isolation: list omits secret, detail has linked_users', async () => {
+    const env = createEnv();
+    const [list, detail] = await Promise.all([
+      jsonReq('/admin/api/idp/providers', {}, env),
+      jsonReq('/admin/api/idp/providers/idp1', {}, env),
+    ]);
+    expect(statusesOf([list, detail])).toEqual([200, 200]);
+    expect((list.body.providers as Array<{ id: string }>)[0].id).toBe('idp1');
+    expect(detail.body.id).toBe('idp1');
+    expect(detail.body.enabled).toBe(true);
+    expect(Array.isArray(detail.body.linked_users)).toBe(true);
+  });
+
+  it('missing IdP∥missing user∥missing room 404 isolation', async () => {
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq('/admin/api/idp/providers/nope', {}, env),
+      jsonReq(`/admin/api/users/${encodeURIComponent('@missing:example.com')}`, {}, env),
+      jsonReq(`/admin/api/rooms/${encodeURIComponent('!missing:example.com')}`, {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([404, 404, 404]);
+    expect(results.every((r) => r.body.errcode === 'M_NOT_FOUND')).toBe(true);
+  });
+
+  it('synapse v2 user detail∥v1 room detail parallel', async () => {
+    const env = createEnv();
+    const [user, room] = await Promise.all([
+      jsonReq(`/_synapse/admin/v2/users/${encodeURIComponent(BOB)}`, {}, env),
+      jsonReq(`/_synapse/admin/v1/rooms/${encodeURIComponent(ROOM)}`, {}, env),
+    ]);
+    expect(user.status).toBe(200);
+    expect(room.status).toBe(200);
+    expect(user.body.name).toBe(BOB);
+    expect(user.body.threepids).toEqual([]);
+    expect(room.body.room_id).toBe(ROOM);
+    expect(room.body.name).toBe('General');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp detail leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const results = await Promise.all([
+        jsonReq('/admin/api/idp/providers/idp1', {}, env),
+        jsonReq('/admin/api/idp/providers/idp1', {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(results.every((r) => r.body.name === 'GitHub')).toBe(true);
+    });
+  }
+});
+
+describe('race leftover whois non-admin + search filters after #232', () => {
+  it('non-admin self whois 200∥other 403', async () => {
+    authState.userId = BOB;
+    const env = nonAdminEnv();
+    const [self, other] = await Promise.all([
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(BOB)}`, {}, env),
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(ADMIN)}`, {}, env),
+    ]);
+    expect(self.status).toBe(200);
+    expect(other.status).toBe(403);
+    expect(self.body.user_id).toBe(BOB);
+    expect(other.body.errcode).toBe('M_FORBIDDEN');
+  });
+
+  it('whois missing user 404 under race', async () => {
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent('@ghost:example.com')}`, {}, env),
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent('@ghost:example.com')}`, {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([404, 404]);
+  });
+
+  it('users search=bob∥synapse guests=false isolation', async () => {
+    const env = createEnv();
+    const [search, guests] = await Promise.all([
+      jsonReq('/admin/api/users?search=bob&limit=10', {}, env),
+      jsonReq('/_synapse/admin/v2/users?guests=false&limit=10&from=0', {}, env),
+    ]);
+    expect(statusesOf([search, guests])).toEqual([200, 200]);
+    expect(Array.isArray(search.body.users)).toBe(true);
+    expect(Array.isArray(guests.body.users)).toBe(true);
+  });
+
+  it('history invalid period pins 7d under race vs 30d', async () => {
+    const env = createEnv();
+    const [weird, month] = await Promise.all([
+      jsonReq('/admin/api/stats/history?period=weird', {}, env),
+      jsonReq('/admin/api/stats/history?period=30d', {}, env),
+    ]);
+    expect(statusesOf([weird, month])).toEqual([200, 200]);
+    expect(weird.body.period).toBe('7d');
+    expect((weird.body.data as unknown[]).length).toBe(7);
+    expect(month.body.period).toBe('30d');
+    expect((month.body.data as unknown[]).length).toBe(30);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`search filter leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const q = i % 2 === 0 ? 'bob' : 'admin';
+      const results = await Promise.all([
+        jsonReq(`/admin/api/users?search=${q}`, {}, env),
+        jsonReq(`/_synapse/admin/v2/users?name=${q}&from=0&limit=5`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover audit/report/events query isolation after #232', () => {
+  it('audit actor∥target∥action filters isolate', async () => {
+    const env = createEnv();
+    const [actor, target, action] = await Promise.all([
+      jsonReq(`/admin/api/audit?actor=${encodeURIComponent(ADMIN)}`, {}, env),
+      jsonReq(`/admin/api/audit?target=${encodeURIComponent(BOB)}`, {}, env),
+      jsonReq('/admin/api/audit?action=user.update', {}, env),
+    ]);
+    expect(statusesOf([actor, target, action])).toEqual([200, 200, 200]);
+    expect(Array.isArray(actor.body.entries)).toBe(true);
+    expect(Array.isArray(target.body.entries)).toBe(true);
+    expect(Array.isArray(action.body.entries)).toBe(true);
+  });
+
+  it('reports resolved=true∥false isolate totals', async () => {
+    const db = createAdminDb({
+      reports: [
+        {
+          id: 1,
+          reporter_user_id: ADMIN,
+          room_id: ROOM,
+          event_id: '$msg:example.com',
+          reason: 'spam',
+          score: -100,
+          created_at: 8_000,
+          resolved: 0,
+          resolved_by: null,
+          resolved_at: null,
+          resolution_note: null,
+        },
+        {
+          id: 2,
+          reporter_user_id: BOB,
+          room_id: ROOM,
+          event_id: '$msg:example.com',
+          reason: 'done',
+          score: 0,
+          created_at: 9_000,
+          resolved: 1,
+          resolved_by: ADMIN,
+          resolved_at: 9_100,
+          resolution_note: 'ok',
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const [open, closed] = await Promise.all([
+      jsonReq('/admin/api/reports?resolved=false', {}, env),
+      jsonReq('/admin/api/reports?resolved=true', {}, env),
+    ]);
+    expect(statusesOf([open, closed])).toEqual([200, 200]);
+    expect(open.body.total).toBe(1);
+    expect(closed.body.total).toBe(1);
+  });
+
+  it('room events before= pagination isolation', async () => {
+    const env = createEnv();
+    const roomEnc = encodeURIComponent(ROOM);
+    const [all, before] = await Promise.all([
+      jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=50`, {}, env),
+      jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=50&before=15`, {}, env),
+    ]);
+    expect(statusesOf([all, before])).toEqual([200, 200]);
+    expect(Array.isArray(all.body.events)).toBe(true);
+    expect(Array.isArray(before.body.events)).toBe(true);
+  });
+
+  it('synapse destinations next_token vs event_reports dir=f', async () => {
+    const env = createEnv();
+    const [dest, reports] = await Promise.all([
+      jsonReq('/_synapse/admin/v1/federation/destinations?limit=1&from=0', {}, env),
+      jsonReq('/_synapse/admin/v1/event_reports?limit=10&from=0&dir=f', {}, env),
+    ]);
+    expect(dest.status).toBe(200);
+    expect(reports.status).toBe(200);
+    expect(dest.body.total).toBe(1);
+    expect(dest.body.next_token).toBeUndefined();
+    expect(Array.isArray(reports.body.event_reports)).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`audit/report leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const results = await Promise.all([
+        jsonReq(`/admin/api/audit?limit=${(i % 3) + 1}`, {}, env),
+        jsonReq(`/admin/api/reports?limit=${(i % 3) + 1}`, {}, env),
+        jsonReq(`/admin/api/media?limit=${(i % 3) + 1}&offset=0`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200, 200]);
+    });
+  }
+});
+
+describe('race leftover federation/test fetch fail + config after #232', () => {
+  it('parallel self-tests both fail when fetch throws', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('network down');
+    });
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq('/admin/api/federation/test', {}, env),
+      jsonReq('/admin/api/federation/test', {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => r.body.success === false)).toBe(true);
+    expect(results.every((r) => (r.body.tests as unknown[]).length === 4)).toBe(true);
+  });
+
+  it('mixed HTTP fail on keys endpoint: tests array still length 4', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/_matrix/key/v2/server')) {
+        return new Response('nope', { status: 503 });
+      }
+      if (url.includes('/.well-known/matrix/server')) {
+        return Response.json({ 'm.server': `${SERVER}:443` });
+      }
+      if (url.includes('/_matrix/federation/v1/version')) {
+        return Response.json({ server: { name: 'matrix-worker', version: 'x' } });
+      }
+      if (url.includes('/.well-known/matrix/client')) {
+        return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
+      }
+      return new Response('missing', { status: 404 });
+    });
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq('/admin/api/federation/test', {}, env),
+      jsonReq('/admin/api/config', {}, env),
+    ]);
+    expect(results[0].status).toBe(200);
+    expect(results[1].status).toBe(200);
+    expect(results[0].body.success).toBe(false);
+    expect(results[1].body.server_name).toBe(SERVER);
+    expect((results[1].body.limits as { max_upload_size: number }).max_upload_size).toBe(
+      50 * 1024 * 1024
+    );
+  });
+
+  it('config∥registration GET∥synapse version leftover isolation', async () => {
+    const adminDO = createAdminDO({ config: { registration_enabled: false } });
+    const env = createEnv({ adminDO });
+    const [config, reg, ver] = await Promise.all([
+      jsonReq('/admin/api/config', {}, env),
+      jsonReq('/admin/api/registration', {}, env),
+      jsonReq('/_synapse/admin/v1/server_version', {}, env),
+    ]);
+    expect(statusesOf([config, reg, ver])).toEqual([200, 200, 200]);
+    expect(reg.body.enabled).toBe(false);
+    expect(ver.body.python_version).toBe('N/A (Cloudflare Workers)');
+    expect((config.body.features as { voip: boolean }).voip).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`config leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const results = await Promise.all([
+        jsonReq('/admin/api/config', {}, env),
+        jsonReq('/_synapse/admin/v1/server_version', {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(results[0].body.version).toBe('tuwunel-test-0.1.0');
+    });
+  }
+});
+
+describe('race leftover GET charset + HEAD/OPTIONS after #232', () => {
+  it('GET leftover paths with charset Content-Type still 200', async () => {
+    const env = createEnv();
+    const init: RequestInit = {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json; charset=utf-8', ...AUTH },
+    };
+    const results = await Promise.all([
+      jsonReq('/admin/api/config', init, env),
+      jsonReq('/admin/api/users?limit=1', init, env),
+      jsonReq('/admin/api/federation/servers', init, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200, 200]);
+  });
+
+  it('HEAD/OPTIONS leftover GET paths', async () => {
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq('/admin/api/stats', jsonInit('HEAD'), env),
+      jsonReq('/admin/api/config', jsonInit('OPTIONS'), env),
+      jsonReq('/admin/api/users', jsonInit('PATCH', {}), env),
+    ]);
+    expect(results.every((r) => [200, 204, 404, 405].includes(r.status))).toBe(true);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`charset leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const init: RequestInit = {
+        headers: { 'Content-Type': `application/json; charset=utf-8`, ...AUTH },
+      };
+      const results = await Promise.all([
+        jsonReq('/admin/api/media?limit=1', init, env),
+        jsonReq('/admin/api/audit?limit=1', init, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
     });
   }
 });
