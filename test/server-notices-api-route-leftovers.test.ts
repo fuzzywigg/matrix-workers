@@ -639,7 +639,7 @@ describe.each([
   it.each([
     ['null body', { user_id: BOB, content: { body: null } }],
     ['undefined body via omit', { user_id: BOB, content: { msgtype: 'm.text' } }],
-    ['numeric body ignored as truthy? wait number', { user_id: BOB, content: { body: 0 } }],
+    ['numeric zero body', { user_id: BOB, content: { body: 0 } }],
     ['false body', { user_id: BOB, content: { body: false } }],
   ] as const)('rejects falsy content.body cases: %s', async (_name, payload) => {
     const db = createNoticeDb();
