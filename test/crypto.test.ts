@@ -1329,3 +1329,118 @@ describe('crypto TOKENMAXX residual quaternary leftovers after #298', () => {
     });
   }
 });
+
+describe('crypto TOKENMAXX residual quinary leftovers after #303', () => {
+  it('verifyPassword malformed∥atob-throw∥hashPassword ok∥timingSafeEqual under race', async () => {
+    const [hash, lowIter, wrongScheme, extraParts, atobResult, eq, ne] = await Promise.all([
+      hashPassword('quinary-ok-1'),
+      verifyPassword('x', '$pbkdf2-sha256$99999$c2FsdA==$aGFzaA=='),
+      verifyPassword('x', '$pbkdf2-sha1$100000$c2FsdA==$aGFzaA=='),
+      verifyPassword('x', '$pbkdf2-sha256$100000$c2FsdA==$aGFzaA==$extra'),
+      verifyPassword('x', '$pbkdf2-sha256$100000$!!!not-b64!!!$aGFzaA==').then(
+        () => 'resolved' as const,
+        () => 'threw' as const
+      ),
+      Promise.resolve(timingSafeEqual('same-token', 'same-token')),
+      Promise.resolve(timingSafeEqual('same-token', 'diff-token')),
+    ]);
+    expect(await verifyPassword('quinary-ok-1', hash)).toBe(true);
+    expect(lowIter).toBe(false);
+    expect(wrongScheme).toBe(false);
+    expect(extraParts).toBe(false);
+    expect(atobResult).toBe('threw');
+    expect(eq).toBe(true);
+    expect(ne).toBe(false);
+  });
+
+  it('validatePasswordStrength exact ∥ verifyPassword reject ∥ hashToken under race', async () => {
+    const [noLetter, noNumber, short, over, rejectIter, tokenA, tokenB] = await Promise.all([
+      Promise.resolve(validatePasswordStrength('12345678')),
+      Promise.resolve(validatePasswordStrength('password')),
+      Promise.resolve(validatePasswordStrength('abcdef7')),
+      Promise.resolve(validatePasswordStrength(`${'a'.repeat(1000)}1`)),
+      verifyPassword('password1', '$pbkdf2-sha256$2000001$c2FsdA==$aGFzaA=='),
+      hashToken('syt_quinary_a'),
+      hashToken('syt_quinary_b'),
+    ]);
+    expect(noLetter).toBe('Password must contain at least one letter');
+    expect(noNumber).toBe('Password must contain at least one number or special character');
+    expect(short).toBe('Password must be at least 8 characters long');
+    expect(over).toBe('Password must be at most 1000 characters long');
+    expect(rejectIter).toBe(false);
+    expect(tokenA).not.toBe(tokenB);
+    expect(tokenA).toBe(await sha256('syt_quinary_a'));
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`verifyPassword malformed∥strength exact flood-${i}`, async () => {
+      const [reject, letter, number, okHash] = await Promise.all([
+        verifyPassword(
+          `pw-${i}`,
+          i % 2 === 0
+            ? `$pbkdf2-sha256$${99999 - i}$c2FsdA==$aGFzaA==`
+            : `$pbkdf2-sha256$100000$c2FsdA==$aGFzaA==$x${i}`
+        ),
+        Promise.resolve(validatePasswordStrength(`${'9'.repeat(8 + (i % 3))}`)),
+        Promise.resolve(validatePasswordStrength(`${'a'.repeat(8 + (i % 3))}`)),
+        hashPassword(`quinary-flood-${i}-1`),
+      ]);
+      expect(reject).toBe(false);
+      expect(letter).toBe('Password must contain at least one letter');
+      expect(number).toBe(
+        'Password must contain at least one number or special character'
+      );
+      expect(await verifyPassword(`quinary-flood-${i}-1`, okHash)).toBe(true);
+    });
+  }
+});
+
+describe('federation signing TOKENMAXX residual quinary leftovers after #303', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('signJson∥verifySignature∥timingSafeEqual stay isolated under Promise.all', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const baseA = { type: 'm.test', content: { side: 'a' } };
+    const baseB = { type: 'm.test', content: { side: 'b' } };
+    const [signedA, signedB] = await Promise.all([
+      signJson(baseA, 'a.example.com', a.keyId, a.privateKeyJwk),
+      signJson(baseB, 'b.example.com', b.keyId, b.privateKeyJwk),
+    ]);
+    const [okA, okB, badCross, eq] = await Promise.all([
+      verifySignature(signedA, 'a.example.com', a.keyId, a.publicKey),
+      verifySignature(signedB, 'b.example.com', b.keyId, b.publicKey),
+      verifySignature(signedA, 'a.example.com', a.keyId, b.publicKey),
+      Promise.resolve(timingSafeEqual(a.keyId, b.keyId)),
+    ]);
+    expect(okA).toBe(true);
+    expect(okB).toBe(true);
+    expect(badCross).toBe(false);
+    expect(eq).toBe(a.keyId === b.keyId);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`signJson∥verifySignature concurrent flood-${i}`, async () => {
+      const pair = await generateSigningKeyPair();
+      const obj = { type: 'm.test', content: { n: i } };
+      const [signed, other] = await Promise.all([
+        signJson(obj, 'ex.com', pair.keyId, pair.privateKeyJwk),
+        signJson({ type: 'm.other', content: { n: i } }, 'ex.com', pair.keyId, pair.privateKeyJwk),
+      ]);
+      const [ok, bad] = await Promise.all([
+        verifySignature(signed, 'ex.com', pair.keyId, pair.publicKey),
+        verifySignature(other, 'other.example.com', pair.keyId, pair.publicKey),
+      ]);
+      expect(ok).toBe(true);
+      expect(bad).toBe(false);
+    });
+  }
+});
