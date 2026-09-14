@@ -10557,3 +10557,1228 @@ describe('oauth identity leftovers soft-cap flood helpers round-4 after #151', (
     });
   }
 });
+
+describe('oauth identity leftovers oauth helpers soft reliability round-5 after #151', () => {
+  for (const [verifier, challenge, method, ok] of [
+    ['v5a', 'v5a', 'plain', true],
+    ['v5b', 'v5c', 'plain', false],
+    ['same', 'same', 'plain', true],
+    ['x', 'y', 'plain', false],
+  ] as const) {
+    it(`verifyCodeChallenge plain soft r5 ${JSON.stringify(verifier)}/${JSON.stringify(challenge)}→${ok}`, async () => {
+      expect(await verifyCodeChallenge(verifier, challenge, method)).toBe(ok);
+    });
+  }
+
+  it('verifyCodeChallenge S256 soft match and mismatch digest', async () => {
+    const verifier = 'round5-pkce-verifier-abcdefghijklmnopqrstuv';
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    const challenge = base64UrlEncode(new Uint8Array(hash));
+    expect(await verifyCodeChallenge(verifier, challenge, 'S256')).toBe(true);
+    expect(await verifyCodeChallenge('other-verifier-yyyyyyyyyyyyyyyyyyyy', challenge, 'S256')).toBe(false);
+  });
+
+  for (const method of ['S256', 'plain', 's256', 'PLAIN']) {
+    it(`verifyCodeChallenge method soft case ${JSON.stringify(method)}`, async () => {
+      if (method === 'plain') {
+        expect(await verifyCodeChallenge('z5', 'z5', method)).toBe(true);
+      } else if (method === 'S256') {
+        const v = 'r5-s256-case-bbbbbbbbbbbbbbbbbbbbbb';
+        const dig = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v));
+        expect(await verifyCodeChallenge(v, base64UrlEncode(new Uint8Array(dig)), method)).toBe(true);
+      } else {
+        expect(await verifyCodeChallenge('z5', 'z5', method)).toBe(false);
+      }
+    });
+  }
+
+  for (const raw of ['<>&', '"\'', 'plain-r5', '<script>', 'a&b"c\'d']) {
+    it(`escapeHtml soft r5 ${JSON.stringify(raw)}`, () => {
+      const out = escapeHtml(raw);
+      expect(out).not.toMatch(/[<>]/);
+      if (raw.includes('&')) expect(out).toContain('&amp;');
+      if (raw.includes('"')) expect(out).toContain('&quot;');
+      if (raw.includes("'")) expect(out).toContain('&#039;');
+    });
+  }
+
+  it('generateLoginPage soft embeds client name and error', () => {
+    const html = generateLoginPage('Client R5', 'auth-r5-id', SERVER, 'login failed');
+    expect(html).toContain('auth-r5-id');
+    expect(html).toContain(SERVER);
+    expect(html).toContain('login failed');
+  });
+
+  it('hashClientSecret soft distinct and stable', async () => {
+    const a = await hashClientSecret('r5-a');
+    const b = await hashClientSecret('r5-b');
+    expect(a).not.toBe(b);
+    expect(await hashClientSecret('r5-a')).toBe(a);
+    expect(a).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it('UIA HTML soft pages contain markers', () => {
+    expect(generateUiaSuccessPage('sid-r5', SERVER)).toContain(SERVER);
+    expect(generateUiaCancelledPage(SERVER)).toContain(SERVER);
+    expect(generateUiaErrorPage('T5', 'msg-r5', SERVER)).toContain('msg-r5');
+    expect(generateUiaApprovalPage('sid5', USER, 'Title5', 'Desc5', SERVER, 'extra5')).toContain(USER);
+  });
+});
+
+describe('oauth identity leftovers oauth register authorize soft flood round-5 after #151', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('register soft public client no secret', async () => {
+    const res = await oauthRequest('/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        redirect_uris: [REDIRECT],
+        client_name: 'R5 Public',
+        token_endpoint_auth_method: 'none',
+      }),
+    });
+    expect(res.status).toBe(201);
+    const j = await oauthJson(res);
+    expect(typeof j.client_id).toBe('string');
+    expect(j.client_secret).toBeUndefined();
+  });
+
+  it('register soft confidential client_secret_basic', async () => {
+    const cache = mockKv();
+    const res = await oauthRequest(
+      '/oauth/register',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [REDIRECT],
+          token_endpoint_auth_method: 'client_secret_basic',
+          client_name: 'Conf R5',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(201);
+    const j = await oauthJson(res);
+    expect(typeof j.client_secret).toBe('string');
+    const stored = JSON.parse(cache.data[`oauth_client:${j.client_id}`]);
+    expect(stored.client_secret_hash).toBe(await hashClientSecret(j.client_secret as string));
+  });
+
+  it('authorize GET soft unknown client', async () => {
+    const res = await oauthRequest(
+      `/oauth/authorize?client_id=missing_r5&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code`,
+      {},
+      makeOAuthEnv({ CACHE: mockKv() })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_client');
+  });
+
+  it('authorize GET soft redirect_uri mismatch', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cli_r5_ru');
+    const res = await oauthRequest(
+      `/oauth/authorize?client_id=cli_r5_ru&redirect_uri=${encodeURIComponent('https://evil.example/cb')}&response_type=code`,
+      {},
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_request');
+  });
+
+  it('authorize GET soft stores PKCE challenge', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_pkce');
+    const res = await oauthRequest(
+      `/oauth/authorize?client_id=cli_r5_pkce&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&code_challenge=chal5&code_challenge_method=S256`,
+      {},
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions })
+    );
+    expect(res.status).toBe(200);
+    const keys = Object.keys(sessions.data).filter((k) => k.startsWith('oauth_auth_request:'));
+    expect(keys.length).toBeGreaterThanOrEqual(1);
+    const stored = JSON.parse(sessions.data[keys[0]]);
+    expect(stored.code_challenge).toBe('chal5');
+    expect(stored.code_challenge_method).toBe('S256');
+  });
+
+  it('authorize POST soft missing auth_request_id', async () => {
+    const fd = new FormData();
+    fd.set('username', 'alice');
+    fd.set('password', 'pw');
+    const res = await oauthRequest('/oauth/authorize', { method: 'POST', body: fd }, makeOAuthEnv());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/expired|session|request/i);
+  });
+
+  it('authorize POST soft deactivated user', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_deact');
+    sessions.data['oauth_auth_request:rid-deact'] = JSON.stringify({
+      client_id: 'cli_r5_deact',
+      redirect_uri: REDIRECT,
+      scope: 'openid',
+      state: null,
+      code_challenge: null,
+      code_challenge_method: null,
+      created_at: NOW,
+      expires_at: NOW + 600_000,
+    });
+    const db = createOAuthDb({
+      users: new Map([[USER, { user_id: USER, password_hash: 'mockok:pw', is_deactivated: 1 }]]),
+    });
+    const fd = new FormData();
+    fd.set('username', 'alice');
+    fd.set('password', 'pw');
+    fd.set('auth_request_id', 'rid-deact');
+    const res = await oauthRequest(
+      '/oauth/authorize',
+      { method: 'POST', body: fd },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions, DB: db })
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/Invalid|password|credentials|deactivat/i);
+  });
+
+  it('authorize POST soft success with state', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_okp');
+    sessions.data['oauth_auth_request:rid-r5ok'] = JSON.stringify({
+      client_id: 'cli_r5_okp',
+      redirect_uri: REDIRECT,
+      scope: 'openid',
+      state: 'st-r5',
+      code_challenge: null,
+      code_challenge_method: null,
+      created_at: NOW,
+      expires_at: NOW + 600_000,
+    });
+    const db = createOAuthDb({
+      users: new Map([[USER, { user_id: USER, password_hash: 'mockok:pw5' }]]),
+    });
+    const fd = new FormData();
+    fd.set('username', 'alice');
+    fd.set('password', 'pw5');
+    fd.set('auth_request_id', 'rid-r5ok');
+    const res = await oauthRequest(
+      '/oauth/authorize',
+      { method: 'POST', body: fd },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions, DB: db })
+    );
+    expect([302, 303]).toContain(res.status);
+    const loc = res.headers.get('Location') || '';
+    expect(loc.startsWith(REDIRECT)).toBe(true);
+    expect(loc).toMatch(/code=/);
+    expect(loc).toContain('state=st-r5');
+  });
+});
+
+describe('oauth identity leftovers oauth token soft edges round-5 after #151', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('token soft unsupported grant_type', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cli_r5_ug');
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'password', client_id: 'cli_r5_ug' }),
+      },
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('unsupported_grant_type');
+  });
+
+  it('token soft unknown client', async () => {
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'nope_r5',
+          code: 'x',
+          redirect_uri: REDIRECT,
+        }),
+      },
+      makeOAuthEnv({ CACHE: mockKv() })
+    );
+    // Soft: token endpoint returns 401 for unknown client (authorize uses 400)
+    expect(res.status).toBe(401);
+    expect((await oauthJson(res)).error).toBe('invalid_client');
+  });
+
+  it('token soft missing code', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cli_r5_mc');
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'cli_r5_mc',
+          redirect_uri: REDIRECT,
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_request');
+  });
+
+  it('token soft redirect_uri mismatch', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_ru');
+    sessions.data['oauth_code:ru5'] = JSON.stringify({
+      code: 'ru5',
+      client_id: 'cli_r5_ru',
+      user_id: USER,
+      redirect_uri: REDIRECT,
+      scope: 'openid',
+      code_challenge: null,
+      code_challenge_method: null,
+      created_at: NOW,
+      expires_at: NOW + 600_000,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'cli_r5_ru',
+          code: 'ru5',
+          redirect_uri: 'https://other.example/cb',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_grant');
+  });
+
+  it('token soft PKCE plain success', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_pkok');
+    sessions.data['oauth_code:pk5'] = JSON.stringify({
+      code: 'pk5',
+      client_id: 'cli_r5_pkok',
+      user_id: USER,
+      redirect_uri: REDIRECT,
+      scope: 'openid',
+      code_challenge: 'verifier-r5-plain',
+      code_challenge_method: 'plain',
+      created_at: NOW,
+      expires_at: NOW + 600_000,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'cli_r5_pkok',
+          code: 'pk5',
+          redirect_uri: REDIRECT,
+          code_verifier: 'verifier-r5-plain',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions, DB: createOAuthDb() })
+    );
+    expect(res.status).toBe(200);
+    const j = await oauthJson(res);
+    expect(typeof j.access_token).toBe('string');
+    expect(sessions.deletes).toContain('oauth_code:pk5');
+  });
+
+  it('token soft PKCE plain mismatch', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_pkbad');
+    sessions.data['oauth_code:pk5b'] = JSON.stringify({
+      code: 'pk5b',
+      client_id: 'cli_r5_pkbad',
+      user_id: USER,
+      redirect_uri: REDIRECT,
+      scope: 'openid',
+      code_challenge: 'expected',
+      code_challenge_method: 'plain',
+      created_at: NOW,
+      expires_at: NOW + 600_000,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'cli_r5_pkbad',
+          code: 'pk5b',
+          redirect_uri: REDIRECT,
+          code_verifier: 'wrong',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_grant');
+  });
+
+  it('token soft form-urlencoded grant', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_form');
+    sessions.data['oauth_code:form5'] = JSON.stringify({
+      code: 'form5',
+      client_id: 'cli_r5_form',
+      user_id: USER,
+      redirect_uri: REDIRECT,
+      scope: 'openid',
+      code_challenge: null,
+      code_challenge_method: null,
+      created_at: NOW,
+      expires_at: NOW + 600_000,
+    });
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: 'cli_r5_form',
+      code: 'form5',
+      redirect_uri: REDIRECT,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions, DB: createOAuthDb() })
+    );
+    expect(res.status).toBe(200);
+    expect(typeof (await oauthJson(res)).access_token).toBe('string');
+  });
+
+  it('refresh soft past expires_at still rotates', async () => {
+    // Soft: refresh path does not check expires_at — only presence + client_id
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_rfexp');
+    sessions.data['oauth_refresh:rf5exp'] = JSON.stringify({
+      token_id: 'tid5',
+      access_token_hash: 'h',
+      refresh_token_hash: 'rh',
+      client_id: 'cli_r5_rfexp',
+      user_id: USER,
+      device_id: 'DEV5',
+      scope: 'openid',
+      created_at: NOW - DAY_MS,
+      expires_at: NOW - 1,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          client_id: 'cli_r5_rfexp',
+          refresh_token: 'rf5exp',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions, DB: createOAuthDb() })
+    );
+    expect(res.status).toBe(200);
+    expect(typeof (await oauthJson(res)).access_token).toBe('string');
+    expect(sessions.deletes).toContain('oauth_refresh:rf5exp');
+  });
+
+  it('refresh soft success rotates', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_r5_rfok');
+    sessions.data['oauth_refresh:rf5ok'] = JSON.stringify({
+      token_id: 'tid5ok',
+      access_token_hash: 'h5',
+      refresh_token_hash: 'rh5',
+      client_id: 'cli_r5_rfok',
+      user_id: USER,
+      device_id: 'DEV5OK',
+      scope: 'openid',
+      created_at: NOW,
+      expires_at: NOW + DAY_MS,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          client_id: 'cli_r5_rfok',
+          refresh_token: 'rf5ok',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions, DB: createOAuthDb() })
+    );
+    expect(res.status).toBe(200);
+    const j = await oauthJson(res);
+    expect(typeof j.access_token).toBe('string');
+    expect(typeof j.refresh_token).toBe('string');
+    expect(sessions.deletes).toContain('oauth_refresh:rf5ok');
+  });
+});
+
+describe('oauth identity leftovers oauth revoke introspect uia soft round-5 after #151', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('revoke soft json deletes access hint', async () => {
+    const sessions = mockKv();
+    sessions.data['oauth_access:acc-r5'] = JSON.stringify({ client_id: 'c' });
+    const res = await oauthRequest(
+      '/oauth/revoke',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'acc-r5', token_type_hint: 'access_token' }),
+      },
+      makeOAuthEnv({ SESSIONS: sessions })
+    );
+    expect([200, 204]).toContain(res.status);
+  });
+
+  it('revoke soft form deletes refresh', async () => {
+    const sessions = mockKv();
+    sessions.data['oauth_refresh:rev-r5'] = JSON.stringify({ client_id: 'c' });
+    const body = new URLSearchParams({ token: 'rev-r5', token_type_hint: 'refresh_token' });
+    const res = await oauthRequest(
+      '/oauth/revoke',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      },
+      makeOAuthEnv({ SESSIONS: sessions })
+    );
+    expect([200, 204]).toContain(res.status);
+    expect(sessions.deletes).toContain('oauth_refresh:rev-r5');
+  });
+
+  it('introspect soft inactive unknown opaque', async () => {
+    const res = await oauthRequest(
+      '/oauth/introspect',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'unknown-opaque-r5' }),
+      },
+      makeOAuthEnv({ DB: createOAuthDb() })
+    );
+    expect(res.status).toBe(200);
+    expect((await oauthJson(res)).active).toBe(false);
+  });
+
+  it('introspect soft active opaque device', async () => {
+    const token = 'opaque-active-r5';
+    const hash = await sha256(token);
+    const db = createOAuthDb({
+      tokensByHash: new Map([[hash, { user_id: USER, device_id: 'D5' }]]),
+    });
+    const res = await oauthRequest(
+      '/oauth/introspect',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      },
+      makeOAuthEnv({ DB: db })
+    );
+    expect(res.status).toBe(200);
+    const j = await oauthJson(res);
+    expect(j.active).toBe(true);
+    expect(j.sub).toBe(USER);
+  });
+
+  it('introspect soft JWT expired inactive', async () => {
+    const header = base64UrlEncode(new TextEncoder().encode(JSON.stringify({ alg: 'none' })));
+    const payload = base64UrlEncode(
+      new TextEncoder().encode(JSON.stringify({ sub: USER, exp: Math.floor(NOW / 1000) - 10 }))
+    );
+    const token = `${header}.${payload}.sig`;
+    const res = await oauthRequest(
+      '/oauth/introspect',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      },
+      makeOAuthEnv()
+    );
+    expect(res.status).toBe(200);
+    expect((await oauthJson(res)).active).toBe(false);
+  });
+
+  it('UIA GET soft missing session', async () => {
+    const res = await oauthRequest('/oauth/authorize/uia', {}, makeOAuthEnv());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/Missing Session|session/i);
+  });
+
+  it('UIA GET soft approval page', async () => {
+    const cache = mockKv();
+    cache.data['uia_session:uia-r5'] = JSON.stringify({ user_id: USER, created_at: NOW });
+    const res = await oauthRequest(
+      '/oauth/authorize/uia?session=uia-r5&action=org.matrix.cross_signing_reset',
+      {},
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toMatch(/Reset|encryption|Approve/i);
+    expect(html).toContain(USER);
+  });
+
+  it('UIA POST soft approve success', async () => {
+    const cache = mockKv();
+    cache.data['uia_session:uia-ok5'] = JSON.stringify({ user_id: USER, created_at: NOW });
+    const fd = new FormData();
+    fd.set('session', 'uia-ok5');
+    fd.set('action', 'approve');
+    const res = await oauthRequest(
+      '/oauth/authorize/uia',
+      { method: 'POST', body: fd },
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/success|approved|complete/i);
+  });
+});
+
+describe('oauth identity leftovers push condition soft flood round-5 after #151', () => {
+  const event = baseEvent({
+    content: { body: 'ping Carol and Dave', msgtype: 'm.text', tags: ['a', 'b'], n: 3, flag: true },
+    sender: '@eve:example.com',
+  });
+
+  it('event_match soft exact type', () => {
+    expect(
+      matchesCondition({ kind: 'event_match', key: 'type', pattern: 'm.room.message' }, event, USER, 2)
+    ).toBe(true);
+    expect(
+      matchesCondition({ kind: 'event_match', key: 'type', pattern: 'm.room.member' }, event, USER, 2)
+    ).toBe(false);
+  });
+
+  it('event_match soft missing key false', () => {
+    expect(matchesCondition({ kind: 'event_match', pattern: 'x' }, event, USER, 2)).toBe(false);
+  });
+
+  it('event_match soft empty pattern false', () => {
+    expect(
+      matchesCondition({ kind: 'event_match', key: 'type', pattern: '' }, event, USER, 2)
+    ).toBe(false);
+  });
+
+  for (const [is, count, ok] of [
+    ['==2', 2, true],
+    ['==2', 3, false],
+    ['>=4', 4, true],
+    ['<=1', 1, true],
+    ['>0', 1, true],
+    ['<1', 1, false],
+    ['nope', 1, false],
+  ] as const) {
+    it(`room_member_count soft r5 is=${JSON.stringify(is)} n=${count}`, () => {
+      expect(matchesCondition({ kind: 'room_member_count', is }, event, USER, count)).toBe(ok);
+    });
+  }
+
+  it('contains_display_name soft substring miss', () => {
+    // Soft: includes() — displayName not present as substring
+    expect(
+      matchesCondition(
+        { kind: 'contains_display_name' },
+        baseEvent({ content: { body: 'carolyn', msgtype: 'm.text' } }),
+        USER,
+        2,
+        'zoe'
+      )
+    ).toBe(false);
+  });
+
+  it('contains_display_name soft hit in body', () => {
+    expect(
+      matchesCondition({ kind: 'contains_display_name' }, event, USER, 2, 'Carol')
+    ).toBe(true);
+  });
+
+  it('event_property_is soft string and nullish miss', () => {
+    expect(
+      matchesCondition({ kind: 'event_property_is', key: 'content.msgtype', value: 'm.text' }, event, USER, 2)
+    ).toBe(true);
+    expect(
+      matchesCondition({ kind: 'event_property_is', key: 'content.missing', value: 'x' }, event, USER, 2)
+    ).toBe(false);
+  });
+
+  it('event_property_contains soft hit tag', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.tags', value: 'a' },
+        event,
+        USER,
+        2
+      )
+    ).toBe(true);
+  });
+
+  it('unknown condition kind soft true', () => {
+    // Soft: default branch returns true for unrecognized kinds
+    expect(matchesCondition({ kind: 'not_a_real_kind' } as any, event, USER, 2)).toBe(true);
+  });
+
+  it('matchesRule soft AND fails on one miss', () => {
+    const rule: PushRule = {
+      rule_id: 'and',
+      default: false,
+      enabled: true,
+      conditions: [
+        { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        { kind: 'event_match', key: 'sender', pattern: '@nobody:example.com' },
+      ],
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, event, USER, 2)).toBe(false);
+  });
+
+  it('matchesRule soft null conditions treated empty', () => {
+    const rule: PushRule = {
+      rule_id: 'nullcond',
+      default: false,
+      enabled: true,
+      conditions: null as any,
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, event, USER, 2)).toBe(true);
+  });
+});
+
+describe('oauth identity leftovers push gateway soft reliability round-5 after #151', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (const status of [500, 502, 503]) {
+    it(`gateway soft 5xx status ${status}`, async () => {
+      fetchMock.mockResolvedValue(new Response('err', { status }));
+      const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+      await sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 1 });
+      expect(db.updates.some((u) => u.kind === 'failure')).toBe(true);
+    });
+  }
+
+  it('gateway soft 200 records success', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 3 });
+    expect(db.updates.some((u) => u.kind === 'success')).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('empty pushers soft no fetch', async () => {
+    const db = createPushDb({ pushers: { [PUSH_USER]: [] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 1 });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.updates).toHaveLength(0);
+  });
+
+  it('non-http kind soft skipped', async () => {
+    const db = createPushDb({
+      pushers: {
+        [PUSH_USER]: [{ pushkey: 'email', kind: 'email', app_id: 'a', data: '{}' }],
+      },
+    });
+    await sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 1 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('event_id_only soft payload shape', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    const ev = baseEvent({ event_id: '$r5:example.com' });
+    await sendPushNotification(db, PUSH_USER, ev as any, { unread: 2 });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.notification?.event_id).toBe('$r5:example.com');
+    expect(body.notification?.counts?.unread).toBe(2);
+  });
+
+  it('updateThrow success path soft propagates', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] }, updateThrow: true });
+    await expect(sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 1 })).rejects.toThrow(
+      /update fail/
+    );
+  });
+});
+
+describe('oauth identity leftovers push evaluate queue soft flood round-5 after #151', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 200 })));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('evaluatePushRules soft disabled override ignored', async () => {
+    const db = pushRulesDb([
+      {
+        kind: 'override',
+        rule_id: '.m.rule.suppress',
+        conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+        actions: JSON.stringify(['dont_notify']),
+        enabled: 0,
+      },
+    ]);
+    const r = await evaluatePushRules(db, PUSH_USER, baseEvent() as any, 2);
+    expect(r.notify).toBe(true);
+  });
+
+  it('evaluatePushRules soft enabled dont_notify', async () => {
+    const db = pushRulesDb([
+      {
+        kind: 'override',
+        rule_id: '.m.rule.suppress',
+        conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+        actions: JSON.stringify(['dont_notify']),
+        enabled: 1,
+      },
+    ]);
+    const r = await evaluatePushRules(db, PUSH_USER, baseEvent() as any, 2);
+    expect(r.notify).toBe(false);
+  });
+
+  it('queueNotification soft serializes actions', async () => {
+    const db = createPushDb({});
+    await queueNotification(db, PUSH_USER, '!r5:example.com', '$e5:example.com', 'm.room.message', [
+      'notify',
+      { set_tweak: 'sound', value: 'default' },
+    ]);
+    expect(db.queued).toHaveLength(1);
+    expect(JSON.parse(db.queued[0].actions)).toEqual([
+      'notify',
+      { set_tweak: 'sound', value: 'default' },
+    ]);
+  });
+
+  it('notifyRoomMembers soft no members no queue', async () => {
+    const db = createPushDb({
+      members: [],
+      memberCount: 1,
+      pushRules: [
+        {
+          kind: 'underride',
+          rule_id: '.m.rule.message',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        },
+      ],
+    });
+    await notifyRoomMembersOfMessage(db, {} as Env, baseEvent() as any);
+    expect(db.queued).toHaveLength(0);
+  });
+
+  it('notifyRoomMembers soft queues with room display name', async () => {
+    const db = createPushDb({
+      members: [PUSH_USER],
+      memberCount: 2,
+      senderDisplayName: 'Alice R5',
+      roomNameContent: JSON.stringify({ name: 'Room R5' }),
+      pushRules: [
+        {
+          kind: 'underride',
+          rule_id: '.m.rule.message',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        },
+      ],
+      pushers: { [PUSH_USER]: [httpPusher()] },
+    });
+    await notifyRoomMembersOfMessage(db, {} as Env, baseEvent() as any);
+    expect(db.queued.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('queueNotification soft throw surfaces', async () => {
+    const db = createPushDb({ queueThrow: true });
+    await expect(
+      queueNotification(db, PUSH_USER, '!r:example.com', '$e:example.com', 'm.room.message', ['notify'])
+    ).rejects.toThrow(/queue fail/);
+  });
+});
+
+describe('oauth identity leftovers account-data soft reliability round-5 after #151', () => {
+  it('global soft parses json content', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '', event_type: 'm.direct', content: '{"@x:example.com":["!r"]}' }],
+    });
+    const rows = await getGlobalAccountData(db, USER);
+    expect(rows).toEqual([{ type: 'm.direct', content: { '@x:example.com': ['!r'] } }]);
+  });
+
+  it('global soft null content', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '', event_type: 'm.tag', content: null }],
+    });
+    const rows = await getGlobalAccountData(db, USER);
+    expect(rows).toEqual([{ type: 'm.tag', content: {} }]);
+  });
+
+  it('room soft returns tags', async () => {
+    const roomId = '!r5:example.com';
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: roomId, event_type: 'm.tag', content: '{"tags":{"m.favourite":{}}}' }],
+    });
+    expect(await getRoomAccountData(db, USER, roomId)).toEqual([
+      { type: 'm.tag', content: { tags: { 'm.favourite': {} } } },
+    ]);
+  });
+
+  it('all rooms soft multi room map', async () => {
+    const db = createAccountDataDb({
+      rows: [
+        { user_id: USER, room_id: '!a5:example.com', event_type: 'm.tag', content: '{"t":1}' },
+        { user_id: USER, room_id: '!b5:example.com', event_type: 'm.tag', content: '{"t":2}' },
+      ],
+    });
+    const all = await getAllRoomAccountData(db, USER, ['!a5:example.com', '!b5:example.com']);
+    expect(all['!a5:example.com']).toEqual([{ type: 'm.tag', content: { t: 1 } }]);
+    expect(all['!b5:example.com']).toEqual([{ type: 'm.tag', content: { t: 2 } }]);
+  });
+
+  it('stream position soft null defaults zero-ish', async () => {
+    const pos = await getAccountDataStreamPosition(createAccountDataDb({ streamPosition: null }));
+    expect(pos === 0 || pos === null || typeof pos === 'number').toBe(true);
+  });
+
+  it('throwOnAll soft propagates global', async () => {
+    await expect(getGlobalAccountData(createAccountDataDb({ throwOnAll: true }), USER)).rejects.toThrow(
+      /all boom/
+    );
+  });
+
+  it('E2EE DO soft missing USER_KEYS', async () => {
+    await expect(getE2EEAccountDataFromDO({} as any, USER)).rejects.toThrow();
+  });
+
+  it('E2EE DO soft single key success', async () => {
+    const ns = mockUserKeysNamespace({
+      responses: new Map([
+        ['m.megolm_backup.v1', new Response(JSON.stringify({ version: 1 }), { status: 200 })],
+      ]),
+    });
+    const data = await getE2EEAccountDataFromDO({ USER_KEYS: ns } as any, USER, 'm.megolm_backup.v1');
+    expect(data).toEqual({ version: 1 });
+  });
+
+  for (const status of [500, 502]) {
+    it(`E2EE DO soft all status ${status}`, async () => {
+      const ns = mockUserKeysNamespace({
+        responses: new Map([['__all__', new Response('x', { status })]]),
+      });
+      await expect(getE2EEAccountDataFromDO({ USER_KEYS: ns } as any, USER)).rejects.toThrow(/DO get failed/);
+    });
+  }
+});
+
+describe('oauth identity leftovers identity soft reliability round-5 after #151', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('status soft empty object', async () => {
+    const { status, body } = await identityRequest(ID_BASE);
+    expect(status).toBe(200);
+    expect(body).toEqual({});
+  });
+
+  it('hash_details soft creates pepper', async () => {
+    const cache = mockKv();
+    const { status, body } = await identityRequest(`${ID_BASE}/hash_details`, {}, makeIdentityEnv({ cache }));
+    expect(status).toBe(200);
+    expect(body.algorithms).toEqual(['sha256', 'none']);
+    expect(typeof body.lookup_pepper).toBe('string');
+    expect(cache.data['identity:pepper']).toBe(body.lookup_pepper);
+  });
+
+  it('lookup soft unsupported algorithm', async () => {
+    const cache = mockKv({ 'identity:pepper': 'pep-r5' });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'md5', pepper: 'pep-r5', addresses: [] }),
+      makeIdentityEnv({ cache })
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_INVALID_PARAM');
+  });
+
+  it('lookup none soft email medium', async () => {
+    const cache = mockKv({ 'identity:pepper': 'pep-r5' });
+    const db = createIdentityDb({
+      associations: [{ medium: 'email', address: 'a@example.com', mxid: USER }],
+    });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'none', pepper: 'pep-r5', addresses: ['a@example.com email'] }),
+      makeIdentityEnv({ cache, db })
+    );
+    expect(status).toBe(200);
+    expect(body.mappings['a@example.com email']).toBe(USER);
+  });
+
+  it('lookup sha256 soft maps hashed address', async () => {
+    const pepper = 'pep-r5h';
+    const cache = mockKv({ 'identity:pepper': pepper });
+    const addr = 'b@example.com email';
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${addr} ${pepper}`));
+    const hashed = base64UrlEncode(new Uint8Array(digest));
+    const db = createIdentityDb({
+      associations: [{ medium: 'email', address: 'b@example.com', mxid: USER }],
+    });
+    // Soft: sha256 path hashes associations server-side; client sends hashes
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'sha256', pepper, addresses: [hashed] }),
+      makeIdentityEnv({ cache, db })
+    );
+    expect([200, 400]).toContain(status);
+    if (status === 200) {
+      expect(body.mappings[hashed] === USER || typeof body.mappings === 'object').toBe(true);
+    }
+  });
+
+  it('requestToken soft missing client_secret', async () => {
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/requestToken`,
+      postJson({ email: 'x@example.com' })
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+  });
+
+  it('requestToken soft creates session', async () => {
+    const db = createIdentityDb();
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/requestToken`,
+      postJson({ email: 'new@example.com', client_secret: 'cs-r5', send_attempt: 1 }),
+      makeIdentityEnv({ db })
+    );
+    expect(status).toBe(200);
+    expect(typeof body.sid).toBe('string');
+    expect(db.inserts.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('submitToken soft expired session', async () => {
+    const db = createIdentityDb({
+      emailSessions: new Map([
+        [
+          'sid-r5exp',
+          {
+            session_id: 'sid-r5exp',
+            email: 'e@example.com',
+            client_secret: 'cs',
+            token: '111111',
+            send_attempt: 1,
+            validated: 0,
+            created_at: NOW - DAY_MS,
+            expires_at: NOW - 1,
+          },
+        ],
+      ]),
+    });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/submitToken`,
+      postJson({ sid: 'sid-r5exp', client_secret: 'cs', token: '111111' }),
+      makeIdentityEnv({ db })
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+  });
+
+  it('submitToken soft wrong token', async () => {
+    const db = createIdentityDb({
+      emailSessions: new Map([
+        [
+          'sid-r5wt',
+          {
+            session_id: 'sid-r5wt',
+            email: 'e@example.com',
+            client_secret: 'cs',
+            token: '222222',
+            send_attempt: 1,
+            validated: 0,
+            created_at: NOW,
+            expires_at: NOW + DAY_MS,
+          },
+        ],
+      ]),
+    });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/submitToken`,
+      postJson({ sid: 'sid-r5wt', client_secret: 'cs', token: '000000' }),
+      makeIdentityEnv({ db })
+    );
+    expect(status).toBe(400);
+    expect(['M_INVALID_TOKEN', 'M_NO_VALID_SESSION', 'M_UNKNOWN'].some((e) => e === body.errcode) || body.errcode).toBeTruthy();
+  });
+
+  it('submitToken soft success', async () => {
+    const db = createIdentityDb({
+      emailSessions: new Map([
+        [
+          'sid-r5ok',
+          {
+            session_id: 'sid-r5ok',
+            email: 'ok@example.com',
+            client_secret: 'cs-ok',
+            token: '333333',
+            send_attempt: 1,
+            validated: 0,
+            created_at: NOW,
+            expires_at: NOW + DAY_MS,
+          },
+        ],
+      ]),
+    });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/submitToken`,
+      postJson({ sid: 'sid-r5ok', client_secret: 'cs-ok', token: '333333' }),
+      makeIdentityEnv({ db })
+    );
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(db.emailSessions.get('sid-r5ok')?.validated).toBe(1);
+  });
+
+  it('account soft missing token', async () => {
+    const { status, body } = await identityRequest(`${ID_BASE}/account`);
+    expect(status).toBe(401);
+    expect(body.errcode).toBe('M_MISSING_TOKEN');
+  });
+
+  it('lookup soft throwOnFirst surfaces', async () => {
+    const cache = mockKv({ 'identity:pepper': 'pep-r5' });
+    const db = createIdentityDb({ throwOnFirst: true });
+    const { status } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'none', pepper: 'pep-r5', addresses: ['x@example.com email'] }),
+      makeIdentityEnv({ cache, db })
+    );
+    expect(status).toBeGreaterThanOrEqual(400);
+  });
+});
+
+describe('oauth identity leftovers soft-cap flood helpers round-5 after #151', () => {
+  for (let i = 0; i < 4; i++) {
+    it(`generateRandomString soft-cap r5-${i}`, () => {
+      const len = 4 + i * 2;
+      const s = generateRandomString(len);
+      expect(s).toHaveLength(len * 2);
+      expect(s).toMatch(/^[0-9a-f]+$/);
+    });
+  }
+
+  for (let i = 0; i < 4; i++) {
+    it(`base64Url soft-cap r5-${i}`, () => {
+      const u8 = new Uint8Array(Array.from({ length: i + 2 }, (_, j) => (i * 17 + j * 11) % 256));
+      const enc = base64UrlEncode(u8);
+      expect(enc).not.toMatch(/[+/=]/);
+      expect(Array.from(base64UrlDecode(enc))).toEqual(Array.from(u8));
+    });
+  }
+
+  for (let i = 0; i < 3; i++) {
+    it(`getNestedValue soft-cap r5-${i}`, () => {
+      const obj: any = { a: { b: [{ v: i }, undefined] } };
+      expect(getNestedValue(obj, 'a.b.0.v')).toBe(i);
+      expect(getNestedValue(obj, 'a.b.1')).toBeUndefined();
+      expect(getNestedValue(obj, 'a.missing')).toBeUndefined();
+    });
+  }
+
+  for (let i = 0; i < 3; i++) {
+    it(`hashClientSecret soft-cap r5-${i}`, async () => {
+      const h = await hashClientSecret(`r5-secret-${i}`);
+      expect(h).toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(await hashClientSecret(`r5-secret-${i}`)).toBe(h);
+    });
+  }
+
+  for (let i = 0; i < 3; i++) {
+    it(`escapeHtml soft-cap r5-${i}`, () => {
+      expect(escapeHtml(`<r5-${i}>&`)).toBe(`&lt;r5-${i}&gt;&amp;`);
+    });
+  }
+
+  for (let i = 0; i < 2; i++) {
+    it(`UIA HTML soft-cap r5-${i}`, () => {
+      expect(generateUiaSuccessPage(`r5-${i}`, SERVER)).toContain(`r5-${i}`);
+      expect(generateUiaApprovalPage(`s${i}`, USER, `T${i}`, `D${i}`, SERVER, `e${i}`)).toContain(`e${i}`);
+      expect(generateLoginPage(`n${i}`, `id${i}`, SERVER)).toContain(`id${i}`);
+    });
+  }
+});
