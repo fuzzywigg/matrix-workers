@@ -17,6 +17,12 @@
  * mutate inject (not only wipe); getUserById throw∥ok; auth lookup count
  * bind; Accept/Content-Type soft; thirdparty special-char paths.
  *
+ * Residual deepen after #241: alias mutateAfterGets after-1 serial;
+ * double-encoded alias; getAppServiceByToken flip mid-flight; triple
+ * alias getBarrier; case-sensitive alias; Content-Type on GET ignored;
+ * thirdparty exact stub key set; Bearer\\ttab missing; user∥alias-throw∥tp;
+ * exact Missing/Invalid AS token messages under race.
+ *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -921,6 +927,274 @@ describe('race appservice Accept Content-Type soft after #232', () => {
       expect(results[1].body).toMatchObject({ errcode: 'M_NOT_FOUND', error: 'Room alias not found' });
       expect(results[2].status).toBe(200);
       expect(results[3].body).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — alias serial mutateAfterGets + double-encode
+// ---------------------------------------------------------------------------
+
+describe('race appservice alias serial mutate + double-encode after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`alias mutateAfterGets after-1 serial soft flood-${i}`, async () => {
+      authOk();
+      const a = `#_bridge_ser${i}:${SERVER}`;
+      const db = createAliasDb({
+        aliases: [{ alias: a, room_id: `!ser${i}:${SERVER}` }],
+        mutateAfterGets: { after: 1, next: [] },
+      });
+      const env = makeEnv({ db });
+      const first = await request(
+        `/_matrix/app/v1/rooms/${encodeURIComponent(a)}`,
+        bearer(AS_TOKEN),
+        env
+      );
+      const second = await request(
+        `/_matrix/app/v1/rooms/${encodeURIComponent(a)}`,
+        bearer(AS_TOKEN),
+        env
+      );
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(404);
+      expect(second.body).toMatchObject({
+        errcode: 'M_NOT_FOUND',
+        error: 'Room alias not found',
+      });
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`double-encoded alias soft flood-${i}`, async () => {
+      authOk();
+      const alias = `#_bridge_enc${i}:${SERVER}`;
+      const db = createAliasDb({
+        aliases: [{ alias, room_id: `!enc${i}:${SERVER}` }],
+      });
+      const env = makeEnv({ db });
+      const single = encodeURIComponent(alias);
+      const doubled = encodeURIComponent(single);
+      const results = await Promise.all([
+        request(`/_matrix/app/v1/rooms/${single}`, bearer(AS_TOKEN), env),
+        request(`/_matrix/app/v1/rooms/${doubled}`, bearer(AS_TOKEN), env),
+        request(`/_matrix/app/v1/thirdparty/protocol/irc`, bearer(AS_TOKEN), env),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[1].status).toBe(404);
+      expect(results[2].status).toBe(200);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`case-sensitive alias under race soft flood-${i}`, async () => {
+      authOk();
+      const lower = `#_bridge_case${i}:${SERVER}`;
+      const mixed = `#_Bridge_case${i}:${SERVER}`;
+      const db = createAliasDb({
+        aliases: [{ alias: lower, room_id: `!c${i}:${SERVER}` }],
+      });
+      const env = makeEnv({ db });
+      const results = await Promise.all([
+        request(`/_matrix/app/v1/rooms/${encodeURIComponent(lower)}`, bearer(AS_TOKEN), env),
+        request(`/_matrix/app/v1/rooms/${encodeURIComponent(mixed)}`, bearer(AS_TOKEN), env),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[1].status).toBe(404);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — token flip mid-flight + triple alias barrier
+// ---------------------------------------------------------------------------
+
+describe('race appservice token flip + triple alias barrier after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`getAppServiceByToken flip mid-flight soft flood-${i}`, async () => {
+      let calls = 0;
+      getAppServiceByToken.mockImplementation(async () => {
+        calls += 1;
+        // First two authenticated lookups succeed; later flip to unknown
+        return calls <= 2 ? BRIDGE_REG : null;
+      });
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const results = await Promise.all([
+        request(`/_matrix/app/v1/users/${USER_ENC}`, bearer(AS_TOKEN)),
+        request(`/_matrix/app/v1/thirdparty/protocol/irc`, bearer(AS_TOKEN)),
+        request(`/_matrix/app/v1/thirdparty/user/irc`, bearer(AS_TOKEN)),
+        request(`/_matrix/app/v1/thirdparty/location/irc`, bearer(AS_TOKEN)),
+      ]);
+      const oks = results.filter((r) => r.status === 200);
+      const unknowns = results.filter(
+        (r) =>
+          r.status === 401 &&
+          (r.body as { errcode?: string }).errcode === 'M_UNKNOWN_TOKEN'
+      );
+      expect(oks.length).toBe(2);
+      expect(unknowns.length).toBe(2);
+      expect(calls).toBe(4);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`triple alias getBarrier soft flood-${i}`, async () => {
+      authOk();
+      const a = `#_bridge_tri${i}:${SERVER}`;
+      const db = createAliasDb({
+        aliases: [{ alias: a, room_id: `!tri${i}:${SERVER}` }],
+        getBarrier: { match: (x) => x === a, count: 3 },
+      });
+      const env = makeEnv({ db });
+      const results = await Promise.all([
+        request(`/_matrix/app/v1/rooms/${encodeURIComponent(a)}`, bearer(AS_TOKEN), env),
+        request(`/_matrix/app/v1/rooms/${encodeURIComponent(a)}`, bearer(AS_TOKEN), env),
+        request(`/_matrix/app/v1/rooms/${encodeURIComponent(a)}`, bearer(AS_TOKEN), env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200, 200]);
+      expect(db.getCount).toBe(3);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — Content-Type GET + stub keys + Bearer tab
+// ---------------------------------------------------------------------------
+
+describe('race appservice Content-Type + stub keys + tab Bearer after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`Content-Type on GET ignored soft flood-${i}`, async () => {
+      authOk();
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const cts = [
+        'application/json',
+        'text/plain',
+        'application/x-www-form-urlencoded',
+        'multipart/form-data',
+      ];
+      const ct = cts[i % cts.length];
+      const results = await Promise.all([
+        request(`/_matrix/app/v1/users/${USER_ENC}`, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${AS_TOKEN}`, 'Content-Type': ct },
+        }),
+        request(`/_matrix/app/v1/thirdparty/protocol/irc`, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${AS_TOKEN}`, 'Content-Type': ct },
+        }),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`thirdparty exact stub key set soft flood-${i}`, async () => {
+      authOk();
+      const results = await Promise.all([
+        request(`/_matrix/app/v1/thirdparty/protocol/irc`, bearer(AS_TOKEN)),
+        request(`/_matrix/app/v1/thirdparty/protocol/slack`, bearer(AS_TOKEN)),
+        request(`/_matrix/app/v1/thirdparty/user/irc`, bearer(AS_TOKEN)),
+        request(`/_matrix/app/v1/thirdparty/location/irc`, bearer(AS_TOKEN)),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200, 200, 200]);
+      for (const r of results.slice(0, 2)) {
+        const body = r.body as Record<string, unknown>;
+        expect(Object.keys(body).sort()).toEqual([
+          'field_types',
+          'instances',
+          'location_fields',
+          'user_fields',
+        ]);
+        expect(body.user_fields).toEqual([]);
+        expect(body.location_fields).toEqual([]);
+        expect(body.field_types).toEqual({});
+        expect(body.instances).toEqual([]);
+      }
+      expect(results[2].body).toEqual([]);
+      expect(results[3].body).toEqual([]);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`Bearer\\ttab missing∥ok soft flood-${i}`, async () => {
+      getAppServiceByToken.mockImplementation(async (_db: unknown, tok: string) =>
+        tok === AS_TOKEN ? BRIDGE_REG : null
+      );
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const results = await Promise.all([
+        request(`/_matrix/app/v1/users/${USER_ENC}`, {
+          headers: { Authorization: `Bearer\t${AS_TOKEN}` },
+        }),
+        request(`/_matrix/app/v1/users/${USER_ENC}`, bearer(AS_TOKEN)),
+        request(`/_matrix/app/v1/thirdparty/protocol/irc`, {
+          headers: { Authorization: `Bearer\t${AS_TOKEN}` },
+        }),
+      ]);
+      expect(results[0].status).toBe(401);
+      expect(results[0].body).toMatchObject({
+        errcode: 'M_MISSING_TOKEN',
+        error: 'Missing AS token',
+      });
+      expect(results[1].status).toBe(200);
+      expect(results[2].status).toBe(401);
+      expect(results[2].body).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — user∥alias-throw∥tp + exact token messages
+// ---------------------------------------------------------------------------
+
+describe('race appservice user∥alias-throw∥tp + token messages after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`user hit∥alias throw∥tp ok isolation flood-${i}`, async () => {
+      authOk();
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const okDb = createAliasDb({
+        aliases: [{ alias: ALIAS, room_id: `!r:${SERVER}` }],
+      });
+      const throwDb = createAliasDb({ throwOnAlias: true });
+      const results = await Promise.all([
+        request(`/_matrix/app/v1/users/${USER_ENC}`, bearer(AS_TOKEN), makeEnv({ db: okDb })),
+        request(`/_matrix/app/v1/rooms/${ALIAS_ENC}`, bearer(AS_TOKEN), makeEnv({ db: throwDb })),
+        request(`/_matrix/app/v1/thirdparty/protocol/irc`, bearer(AS_TOKEN), makeEnv({ db: okDb })),
+        request(`/_matrix/app/v1/rooms/${ALIAS_ENC}`, bearer(AS_TOKEN), makeEnv({ db: okDb })),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[1].status).toBe(500);
+      expect(results[2].status).toBe(200);
+      expect(results[3].status).toBe(200);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`exact Missing/Invalid AS token messages soft flood-${i}`, async () => {
+      getAppServiceByToken.mockImplementation(async (_db: unknown, tok: string) =>
+        tok === AS_TOKEN ? BRIDGE_REG : null
+      );
+      const paths = [
+        `/_matrix/app/v1/users/${USER_ENC}`,
+        `/_matrix/app/v1/rooms/${ALIAS_ENC}`,
+        `/_matrix/app/v1/thirdparty/protocol/irc`,
+        `/_matrix/app/v1/thirdparty/user/irc`,
+        `/_matrix/app/v1/thirdparty/location/irc`,
+      ];
+      const path = paths[i % paths.length];
+      const results = await Promise.all([
+        request(path),
+        request(path, bearer(`bad-token-${i}`)),
+        request(path, bearer(AS_TOKEN)),
+      ]);
+      expect(results[0].body).toEqual({
+        errcode: 'M_MISSING_TOKEN',
+        error: 'Missing AS token',
+      });
+      expect(results[1].body).toEqual({
+        errcode: 'M_UNKNOWN_TOKEN',
+        error: 'Invalid AS token',
+      });
+      // Authenticated thirdparty always 200; users/rooms may 404 without fixtures
+      expect([200, 404]).toContain(results[2].status);
     });
   }
 });

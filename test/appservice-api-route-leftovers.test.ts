@@ -2,6 +2,12 @@
  * TOKENMAXX HEAVY leftovers after #154 — appservice API soft/edge/reliability.
  * Complements appservice-api-routes.test.ts. Tests-only — no product inventing.
  * Fixtures use example.com only.
+ *
+ * Residual deepen after #241: exact Missing/Invalid AS token messages;
+ * lowercase bearer / Bearer\\ttab; hs_token≠as_token; empty Authorization;
+ * case-sensitive alias; double-encoded user; unicode localpart; thirdparty
+ * exact stub keys; Accept/Content-Type soft; HEAD/OPTIONS; query ignore;
+ * token-with-spaces slice; getAppServiceByToken DB bind.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -1610,4 +1616,272 @@ describe('appservice leftovers lifecycle soft floods after #154', () => {
     expect(p.status).toBe(200);
     expect(p.body).toMatchObject({ instances: [] });
   });
+});
+
+// ---------------------------------------------------------------------------
+// deepen appservice-api route leftovers after #241
+// ---------------------------------------------------------------------------
+
+describe('appservice leftovers exact token messages soft flood after #241', () => {
+  const paths = [
+    `/_matrix/app/v1/users/${USER_ENC}`,
+    `/_matrix/app/v1/rooms/${ALIAS_ENC}`,
+    '/_matrix/app/v1/thirdparty/protocol/irc',
+    '/_matrix/app/v1/thirdparty/user/irc',
+    '/_matrix/app/v1/thirdparty/location/irc',
+  ];
+
+  for (let i = 0; i < 16; i++) {
+    it(`Missing AS token message soft-${i}`, async () => {
+      const path = paths[i % paths.length];
+      const { status, body } = await request(path);
+      expect(status).toBe(401);
+      expect(body).toEqual({ errcode: 'M_MISSING_TOKEN', error: 'Missing AS token' });
+      expect(getAppServiceByToken).not.toHaveBeenCalled();
+    });
+  }
+
+  for (let i = 0; i < 16; i++) {
+    it(`Invalid AS token message soft-${i}`, async () => {
+      getAppServiceByToken.mockResolvedValue(null);
+      const path = paths[i % paths.length];
+      const { status, body } = await request(path, bearer(`bad-${i}`));
+      expect(status).toBe(401);
+      expect(body).toEqual({ errcode: 'M_UNKNOWN_TOKEN', error: 'Invalid AS token' });
+      expect(getAppServiceByToken).toHaveBeenCalledWith(expect.anything(), `bad-${i}`);
+    });
+  }
+});
+
+describe('appservice leftovers Bearer scheme edges soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`lowercase bearer soft-${i}`, async () => {
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const { status, body } = await request(`/_matrix/app/v1/users/${USER_ENC}`, {
+        headers: { Authorization: `bearer ${AS_TOKEN}` },
+      });
+      expect(status).toBe(401);
+      expect(body).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+      expect(getAppServiceByToken).not.toHaveBeenCalled();
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`Bearer\\ttab soft-${i}`, async () => {
+      const { status, body } = await request(`/_matrix/app/v1/thirdparty/protocol/irc`, {
+        headers: { Authorization: `Bearer\t${AS_TOKEN}` },
+      });
+      expect(status).toBe(401);
+      expect(body).toEqual({ errcode: 'M_MISSING_TOKEN', error: 'Missing AS token' });
+      expect(getAppServiceByToken).not.toHaveBeenCalled();
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`empty Authorization header soft-${i}`, async () => {
+      const { status, body } = await request(`/_matrix/app/v1/thirdparty/user/irc`, {
+        headers: { Authorization: '' },
+      });
+      expect(status).toBe(401);
+      expect(body).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`hs_token ≠ as_token soft-${i}`, async () => {
+      getAppServiceByToken.mockImplementation(async (_db: unknown, tok: string) =>
+        tok === AS_TOKEN ? BRIDGE_REG : null
+      );
+      const { status, body } = await request(
+        `/_matrix/app/v1/users/${USER_ENC}`,
+        bearer(BRIDGE_REG.hs_token)
+      );
+      expect(status).toBe(401);
+      expect(body).toEqual({ errcode: 'M_UNKNOWN_TOKEN', error: 'Invalid AS token' });
+    });
+  }
+});
+
+describe('appservice leftovers encoding + case alias soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`case-sensitive alias soft-${i}`, async () => {
+      authOk();
+      const lower = `#_bridge_case${i}:${SERVER}`;
+      const mixed = `#_Bridge_case${i}:${SERVER}`;
+      const db = createAliasDb({
+        aliases: [{ alias: lower, room_id: `!c${i}:${SERVER}` }],
+      });
+      const env = makeEnv({ db });
+      const hit = await request(
+        `/_matrix/app/v1/rooms/${encodeURIComponent(lower)}`,
+        bearer(AS_TOKEN),
+        env
+      );
+      const miss = await request(
+        `/_matrix/app/v1/rooms/${encodeURIComponent(mixed)}`,
+        bearer(AS_TOKEN),
+        env
+      );
+      expect(hit.status).toBe(200);
+      expect(miss.status).toBe(404);
+      expect(miss.body).toMatchObject({ error: 'Room alias not found' });
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`double-encoded user soft-${i}`, async () => {
+      authOk();
+      const hit = `@_bridge_enc${i}:${SERVER}`;
+      getUserById.mockImplementation(async (_db: unknown, userId: string) =>
+        userId === hit ? ({ user_id: hit } as never) : null
+      );
+      const single = encodeURIComponent(hit);
+      const doubled = encodeURIComponent(single);
+      const a = await request(`/_matrix/app/v1/users/${single}`, bearer(AS_TOKEN));
+      const b = await request(`/_matrix/app/v1/users/${doubled}`, bearer(AS_TOKEN));
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(404);
+      expect(b.body).toMatchObject({ error: 'User not found' });
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`unicode localpart soft-${i}`, async () => {
+      authOk();
+      const locals = [`@_bridge_café${i}`, `@_bridge_прото${i}`, `@_bridge_协议${i}`, `@_bridge_😀${i}`];
+      const uid = `${locals[i % locals.length]}:${SERVER}`;
+      getUserById.mockImplementation(async (_db: unknown, userId: string) =>
+        userId === uid ? ({ user_id: uid } as never) : null
+      );
+      const { status, body } = await request(
+        `/_matrix/app/v1/users/${encodeURIComponent(uid)}`,
+        bearer(AS_TOKEN)
+      );
+      expect(status).toBe(200);
+      expect(body).toEqual({});
+      expect(getUserById).toHaveBeenCalledWith(expect.anything(), uid);
+    });
+  }
+});
+
+describe('appservice leftovers thirdparty stub + headers soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`thirdparty exact stub keys soft-${i}`, async () => {
+      authOk();
+      const { status, body } = await request(
+        `/_matrix/app/v1/thirdparty/protocol/proto${i}`,
+        bearer(AS_TOKEN)
+      );
+      expect(status).toBe(200);
+      expect(Object.keys(body as object).sort()).toEqual([
+        'field_types',
+        'instances',
+        'location_fields',
+        'user_fields',
+      ]);
+      expect(body).toEqual({
+        user_fields: [],
+        location_fields: [],
+        field_types: {},
+        instances: [],
+      });
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`Accept/Content-Type soft-${i}`, async () => {
+      authOk();
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const accepts = ['application/json', '*/*', 'text/html', 'application/json, text/plain'];
+      const cts = ['application/json', 'text/plain', 'application/xml', ''];
+      const { status, body } = await request(`/_matrix/app/v1/users/${USER_ENC}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${AS_TOKEN}`,
+          Accept: accepts[i % accepts.length],
+          ...(cts[i % cts.length] ? { 'Content-Type': cts[i % cts.length] } : {}),
+        },
+      });
+      expect(status).toBe(200);
+      expect(body).toEqual({});
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`HEAD/OPTIONS soft-${i}`, async () => {
+      authOk();
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const method = i % 2 === 0 ? 'HEAD' : 'OPTIONS';
+      const path =
+        i % 3 === 0
+          ? `/_matrix/app/v1/users/${USER_ENC}`
+          : i % 3 === 1
+            ? `/_matrix/app/v1/rooms/${ALIAS_ENC}`
+            : '/_matrix/app/v1/thirdparty/protocol/irc';
+      const { status } = await request(path, {
+        method,
+        headers: { Authorization: `Bearer ${AS_TOKEN}` },
+      });
+      expect([200, 204, 404, 405]).toContain(status);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`query string ignored soft-${i}`, async () => {
+      authOk();
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const { status, body } = await request(
+        `/_matrix/app/v1/users/${USER_ENC}?access_token=x&foo=${i}`,
+        bearer(AS_TOKEN)
+      );
+      expect(status).toBe(200);
+      expect(body).toEqual({});
+    });
+  }
+});
+
+describe('appservice leftovers token slice + DB bind soft flood after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`token with embedded spaces soft-${i}`, async () => {
+      const tok = `tok with spaces ${i}`;
+      getAppServiceByToken.mockImplementation(async (_db: unknown, t: string) =>
+        t === tok ? BRIDGE_REG : null
+      );
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const { status } = await request(`/_matrix/app/v1/users/${USER_ENC}`, {
+        headers: { Authorization: `Bearer ${tok}` },
+      });
+      expect(status).toBe(200);
+      expect(getAppServiceByToken).toHaveBeenCalledWith(expect.anything(), tok);
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`getAppServiceByToken DB bind soft-${i}`, async () => {
+      authOk();
+      getUserById.mockResolvedValue({ user_id: USER } as never);
+      const db = createAliasDb();
+      const env = makeEnv({ db });
+      await request(`/_matrix/app/v1/users/${USER_ENC}`, bearer(AS_TOKEN), env);
+      expect(getAppServiceByToken).toHaveBeenCalledTimes(1);
+      expect(getAppServiceByToken.mock.calls[0][0]).toBe(db);
+      expect(getAppServiceByToken.mock.calls[0][1]).toBe(AS_TOKEN);
+      expect(getUserById.mock.calls[0][0]).toBe(db);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`Bearer with multiple spaces includes extras in token soft-${i}`, async () => {
+      getAppServiceByToken.mockImplementation(async (_db: unknown, t: string) =>
+        t === ` ${AS_TOKEN}` ? BRIDGE_REG : null
+      );
+      const { status, body } = await request(`/_matrix/app/v1/thirdparty/location/irc`, {
+        headers: { Authorization: `Bearer  ${AS_TOKEN}` },
+      });
+      // slice(7) keeps the extra leading space in the token
+      expect(status).toBe(200);
+      expect(body).toEqual([]);
+      expect(getAppServiceByToken).toHaveBeenCalledWith(expect.anything(), ` ${AS_TOKEN}`);
+    });
+  }
 });
