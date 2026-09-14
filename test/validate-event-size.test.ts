@@ -385,3 +385,40 @@ describe('validateEventSize TOKENMAXX residual leftovers after #272', () => {
     expect(JSON.stringify(bad)).toBe(beforeBad);
   });
 });
+
+describe('validateEventSize TOKENMAXX residual second-wave leftovers after #282', () => {
+  it('content undefined (as {}) concurrent with soft-reject neither mutates', async () => {
+    const missing = baseEvent({ body: 'will-delete' });
+    delete (missing as { content?: unknown }).content;
+    expect('content' in missing).toBe(false);
+
+    const overhead = JSON.stringify({ body: '' }).length;
+    const bad = baseEvent({ body: 'z'.repeat(65_536 - overhead + 1) });
+    expect(JSON.stringify(bad.content).length).toBe(65_537);
+
+    const beforeMissing = JSON.stringify(missing);
+    const beforeBad = JSON.stringify(bad);
+    const contentLen = JSON.stringify(bad.content).length;
+    const [okResult, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(missing as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(bad);
+        return 'bad';
+      }),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      const e = badResult.reason as MatrixApiError;
+      expect(e.errcode).toBe('M_TOO_LARGE');
+      expect(e.message).toMatch(/content exceeds/);
+      expect(e.message).toMatch(new RegExp(String(contentLen)));
+    }
+    expect(JSON.stringify(missing)).toBe(beforeMissing);
+    expect(JSON.stringify(bad)).toBe(beforeBad);
+    expect('content' in missing).toBe(false);
+  });
+});

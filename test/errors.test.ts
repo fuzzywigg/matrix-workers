@@ -639,3 +639,79 @@ describe('errors TOKENMAXX residual leftovers after #272', () => {
     await expect(custom.json()).resolves.toEqual({});
   });
 });
+
+describe('errors TOKENMAXX residual second-wave leftovers after #282', () => {
+  it('remaining auth/json/notFound factories stay isolated under race', async () => {
+    const [nj, bj, unauth, missTok, deact, unsup, unrec, missP, nf] = await Promise.all([
+      Promise.resolve(Errors.notJson('nj').toResponse()),
+      Promise.resolve(Errors.badJson('bj').toResponse()),
+      Promise.resolve(Errors.unauthorized('ua').toResponse()),
+      Promise.resolve(Errors.missingToken('mt').toResponse()),
+      Promise.resolve(Errors.userDeactivated('ud').toResponse()),
+      Promise.resolve(Errors.unsupportedRoomVersion('urv').toResponse()),
+      Promise.resolve(Errors.unrecognized('ur').toResponse()),
+      Promise.resolve(Errors.missingParam('device_id').toResponse()),
+      Promise.resolve(Errors.notFound('gone').toResponse()),
+    ]);
+    expect(new Set([nj, bj, unauth, missTok, deact, unsup, unrec, missP, nf]).size).toBe(9);
+    expect(nj.status).toBe(400);
+    expect(bj.status).toBe(400);
+    expect(unauth.status).toBe(401);
+    expect(missTok.status).toBe(401);
+    expect(deact.status).toBe(403);
+    expect(unsup.status).toBe(400);
+    expect(unrec.status).toBe(400);
+    expect(missP.status).toBe(400);
+    expect(nf.status).toBe(404);
+    await expect(nj.json()).resolves.toEqual({ errcode: 'M_NOT_JSON', error: 'nj' });
+    await expect(bj.json()).resolves.toEqual({ errcode: 'M_BAD_JSON', error: 'bj' });
+    await expect(unauth.json()).resolves.toEqual({ errcode: 'M_UNAUTHORIZED', error: 'ua' });
+    await expect(missTok.json()).resolves.toEqual({ errcode: 'M_MISSING_TOKEN', error: 'mt' });
+    await expect(deact.json()).resolves.toEqual({ errcode: 'M_USER_DEACTIVATED', error: 'ud' });
+    await expect(unsup.json()).resolves.toEqual({
+      errcode: 'M_UNSUPPORTED_ROOM_VERSION',
+      error: 'urv',
+    });
+    await expect(unrec.json()).resolves.toEqual({ errcode: 'M_UNRECOGNIZED', error: 'ur' });
+    await expect(missP.json()).resolves.toEqual({
+      errcode: 'M_MISSING_PARAM',
+      error: 'Missing required parameter: device_id',
+    });
+    await expect(nf.json()).resolves.toEqual({ errcode: 'M_NOT_FOUND', error: 'gone' });
+  });
+
+  it('withErrorHandler races notJson + missingToken + unexpected throw', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const [a, b, c] = await Promise.all([
+      withErrorHandler(async () => {
+        throw Errors.notJson('race-nj');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.missingToken('race-mt');
+      }),
+      withErrorHandler(async () => {
+        throw new Error('boom-sw');
+      }),
+    ]);
+    expect(a).toBeInstanceOf(Response);
+    expect(b).toBeInstanceOf(Response);
+    expect(c).toBeInstanceOf(Response);
+    expect((a as Response).status).toBe(400);
+    expect((b as Response).status).toBe(401);
+    expect((c as Response).status).toBe(500);
+    await expect((a as Response).json()).resolves.toEqual({
+      errcode: 'M_NOT_JSON',
+      error: 'race-nj',
+    });
+    await expect((b as Response).json()).resolves.toEqual({
+      errcode: 'M_MISSING_TOKEN',
+      error: 'race-mt',
+    });
+    await expect((c as Response).json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN',
+      error: 'An unknown error occurred',
+    });
+    expect(spy).toHaveBeenCalledWith('Unexpected error:', expect.any(Error));
+    spy.mockRestore();
+  });
+});
