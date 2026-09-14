@@ -83,6 +83,7 @@ jobs:
 
 
   # Fail-fast canary for admin + federation concurrent leftovers
+  # (quinary #317 + senary #328 + septenary after tip #336).
   # (quinary #317 + senary deepen). Isolates flake attribution before
   # the full vitest suite.
   admin-federation:
