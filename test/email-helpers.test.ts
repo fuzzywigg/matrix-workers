@@ -502,3 +502,633 @@ describe('getValidatedSession', () => {
     });
   });
 });
+
+describe('email helpers TOKENMAXX HEAVY crypto pinning after #89', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('maps getRandomValues(0) → verification token "100000"', () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 0;
+      return arr;
+    });
+    expect(generateVerificationToken()).toBe('100000');
+  });
+
+  it('maps getRandomValues(899999) → verification token "999999"', () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 899_999;
+      return arr;
+    });
+    expect(generateVerificationToken()).toBe('999999');
+  });
+
+  it('wraps getRandomValues(900000) via % 900000 back to "100000"', () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 900_000;
+      return arr;
+    });
+    expect(generateVerificationToken()).toBe('100000');
+  });
+
+  it('wraps getRandomValues(1_800_000) → "100000" and 900_001 → "100001"', () => {
+    const spy = vi.spyOn(crypto, 'getRandomValues');
+    spy.mockImplementationOnce(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 1_800_000;
+      return arr;
+    });
+    expect(generateVerificationToken()).toBe('100000');
+    spy.mockImplementationOnce(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 900_001;
+      return arr;
+    });
+    expect(generateVerificationToken()).toBe('100001');
+  });
+
+  it('maps all-zero session bytes to 32 hex zeros', async () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint8Array) arr.fill(0);
+      return arr;
+    });
+    expect(await generateSessionId()).toBe('0'.repeat(32));
+  });
+
+  it('maps all-0xff session bytes to 32 hex "ff" chars', async () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint8Array) arr.fill(0xff);
+      return arr;
+    });
+    expect(await generateSessionId()).toBe('ff'.repeat(16));
+  });
+
+  it('zero-pads single-nibble session bytes (0x0a → "0a")', async () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint8Array) {
+        for (let i = 0; i < arr.length; i++) arr[i] = 0x0a;
+      }
+      return arr;
+    });
+    expect(await generateSessionId()).toBe('0a'.repeat(16));
+  });
+
+  it('encodes ascending session bytes as contiguous lowercase hex', async () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint8Array) {
+        for (let i = 0; i < arr.length; i++) arr[i] = i;
+      }
+      return arr;
+    });
+    expect(await generateSessionId()).toBe('000102030405060708090a0b0c0d0e0f');
+  });
+});
+
+describe('sendVerificationEmail TOKENMAXX HEAVY body/from edges after #89', () => {
+  it('treats empty-string EMAIL_FROM as falsy and falls back to noreply@serverName', async () => {
+    const send = vi.fn(async () => ({ messageId: 'mid-empty-from' }));
+    const env = {
+      EMAIL_FROM: '',
+      EMAIL: { send },
+    } as unknown as Env;
+    await sendVerificationEmail(env, 'user@ex.com', '424242', 'matrix.fuzzywigg.com');
+    expect(send.mock.calls[0][0].from).toBe('noreply@matrix.fuzzywigg.com');
+  });
+
+  it('pins exact subject / html / text copy including 24h expiry wording', async () => {
+    const send = vi.fn(async () => ({ messageId: 'mid-copy' }));
+    const env = { EMAIL: { send } } as unknown as Env;
+    await sendVerificationEmail(env, 'u@ex.com', '777777', 'homeserver.test');
+    const args = send.mock.calls[0][0] as {
+      subject: string;
+      html: string;
+      text: string;
+      from: string;
+      to: string;
+    };
+    expect(args.subject).toBe('Your homeserver.test verification code');
+    expect(args.from).toBe('noreply@homeserver.test');
+    expect(args.to).toBe('u@ex.com');
+    expect(args.html).toContain('<div class="code">777777</div>');
+    expect(args.html).toContain('Your verification code for homeserver.test is:');
+    expect(args.html).toContain('This code will expire in 24 hours.');
+    expect(args.html).toContain('This email was sent from homeserver.test');
+    expect(args.html).toContain("If you didn't request this code, you can safely ignore this email.");
+    expect(args.text).toContain('Your verification code for homeserver.test is: 777777');
+    expect(args.text).toContain('This code will expire in 24 hours.');
+    expect(args.text).toContain('This email was sent from homeserver.test');
+    expect(args.text).toContain('Email Verification');
+  });
+
+  it('interpolates unusual serverName characters into subject and bodies', async () => {
+    const send = vi.fn(async () => ({ messageId: 'mid-weird' }));
+    const env = {
+      EMAIL_FROM: 'from@custom.example',
+      EMAIL: { send },
+    } as unknown as Env;
+    await sendVerificationEmail(env, 'to@ex.com', '000001', 'srv:with/slash');
+    const args = send.mock.calls[0][0] as { subject: string; html: string; text: string; from: string };
+    expect(args.from).toBe('from@custom.example');
+    expect(args.subject).toBe('Your srv:with/slash verification code');
+    expect(args.html).toContain('srv:with/slash');
+    expect(args.text).toContain('000001');
+  });
+});
+
+describe('createVerificationSession TOKENMAXX HEAVY session edges after #89', () => {
+  const NOW = 1_700_000_200_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('treats same email + different client_secret as independent sessions', async () => {
+    const db = createEmailDb();
+    const a = await createVerificationSession(db, 'a@b.c', 'secret-a', 1);
+    const b = await createVerificationSession(db, 'a@b.c', 'secret-b', 1);
+    expect('sessionId' in a && 'sessionId' in b).toBe(true);
+    if ('error' in a || 'error' in b) throw new Error('unexpected error');
+    expect(a.sessionId).not.toBe(b.sessionId);
+    expect(db.store.size).toBe(2);
+  });
+
+  it('treats different email + same client_secret as independent sessions', async () => {
+    const db = createEmailDb();
+    const a = await createVerificationSession(db, 'one@ex.com', 'shared', 1);
+    const b = await createVerificationSession(db, 'two@ex.com', 'shared', 1);
+    expect('sessionId' in a && 'sessionId' in b).toBe(true);
+    if ('error' in a || 'error' in b) throw new Error('unexpected error');
+    expect(a.sessionId).not.toBe(b.sessionId);
+    expect(db.store.size).toBe(2);
+  });
+
+  it('ORDER BY created_at DESC picks newest row for retry / validated checks', async () => {
+    const db = createEmailDb();
+    db.store.set('older', {
+      session_id: 'older',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '111111',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 5000,
+      expires_at: NOW + 1000,
+    });
+    db.store.set('newer', {
+      session_id: 'newer',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '222222',
+      send_attempt: 5,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    // sendAttempt 5 matches newest → retry empty token
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 5)).toEqual({
+      sessionId: 'newer',
+      token: '',
+    });
+    // mark newest validated → reject even though older is not validated
+    db.store.get('newer')!.validated = 1;
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 6)).toEqual({
+      error: 'Email already validated for this session',
+    });
+  });
+
+  it('send_attempt 0 existing + sendAttempt 0 is a retry (empty token)', async () => {
+    const db = createEmailDb();
+    db.store.set('z', {
+      session_id: 'z',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '999999',
+      send_attempt: 0,
+      validated: 0,
+      created_at: NOW - 100,
+      expires_at: NOW + 1000,
+    });
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 0)).toEqual({
+      sessionId: 'z',
+      token: '',
+    });
+    expect(db.store.size).toBe(1);
+  });
+
+  it('sendAttempt === existing.send_attempt + 1 deletes old and inserts fresh token', async () => {
+    const db = createEmailDb();
+    db.store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '123456',
+      send_attempt: 4,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    const result = await createVerificationSession(db, 'a@b.c', 'secret', 5);
+    expect('sessionId' in result).toBe(true);
+    if ('error' in result) throw new Error(result.error);
+    expect(result.sessionId).not.toBe('old');
+    expect(result.token).toMatch(/^\d{6}$/);
+    expect(db.store.has('old')).toBe(false);
+    expect([...db.store.values()][0].send_attempt).toBe(5);
+    expect([...db.store.values()][0].token).toBe(result.token);
+  });
+
+  it('stores empty-string userId as null via userId || null', async () => {
+    const db = createEmailDb();
+    const result = await createVerificationSession(db, 'a@b.c', 'secret', 1, '');
+    expect('sessionId' in result).toBe(true);
+    expect([...db.store.values()][0].user_id).toBeNull();
+  });
+
+  it('returns error when DELETE throws after higher sendAttempt', async () => {
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind(..._args: unknown[]) {
+            return {
+              async first<T>() {
+                if (sql.includes('WHERE email = ? AND client_secret = ?')) {
+                  return {
+                    session_id: 'old',
+                    send_attempt: 1,
+                    validated: 0,
+                  } as T;
+                }
+                return null;
+              },
+              async run() {
+                if (sql.includes('DELETE FROM email_verification_sessions')) {
+                  throw new Error('delete boom');
+                }
+                return { meta: { changes: 0 } };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 2)).toEqual({
+      error: 'Failed to create verification session',
+    });
+  });
+
+  it('pins expires_at exactly 24h ahead on fresh insert after delete path', async () => {
+    const db = createEmailDb();
+    db.store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '111111',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 999,
+      expires_at: NOW + 1,
+    });
+    const result = await createVerificationSession(db, 'a@b.c', 'secret', 2, '@bob:ex.com');
+    expect('sessionId' in result).toBe(true);
+    if ('error' in result) throw new Error(result.error);
+    const row = [...db.store.values()][0];
+    expect(row.created_at).toBe(NOW);
+    expect(row.expires_at).toBe(NOW + 24 * 60 * 60 * 1000);
+    expect(row.user_id).toBe('@bob:ex.com');
+    expect(row.validated).toBe(0);
+  });
+});
+
+describe('validateEmailToken TOKENMAXX HEAVY error-precedence after #89', () => {
+  const NOW = 1_700_000_300_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function seed(
+    overrides: Partial<SessionRow> = {}
+  ): D1Database & { store: Map<string, SessionRow> } {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '654321',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 60_000,
+      ...overrides,
+    });
+    return db;
+  }
+
+  it('expired + wrong client_secret → Session expired (expiry before secret)', async () => {
+    expect(
+      await validateEmailToken(seed({ expires_at: NOW - 1 }), 'sid', 'wrong', '654321')
+    ).toEqual({ success: false, error: 'Session expired' });
+  });
+
+  it('expired + wrong token → Session expired (expiry before token)', async () => {
+    expect(
+      await validateEmailToken(seed({ expires_at: NOW - 1 }), 'sid', 'secret', '000000')
+    ).toEqual({ success: false, error: 'Session expired' });
+  });
+
+  it('valid expiry + wrong secret + wrong token → Invalid client_secret (secret before token)', async () => {
+    expect(await validateEmailToken(seed(), 'sid', 'wrong', '000000')).toEqual({
+      success: false,
+      error: 'Invalid client_secret',
+    });
+  });
+
+  it('already validated short-circuits success without UPDATE even when expired', async () => {
+    const db = seed({ validated: 1, expires_at: NOW - 1, token: 'other' });
+    expect(await validateEmailToken(db, 'sid', 'wrong', 'wrong')).toEqual({ success: true });
+    expect(db.store.get('sid')!.validated_at ?? null).toBeNull();
+  });
+
+  it('success pins validated_at; second call short-circuits without changing validated_at', async () => {
+    const db = seed();
+    expect(await validateEmailToken(db, 'sid', 'secret', '654321')).toEqual({ success: true });
+    expect(db.store.get('sid')!.validated_at).toBe(NOW);
+
+    vi.setSystemTime(NOW + 10_000);
+    expect(await validateEmailToken(db, 'sid', 'wrong', 'wrong')).toEqual({ success: true });
+    expect(db.store.get('sid')!.validated_at).toBe(NOW);
+  });
+
+  it('returns Validation failed when UPDATE run() throws after credential match', async () => {
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind(..._args: unknown[]) {
+            return {
+              async first<T>() {
+                if (sql.includes('WHERE session_id = ?')) {
+                  return {
+                    session_id: 'sid',
+                    email: 'a@b.c',
+                    client_secret: 'secret',
+                    token: '654321',
+                    validated: 0,
+                    expires_at: NOW + 60_000,
+                  } as T;
+                }
+                return null;
+              },
+              async run() {
+                throw new Error('update boom');
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+
+    expect(await validateEmailToken(db, 'sid', 'secret', '654321')).toEqual({
+      success: false,
+      error: 'Validation failed',
+    });
+  });
+
+  it('rejects at expires_at + 1ms and accepts at exact expires_at boundary', async () => {
+    const exact = seed({ expires_at: NOW });
+    expect(await validateEmailToken(exact, 'sid', 'secret', '654321')).toEqual({ success: true });
+
+    const justPast = seed({ expires_at: NOW - 1 });
+    expect(await validateEmailToken(justPast, 'sid', 'secret', '654321')).toEqual({
+      success: false,
+      error: 'Session expired',
+    });
+  });
+});
+
+describe('getValidatedSession TOKENMAXX HEAVY userId edges after #89', () => {
+  it('maps empty-string user_id to userId: undefined via || undefined', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: '',
+      client_secret: 'secret',
+      token: '1',
+      send_attempt: 1,
+      validated: 1,
+      created_at: 1,
+      expires_at: 2,
+    });
+    expect(await getValidatedSession(db, 'sid', 'secret')).toEqual({
+      email: 'a@b.c',
+      userId: undefined,
+    });
+  });
+
+  it('preserves truthy non-null user_id "0"', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: '0',
+      client_secret: 'secret',
+      token: '1',
+      send_attempt: 1,
+      validated: 1,
+      created_at: 1,
+      expires_at: 2,
+    });
+    expect(await getValidatedSession(db, 'sid', 'secret')).toEqual({
+      email: 'a@b.c',
+      userId: '0',
+    });
+  });
+
+  it('does not leak token / client_secret in the returned object', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'leak@ex.com',
+      user_id: '@u:ex.com',
+      client_secret: 'secret',
+      token: 'top-secret-token',
+      send_attempt: 1,
+      validated: 1,
+      created_at: 1,
+      expires_at: 2,
+    });
+    const result = await getValidatedSession(db, 'sid', 'secret');
+    expect(result).toEqual({ email: 'leak@ex.com', userId: '@u:ex.com' });
+    expect(JSON.stringify(result)).not.toContain('top-secret-token');
+    expect(JSON.stringify(result)).not.toContain('secret');
+  });
+
+  it('returns null for validated=1 row queried with wrong session id', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: '@u:ex.com',
+      client_secret: 'secret',
+      token: '1',
+      send_attempt: 1,
+      validated: 1,
+      created_at: 1,
+      expires_at: 2,
+    });
+    expect(await getValidatedSession(db, 'other', 'secret')).toBeNull();
+  });
+});
+
+describe('email helpers TOKENMAXX HEAVY leftover edges after #89', () => {
+  const NOW = 1_700_000_400_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('treats any truthy validated (e.g. 2) as already-validated on create', async () => {
+    const db = createEmailDb();
+    db.store.set('old', {
+      session_id: 'old',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '123456',
+      send_attempt: 1,
+      validated: 2,
+      created_at: NOW - 1000,
+      expires_at: NOW + 1000,
+    });
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', 9)).toEqual({
+      error: 'Email already validated for this session',
+    });
+  });
+
+  it('treats validated: 2 as already validated on validateEmailToken', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '654321',
+      send_attempt: 1,
+      validated: 2,
+      created_at: NOW - 1000,
+      expires_at: NOW - 1,
+    });
+    expect(await validateEmailToken(db, 'sid', 'wrong', 'wrong')).toEqual({ success: true });
+  });
+
+  it('negative sendAttempt against existing attempt 0 is a retry (sendAttempt <= existing)', async () => {
+    const db = createEmailDb();
+    db.store.set('z', {
+      session_id: 'z',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: 'secret',
+      token: '111111',
+      send_attempt: 0,
+      validated: 0,
+      created_at: NOW - 100,
+      expires_at: NOW + 1000,
+    });
+    expect(await createVerificationSession(db, 'a@b.c', 'secret', -1)).toEqual({
+      sessionId: 'z',
+      token: '',
+    });
+  });
+
+  it('empty client_secret sessions are keyed independently from non-empty secrets', async () => {
+    const db = createEmailDb();
+    const empty = await createVerificationSession(db, 'a@b.c', '', 1);
+    const nonempty = await createVerificationSession(db, 'a@b.c', 'x', 1);
+    expect('sessionId' in empty && 'sessionId' in nonempty).toBe(true);
+    if ('error' in empty || 'error' in nonempty) throw new Error('unexpected');
+    expect(empty.sessionId).not.toBe(nonempty.sessionId);
+    expect(db.store.size).toBe(2);
+  });
+
+  it('matching empty client_secret + token validates successfully', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'a@b.c',
+      user_id: null,
+      client_secret: '',
+      token: '',
+      send_attempt: 1,
+      validated: 0,
+      created_at: NOW - 1000,
+      expires_at: NOW + 60_000,
+    });
+    expect(await validateEmailToken(db, 'sid', '', '')).toEqual({ success: true });
+    expect(db.store.get('sid')!.validated).toBe(1);
+  });
+
+  it('getValidatedSession accepts empty client_secret when it matches', async () => {
+    const db = createEmailDb();
+    db.store.set('sid', {
+      session_id: 'sid',
+      email: 'empty@ex.com',
+      user_id: null,
+      client_secret: '',
+      token: '1',
+      send_attempt: 1,
+      validated: 1,
+      created_at: 1,
+      expires_at: 2,
+    });
+    expect(await getValidatedSession(db, 'sid', '')).toEqual({
+      email: 'empty@ex.com',
+      userId: undefined,
+    });
+    expect(await getValidatedSession(db, 'sid', 'not-empty')).toBeNull();
+  });
+
+  it('sendVerificationEmail still succeeds when messageId is missing from send result', async () => {
+    const send = vi.fn(async () => ({}));
+    const env = { EMAIL: { send } } as unknown as Env;
+    await expect(
+      sendVerificationEmail(env, 'u@ex.com', '123456', 'ex.com')
+    ).resolves.toEqual({ success: true });
+  });
+
+  it('createVerificationSession uses pinned crypto for both session id and token', async () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView>(arr: T): T => {
+      if (arr instanceof Uint32Array) arr[0] = 42; // → 100042
+      if (arr instanceof Uint8Array) arr.fill(0xab);
+      return arr;
+    });
+    const db = createEmailDb();
+    const result = await createVerificationSession(db, 'pin@ex.com', 'sec', 1);
+    expect(result).toEqual({
+      sessionId: 'ab'.repeat(16),
+      token: '100042',
+    });
+  });
+});
