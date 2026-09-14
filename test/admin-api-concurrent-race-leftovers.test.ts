@@ -1,17 +1,15 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 — admin *GET
- * concurrent race / TOCTOU* for leftover admin-api routes that only had serial
- * soft floods (#157 leftover) or mutate races (#189). Distinct from
+ * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241 —
+ * admin *GET concurrent race / TOCTOU* for leftover admin-api routes that only
+ * had serial soft floods (#157 leftover) or mutate races (#189). Distinct from
  * admin-mutate-concurrent-race-leftovers (writes) and admin-api-route-leftovers
  * (serial GET floods).
  *
- * Distinct from tip #232 (room-cache KV generation) and #226 (rate-limit DO).
+ * Distinct from tip #241 (devices+keybackups) and prior room-cache / rate-limit.
  *
- * Focus (this deepen): federation/status CACHE mutate mid-flight; DEVICE_KEYS
- * get-barrier keys debug; IdP GET by id; synapse user/room detail; whois
- * non-admin self∥other; users search∥guests filter; audit/report query
- * isolation; room events before=; history invalid period pin; federation/test
- * fetch fail; 404 isolation; destinations next_token; keys corrupt JSON.
+ * Focus (this deepen after #241): room events limit/before NaN clamp; synapse
+ * rooms order_by∥dir∥search_term; analytics inbound∥outbound + period echo;
+ * HEAD/OPTIONS/charset expand for federation/analytics/whois.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -2833,6 +2831,193 @@ describe('race leftover GET charset + HEAD/OPTIONS after #232', () => {
       const results = await Promise.all([
         jsonReq('/admin/api/media?limit=1', init, env),
         jsonReq('/admin/api/audit?limit=1', init, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// After #241: residual GET clamp / synapse rooms / analytics / method expand
+// ---------------------------------------------------------------------------
+
+describe('race leftover room events limit/before NaN clamp after #241', () => {
+  it('limit=0 returns empty; limit=999 clamps to ≤100 under race', async () => {
+    const env = createEnv();
+    const roomEnc = encodeURIComponent(ROOM);
+    const [zero, huge] = await Promise.all([
+      jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=0`, {}, env),
+      jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=999`, {}, env),
+    ]);
+    expect(statusesOf([zero, huge])).toEqual([200, 200]);
+    expect((zero.body.events as unknown[]).length).toBe(0);
+    expect((huge.body.events as unknown[]).length).toBeLessThanOrEqual(100);
+    expect((huge.body.events as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it('before=abc (NaN) yields empty under race vs healthy before=', async () => {
+    const env = createEnv();
+    const roomEnc = encodeURIComponent(ROOM);
+    const [bad, ok] = await Promise.all([
+      jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=50&before=abc`, {}, env),
+      jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=50&before=15`, {}, env),
+    ]);
+    expect(statusesOf([bad, ok])).toEqual([200, 200]);
+    expect((bad.body.events as unknown[]).length).toBe(0);
+    expect((ok.body.events as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`events clamp leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const roomEnc = encodeURIComponent(ROOM);
+      const lim = i % 2 === 0 ? 0 : 999;
+      const results = await Promise.all([
+        jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=${lim}`, {}, env),
+        jsonReq(`/admin/api/rooms/${roomEnc}/events?limit=5&before=${i % 2 === 0 ? 'abc' : '15'}`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover synapse rooms order_by∥dir∥search_term after #241', () => {
+  it('order_by=joined_members∥dir=b isolation', async () => {
+    const env = createEnv();
+    const [byMembers, byName] = await Promise.all([
+      jsonReq('/_synapse/admin/v1/rooms?limit=10&from=0&order_by=joined_members&dir=b', {}, env),
+      jsonReq('/_synapse/admin/v1/rooms?limit=10&from=0&order_by=name&dir=f', {}, env),
+    ]);
+    expect(statusesOf([byMembers, byName])).toEqual([200, 200]);
+    expect(Array.isArray(byMembers.body.rooms)).toBe(true);
+    expect(Array.isArray(byName.body.rooms)).toBe(true);
+    expect(byMembers.body.total_rooms).toBe(1);
+  });
+
+  it('search_term match∥miss isolation', async () => {
+    const env = createEnv();
+    const [hit, miss] = await Promise.all([
+      jsonReq('/_synapse/admin/v1/rooms?search_term=room&limit=10&from=0', {}, env),
+      jsonReq('/_synapse/admin/v1/rooms?search_term=nope&limit=10&from=0', {}, env),
+    ]);
+    expect(statusesOf([hit, miss])).toEqual([200, 200]);
+    expect((hit.body.rooms as unknown[]).length).toBe(1);
+    expect((miss.body.rooms as unknown[]).length).toBe(0);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse rooms leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const dir = i % 2 === 0 ? 'b' : 'f';
+      const order = i % 2 === 0 ? 'joined_members' : 'name';
+      const results = await Promise.all([
+        jsonReq(`/_synapse/admin/v1/rooms?limit=5&from=0&order_by=${order}&dir=${dir}`, {}, env),
+        jsonReq(`/_synapse/admin/v1/rooms?search_term=room&limit=5&from=0`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover analytics inbound∥outbound + period echo after #241', () => {
+  it('federation analytics inbound∥outbound with remote sender', async () => {
+    const db = createAdminDb({
+      events: [
+        {
+          event_id: '$local:example.com',
+          room_id: ROOM,
+          event_type: 'm.room.message',
+          state_key: null,
+          sender: ADMIN,
+          content: JSON.stringify({ body: 'local' }),
+          origin_server_ts: Date.now() - 1_000,
+          stream_position: 30,
+        },
+        {
+          event_id: '$remote:example.com',
+          room_id: ROOM,
+          event_type: 'm.room.message',
+          state_key: null,
+          sender: '@remote:remote.example.org',
+          content: JSON.stringify({ body: 'remote' }),
+          origin_server_ts: Date.now() - 500,
+          stream_position: 31,
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const results = await Promise.all([
+      jsonReq('/_matrix/client/v3/admin/analytics/federation?period=24h', {}, env),
+      jsonReq('/_matrix/client/v3/admin/analytics/federation?period=24h', {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => (r.body.inbound_events as number) >= 1)).toBe(true);
+    expect(results.every((r) => (r.body.outbound_events as number) >= 1)).toBe(true);
+    expect(results.every((r) => r.body.period === '24h')).toBe(true);
+  });
+
+  it('unknown period echoes pin: requests→1h default vs federation→24h default', async () => {
+    const env = createEnv();
+    const [reqMetrics, fed] = await Promise.all([
+      jsonReq('/_matrix/client/v3/admin/analytics/requests?period=weird', {}, env),
+      jsonReq('/_matrix/client/v3/admin/analytics/federation?period=weird', {}, env),
+    ]);
+    expect(statusesOf([reqMetrics, fed])).toEqual([200, 200]);
+    expect(reqMetrics.body.period).toBe('weird');
+    expect(fed.body.period).toBe('weird');
+    expect(typeof reqMetrics.body.total_events).toBe('number');
+    expect(typeof fed.body.known_servers).toBe('number');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`analytics leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const period = i % 2 === 0 ? '1h' : '7d';
+      const results = await Promise.all([
+        jsonReq(`/_matrix/client/v3/admin/analytics/requests?period=${period}`, {}, env),
+        jsonReq(`/_matrix/client/v3/admin/analytics/federation?period=${period}`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(results[0].body.period).toBe(period);
+      expect(results[1].body.period).toBe(period);
+    });
+  }
+});
+
+describe('race leftover GET federation/analytics/whois charset+HEAD after #241', () => {
+  it('charset GET federation/servers∥analytics∥whois still 200', async () => {
+    const env = createEnv();
+    const init: RequestInit = {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json; charset=utf-8', ...AUTH },
+    };
+    const results = await Promise.all([
+      jsonReq('/admin/api/federation/servers', init, env),
+      jsonReq('/_matrix/client/v3/admin/analytics/requests?period=1h', init, env),
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(BOB)}`, init, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200, 200]);
+  });
+
+  it('HEAD/OPTIONS/PATCH leftover expand paths', async () => {
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq('/admin/api/federation/status', jsonInit('HEAD'), env),
+      jsonReq('/_matrix/client/v3/admin/analytics/federation', jsonInit('OPTIONS'), env),
+      jsonReq(`/_matrix/client/v3/admin/whois/${encodeURIComponent(BOB)}`, jsonInit('PATCH', {}), env),
+    ]);
+    expect(results.every((r) => [200, 204, 404, 405].includes(r.status))).toBe(true);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`charset expand leftover flood-${i}`, async () => {
+      const env = createEnv();
+      const init: RequestInit = {
+        headers: { 'Content-Type': 'application/json; charset=utf-8', ...AUTH },
+      };
+      const results = await Promise.all([
+        jsonReq('/admin/api/federation/servers', init, env),
+        jsonReq('/_matrix/client/v3/admin/analytics/requests?period=1h', init, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
     });

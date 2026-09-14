@@ -1,7 +1,9 @@
 /**
- * TOKENMAXX HEAVY leftovers after #157 — federation S2S soft/edge/reliability.
- * Complements federation-api-routes.test.ts. Tests-only — no product inventing.
- * Fixtures use example.com only.
+ * TOKENMAXX HEAVY leftovers after #157 / residual after #241 — federation S2S
+ * soft/edge/reliability. Complements federation-api-routes.test.ts and concurrent
+ * race leftovers (#214/#239). This deepen: media hit Disposition; thumbnail
+ * clamp/method/non-image; hierarchy; presence EDU; event_auth/backfill;
+ * timestamp edges. Tests-only — no product inventing. Fixtures use example.com only.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -2673,6 +2675,350 @@ describe('soft-extra publicRooms pagination charset', () => {
     const r = await req('GET', '/_matrix/federation/v1/publicRooms?limit=1&since=offset_' + 9, makeEnv(createFedDb({ rooms })));
     expect(r.status).toBe(200);
   });
+});
+
+// ---------------------------------------------------------------------------
+// After #241: residual serial soft floods — media hit / thumbnail / hierarchy /
+// presence EDU / event_auth∥backfill / timestamp edges
+// ---------------------------------------------------------------------------
+
+const MEDIA_SOFT = 'mxc_soft_media';
+
+describe('soft-16 media/download hit Content-Disposition after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  it('soft-16 hit with filename sets Disposition + Cache-Control', async () => {
+    const media = mockR2({ [MEDIA_SOFT]: new Uint8Array([1, 2, 3]) });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_SOFT, content_type: 'image/png', filename: 'hit.png' }],
+    });
+    const r = await req('GET', `/_matrix/federation/v1/media/download/${MEDIA_SOFT}`, makeEnv(db, { media }));
+    expect(r.status).toBe(200);
+    expect(r.headers.get('Content-Type')).toBe('image/png');
+    expect(r.headers.get('Content-Disposition')).toBe('inline; filename="hit.png"');
+    expect(r.headers.get('Cache-Control')).toContain('immutable');
+  });
+
+  it('soft-16 R2 hit without D1 metadata → octet-stream, no Disposition', async () => {
+    const media = mockR2({ [MEDIA_SOFT]: new Uint8Array([9]) });
+    const r = await req('GET', `/_matrix/federation/v1/media/download/${MEDIA_SOFT}`, makeEnv(createFedDb(), { media }));
+    expect(r.status).toBe(200);
+    expect(r.headers.get('Content-Type')).toBe('application/octet-stream');
+    expect(r.headers.get('Content-Disposition')).toBeNull();
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`soft-16 media hit flood-${i}`, async () => {
+      const mid = `mxc_hit_${i}`;
+      const media = mockR2({ [mid]: new Uint8Array([i]) });
+      const db = createFedDb({
+        media: [{ media_id: mid, content_type: 'image/jpeg', filename: `f${i}.jpg` }],
+      });
+      const r = await req('GET', `/_matrix/federation/v1/media/download/${mid}`, makeEnv(db, { media }));
+      expect(r.status).toBe(200);
+      expect(r.headers.get('Content-Disposition')).toBe(`inline; filename="f${i}.jpg"`);
+    });
+  }
+});
+
+describe('soft-17 media/thumbnail clamp∥method∥non-image after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  it('soft-17 width clamp uses thumb_1920 key when present', async () => {
+    const thumbKey = `thumb_${MEDIA_SOFT}_1920x96_scale`;
+    const media = mockR2({
+      [MEDIA_SOFT]: new Uint8Array([1]),
+      [thumbKey]: new Uint8Array([2, 2]),
+    });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_SOFT, content_type: 'image/png', filename: 'p.png' }],
+    });
+    const r = await req(
+      'GET',
+      `/_matrix/federation/v1/media/thumbnail/${MEDIA_SOFT}?width=9999&height=96&method=scale`,
+      makeEnv(db, { media })
+    );
+    expect(r.status).toBe(200);
+    expect(r.headers.get('Content-Type')).toBe('image/jpeg');
+  });
+
+  it('soft-17 method=crop miss falls back; non-image omits X-Thumbnail-Generated', async () => {
+    const media = mockR2({ [MEDIA_SOFT]: new Uint8Array([3, 3, 3]) });
+    const imgDb = createFedDb({
+      media: [{ media_id: MEDIA_SOFT, content_type: 'image/png', filename: 'p.png' }],
+    });
+    const pdfDb = createFedDb({
+      media: [{ media_id: MEDIA_SOFT, content_type: 'application/pdf', filename: 'd.pdf' }],
+    });
+    const crop = await req(
+      'GET',
+      `/_matrix/federation/v1/media/thumbnail/${MEDIA_SOFT}?width=32&height=32&method=crop`,
+      makeEnv(imgDb, { media })
+    );
+    const pdf = await req(
+      'GET',
+      `/_matrix/federation/v1/media/thumbnail/${MEDIA_SOFT}?width=32&height=32`,
+      makeEnv(pdfDb, { media })
+    );
+    expect(crop.status).toBe(200);
+    expect(crop.headers.get('X-Thumbnail-Generated')).toBe('false');
+    expect(pdf.status).toBe(200);
+    expect(pdf.headers.get('Content-Type')).toBe('application/pdf');
+    expect(pdf.headers.get('X-Thumbnail-Generated')).toBeNull();
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`soft-17 thumbnail flood-${i}`, async () => {
+      const media = mockR2({ [MEDIA_SOFT]: new Uint8Array([i]) });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_SOFT, content_type: 'image/png', filename: `t${i}.png` }],
+      });
+      const method = i % 2 === 0 ? 'scale' : 'crop';
+      const w = i % 3 === 0 ? 9999 : 48;
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA_SOFT}?width=${w}&height=48&method=${method}`,
+        makeEnv(db, { media })
+      );
+      expect(r.status).toBe(200);
+    });
+  }
+});
+
+describe('soft-18 hierarchy from=offset∥suggested_only∥empty-via after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  function spaceDb() {
+    const child = '!child:example.com';
+    const del = '!del:example.com';
+    const evt = makeEvent({
+      event_id: '$c1',
+      event_type: 'm.space.child',
+      state_key: child,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const evtDel = makeEvent({
+      event_id: '$c2',
+      event_type: 'm.space.child',
+      state_key: del,
+      content: JSON.stringify({ via: [] }),
+    });
+    const name = makeEvent({
+      event_id: '$sn',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Space' }),
+    });
+    const cname = makeEvent({
+      event_id: '$cn',
+      room_id: child,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Child' }),
+    });
+    return createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: child, room_version: '10', is_public: 1, created_at: 2 },
+        { room_id: del, room_version: '10', is_public: 1, created_at: 3 },
+      ],
+      events: [evt, evtDel, name, cname],
+      roomState: new Map([
+        [`${ROOM}|m.space.child|${child}`, evt.event_id],
+        [`${ROOM}|m.space.child|${del}`, evtDel.event_id],
+        [`${ROOM}|m.room.name|`, name.event_id],
+        [`${child}|m.room.name|`, cname.event_id],
+      ]),
+    });
+  }
+
+  it('soft-18 page0 includes room; empty-via skipped', async () => {
+    const r = await req(
+      'GET',
+      `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=10`,
+      makeEnv(spaceDb())
+    );
+    expect(r.status).toBe(200);
+    const body = r.body as { room: { room_id: string } | null; children: Array<{ room_id: string }> };
+    expect(body.room?.room_id).toBe(ROOM);
+    expect(body.children.every((c) => c.room_id !== '!del:example.com')).toBe(true);
+  });
+
+  it('soft-18 from=offset_1 omits space root', async () => {
+    const r = await req(
+      'GET',
+      `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=10&from=offset_1`,
+      makeEnv(spaceDb())
+    );
+    expect(r.status).toBe(200);
+    expect((r.body as { room: { room_id: string } | null }).room?.room_id).not.toBe(ROOM);
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`soft-18 hierarchy flood-${i}`, async () => {
+      const suggested = i % 2 === 0 ? 'true' : 'false';
+      const from = i % 3 === 0 ? '&from=offset_1' : '';
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?suggested_only=${suggested}&limit=5${from}`,
+        makeEnv(spaceDb())
+      );
+      expect(r.status).toBe(200);
+    });
+  }
+});
+
+describe('soft-19 send m.presence push soft flood after #241', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it('soft-19 presence push records INSERT INTO presence', async () => {
+    const db = createFedDb();
+    const r = await req('PUT', '/_matrix/federation/v1/send/txn-presence', makeEnv(db), {
+      pdus: [],
+      edus: [
+        {
+          edu_type: 'm.presence',
+          content: {
+            push: [
+              {
+                user_id: `@remote:${FED_ORIGIN}`,
+                presence: 'online',
+                status_msg: 'hi',
+                last_active_ago: 1000,
+                currently_active: true,
+              },
+            ],
+          },
+        },
+      ],
+    });
+    expect(r.status).toBe(200);
+    expect(db.inserts.some((i) => i.sql.includes('INSERT INTO presence'))).toBe(true);
+  });
+
+  it('soft-19 presence without push is no-op 200', async () => {
+    const db = createFedDb();
+    const r = await req('PUT', '/_matrix/federation/v1/send/txn-presence-empty', makeEnv(db), {
+      pdus: [],
+      edus: [{ edu_type: 'm.presence', content: {} }],
+    });
+    expect(r.status).toBe(200);
+    expect(db.inserts.some((i) => i.sql.includes('INSERT INTO presence'))).toBe(false);
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`soft-19 presence flood-${i}`, async () => {
+      const db = createFedDb();
+      const r = await req('PUT', `/_matrix/federation/v1/send/txn-pres-${i}`, makeEnv(db), {
+        pdus: [],
+        edus: [
+          {
+            edu_type: 'm.presence',
+            content: {
+              push: [
+                {
+                  user_id: `@u${i}:${FED_ORIGIN}`,
+                  presence: i % 2 === 0 ? 'online' : 'unavailable',
+                  currently_active: i % 2 === 0,
+                },
+              ],
+            },
+          },
+        ],
+      });
+      expect(r.status).toBe(200);
+      expect(db.inserts.some((row) => row.sql.includes('INSERT INTO presence'))).toBe(true);
+    });
+  }
+});
+
+describe('soft-20 event_auth∥backfill soft flood after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  it('soft-20 event_auth walks member chain', async () => {
+    const r = await req(
+      'GET',
+      `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent('$member:example.com')}`,
+      makeEnv(seedBasicRoom())
+    );
+    expect(r.status).toBe(200);
+    expect((r.body as { auth_chain: unknown[] }).auth_chain.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('soft-20 backfill returns pdus; missing room 404', async () => {
+    const [ok, miss] = await Promise.all([
+      req('GET', `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=5`, makeEnv(seedBasicRoom())),
+      req('GET', '/_matrix/federation/v1/backfill/%21no%3Ax?limit=5', makeEnv(seedBasicRoom())),
+    ]);
+    expect(ok.status).toBe(200);
+    expect((ok.body as { pdus: unknown[] }).pdus.length).toBeGreaterThan(0);
+    expect(miss.status).toBe(404);
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`soft-20 event_auth/backfill flood-${i}`, async () => {
+      const env = makeEnv(seedBasicRoom());
+      const [a, b] = await Promise.all([
+        req(
+          'GET',
+          `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent('$member:example.com')}`,
+          env
+        ),
+        req('GET', `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=${(i % 3) + 1}`, env),
+      ]);
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(200);
+    });
+  }
+});
+
+describe('soft-21 timestamp_to_event ts/dir/no-event soft flood after #241', () => {
+  beforeEach(() => { federationOrigin = FED_ORIGIN; });
+
+  it('soft-21 missing ts 400; ts<=0 400; unknown dir forward; no-event 404', async () => {
+    const e = makeEvent({
+      event_id: '$ts1',
+      event_type: 'm.room.message',
+      content: '{}',
+      origin_server_ts: 2000,
+    });
+    const env = makeEnv(createFedDb({ events: [e] }));
+    const base = `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}`;
+    const [noTs, zero, weirdDir, none] = await Promise.all([
+      req('GET', base, env),
+      req('GET', `${base}?ts=0&dir=f`, env),
+      req('GET', `${base}?ts=1500&dir=x`, env),
+      req('GET', `${base}?ts=9999&dir=f`, makeEnv(createFedDb({ events: [] }))),
+    ]);
+    expect(noTs.status).toBe(400);
+    expect(zero.status).toBe(400);
+    expect(weirdDir.status).toBe(200);
+    expect((weirdDir.body as { event_id: string }).event_id).toBe('$ts1');
+    expect(none.status).toBe(404);
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`soft-21 timestamp flood-${i}`, async () => {
+      const e = makeEvent({
+        event_id: `$tsf-${i}`,
+        event_type: 'm.room.message',
+        content: '{}',
+        origin_server_ts: 1_700_000_000_000,
+      });
+      const env = makeEnv(createFedDb({ events: [e] }));
+      const dir = i % 2 === 0 ? 'f' : 'b';
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1700000000000&dir=${dir}`,
+        env
+      );
+      expect(r.status).toBe(200);
+      expect((r.body as { event_id: string }).event_id).toBe(`$tsf-${i}`);
+    });
+  }
 });
 
 afterEach(() => { federationOrigin = FED_ORIGIN; vi.clearAllMocks(); });

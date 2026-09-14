@@ -1,15 +1,11 @@
 /**
- * TOKENMAXX HEAVY leftovers after #189 — admin *mutate concurrent race / TOCTOU*
- * + soft/edge reliability for mutate slices not covered by admin-api-route-leftovers
- * (#157/#161 GET soft floods) or admin-api-routes base coverage.
- * Orthogonal to typing (#185), qr-login (#183), receipts race (#184), federation
- * keys/membership/account-data race (#188), sliding-sync (#189), workflows (#187),
- * oauth/push/account-data/identity (#186), to-device races (#181), relations (#179),
- * devices/keybackups/report races (#174), keys/media/appservice races (#167).
- * Focus: create∥create localpart TOCTOU, PUT∥DELETE deactivate, make-admin∥remove-admin,
- * reset-password∥sessions revoke, login-token double-mint, purge∥bulk-delete,
- * quarantine∥media delete, report resolve∥unresolve, registration PUT races,
- * IdP provider PUT∥DELETE, Synapse deactivate∥reset_password, Admin DO invalidate races.
+ * TOKENMAXX HEAVY leftovers after #189 / residual after #241 — admin *mutate
+ * concurrent race / TOCTOU* + soft/edge reliability for mutate slices not covered
+ * by admin-api-route-leftovers (#157/#161 GET soft floods) or admin-api-routes.
+ * Orthogonal to tip #241 (devices+keybackups) and prior admin GET races (#239).
+ * Focus (this deepen): synapse PUT v2 create∥update TOCTOU; report resolve
+ * empty-body∥bad-JSON; media missing-id; bulk-delete self-only deleted:0;
+ * registration enabled-type soft.
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
 
@@ -7293,4 +7289,230 @@ describe('admin mutate wrong-method soft floods after #189', () => {
     expect([404, 405, 400, 500]).toContain(res.status);
   });
 
+});
+
+// ---------------------------------------------------------------------------
+// After #241: residual mutate TOCTOU / empty-body / missing-id / type soft
+// ---------------------------------------------------------------------------
+
+describe('race leftover synapse PUT v2 create∥update TOCTOU after #241', () => {
+  it('dual create same new user under SELECT barrier', async () => {
+    const db = createAdminDb({
+      selectBarrier: {
+        match: (sql) => sql.includes('SELECT user_id FROM users WHERE user_id = ?'),
+        count: 2,
+      },
+    });
+    const env = createEnv({ db });
+    const uid = '@dave:example.com';
+    const results = await Promise.all([
+      jsonReq(
+        `/_synapse/admin/v2/users/${enc(uid)}`,
+        jsonInit('PUT', { password: 'p1', displayname: 'D1' }),
+        env
+      ),
+      jsonReq(
+        `/_synapse/admin/v2/users/${enc(uid)}`,
+        jsonInit('PUT', { password: 'p2', displayname: 'D2' }),
+        env
+      ),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.users.filter((u) => u.user_id === uid).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('update existing∥create missing password isolation', async () => {
+    const env = createEnv();
+    const [upd, missPw, badId] = await Promise.all([
+      jsonReq(
+        `/_synapse/admin/v2/users/${enc(BOB)}`,
+        jsonInit('PUT', { displayname: 'Bob2' }),
+        env
+      ),
+      jsonReq(
+        `/_synapse/admin/v2/users/${enc('@newbie:example.com')}`,
+        jsonInit('PUT', { displayname: 'NoPw' }),
+        env
+      ),
+      jsonReq(
+        `/_synapse/admin/v2/users/${enc('not-a-mxid')}`,
+        jsonInit('PUT', { password: 'x' }),
+        env
+      ),
+    ]);
+    expect(upd.status).toBe(200);
+    expect(upd.body.name).toBe(BOB);
+    expect(missPw.status).toBe(400);
+    expect(missPw.body.errcode).toBe('M_MISSING_PARAM');
+    expect(badId.status).toBe(400);
+    expect(badId.body.errcode).toBe('M_INVALID_USERNAME');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`synapse PUT leftover flood-${i}`, async () => {
+      const uid = `@sput${i}:example.com`;
+      const db = createAdminDb({ users: [defaultAdmin()] });
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq(
+          `/_synapse/admin/v2/users/${enc(uid)}`,
+          jsonInit('PUT', { password: `pw${i}`, displayname: `N${i}` }),
+          env
+        ),
+        jsonReq(
+          `/_synapse/admin/v2/users/${enc(uid)}`,
+          jsonInit('PUT', { password: `pw${i}b`, displayname: `N${i}b` }),
+          env
+        ),
+      ]);
+      expect(results.every((r) => r.status === 200)).toBe(true);
+    });
+  }
+});
+
+describe('race leftover report resolve empty-body∥bad-JSON soft after #241', () => {
+  it('empty body resolve∥unresolve both 200', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const results = await Promise.all([
+      jsonReq('/admin/api/reports/1/resolve', { method: 'POST', headers: { ...AUTH } }, env),
+      jsonReq('/admin/api/reports/1/unresolve', { method: 'POST', headers: { ...AUTH } }, env),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+  });
+
+  it('bad JSON resolve swallows to body={} still 200', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const results = await Promise.all([
+      jsonReq(
+        '/admin/api/reports/1/resolve',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...AUTH },
+          body: '{not-json',
+        },
+        env
+      ),
+      jsonReq(
+        '/admin/api/reports/1/resolve',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...AUTH },
+          body: '{also-bad',
+        },
+        env
+      ),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports[0].resolved).toBe(1);
+    expect(db.reports[0].resolution_note).toBeNull();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`resolve empty/bad leftover flood-${i}`, async () => {
+      const db = createAdminDb({
+        reports: [
+          {
+            id: 1,
+            reporter_user_id: ADMIN,
+            room_id: ROOM,
+            event_id: '$msg:example.com',
+            reason: 'spam',
+            score: -1,
+            created_at: 1,
+            resolved: 0,
+            resolved_by: null,
+            resolved_at: null,
+            resolution_note: null,
+          },
+        ],
+      });
+      const env = createEnv({ db });
+      const init =
+        i % 2 === 0
+          ? ({ method: 'POST', headers: { ...AUTH } } as RequestInit)
+          : ({
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...AUTH },
+              body: '{bad',
+            } as RequestInit);
+      const results = await Promise.all([
+        jsonReq('/admin/api/reports/1/resolve', init, env),
+        jsonReq('/admin/api/reports/1/unresolve', { method: 'POST', headers: { ...AUTH } }, env),
+      ]);
+      expect(results.every((r) => [200, 404].includes(r.status))).toBe(true);
+    });
+  }
+});
+
+describe('race leftover media missing-id + bulk-delete self-only after #241', () => {
+  it('missing media quarantine∥delete still 200', async () => {
+    const media = mockR2();
+    const db = createAdminDb({ media: [], thumbnails: [] });
+    const env = createEnv({ db, media });
+    const mid = 'mxc_missing_xyz';
+    const results = await Promise.all([
+      jsonReq(`/admin/api/media/${mid}/quarantine`, jsonInit('POST', {}), env),
+      jsonReq(`/admin/api/media/${mid}`, jsonInit('DELETE'), env),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(results.every((r) => r.body.success === true)).toBe(true);
+  });
+
+  it('bulk-delete only-self → deleted:0 under race', async () => {
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq('/admin/api/users/bulk-delete', jsonInit('POST', { user_ids: [ADMIN] }), env),
+      jsonReq('/admin/api/users/bulk-delete', jsonInit('POST', { user_ids: [ADMIN, ADMIN] }), env),
+    ]);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(results.every((r) => r.body.deleted === 0)).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`missing-media/self-bulk leftover flood-${i}`, async () => {
+      const media = mockR2();
+      const env = createEnv({ db: createAdminDb({ media: [], thumbnails: [] }), media });
+      const results = await Promise.all([
+        jsonReq(`/admin/api/media/mxc_gone_${i}/quarantine`, jsonInit('POST', {}), env),
+        jsonReq('/admin/api/users/bulk-delete', jsonInit('POST', { user_ids: [ADMIN] }), env),
+      ]);
+      expect(results.map((r) => r.status).sort((a, b) => a - b)).toEqual([200, 200]);
+      expect(results[1].body.deleted).toBe(0);
+    });
+  }
+});
+
+describe('admin mutate registration enabled-type soft after #241', () => {
+  const badEnabled = [1, 'true', null, 'yes', {}, [], 0, false] as unknown[];
+
+  for (let i = 0; i < badEnabled.length; i++) {
+    it(`registration enabled-type soft-${i}`, async () => {
+      const env = createEnv();
+      const enabled = badEnabled[i];
+      // false is boolean → 200; non-booleans → 400 M_MISSING_PARAM
+      const res = await jsonReq(
+        '/admin/api/registration',
+        jsonInit('PUT', { enabled }),
+        env
+      );
+      if (typeof enabled === 'boolean') {
+        expect(res.status).toBe(200);
+      } else {
+        expect(res.status).toBe(400);
+        expect(res.body.errcode).toBe('M_MISSING_PARAM');
+      }
+    });
+  }
+
+  it('registration missing enabled key 400 under parallel', async () => {
+    const env = createEnv();
+    const results = await Promise.all([
+      jsonReq('/admin/api/registration', jsonInit('PUT', {}), env),
+      jsonReq('/admin/api/registration', jsonInit('PUT', { enabled: 'yes' }), env),
+    ]);
+    expect(results.every((r) => r.status === 400)).toBe(true);
+    expect(results.every((r) => r.body.errcode === 'M_MISSING_PARAM')).toBe(true);
+  });
 });

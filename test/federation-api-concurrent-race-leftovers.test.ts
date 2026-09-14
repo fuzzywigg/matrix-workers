@@ -1,14 +1,13 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 — federation-api
- * *concurrent race / TOCTOU* for leftover S2S routes that only had serial
- * soft floods (#157 leftover). Distinct from federation-keys-membership-account-data
+ * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241 —
+ * federation-api *concurrent race / TOCTOU* for leftover S2S routes that only
+ * had serial soft floods (#157 leftover). Distinct from federation-keys-membership
  * concurrent-race (OTK / make_join) and federation-api-route-leftovers (serial
- * floods). Distinct from tip #232 (room-cache) and catchup/consumer (#231).
+ * floods). Distinct from tip #241 (devices+keybackups) and catchup (#237).
  *
- * Focus (this deepen): key/v2/server/:keyId; notary query own-server;
- * thumbnail R2 thumb-key barrier; event_auth chain; backfill membership;
- * timestamp_to_event dir=f∥b; hierarchy; send cached∥miss isolation;
- * openid already-expired delete; get_missing_events; leftover 404 isolation.
+ * Focus (this deepen after #241): processed_pdus accept∥reject; thumbnail
+ * width-clamp∥method=crop; hierarchy from=offset∥empty-via; get_missing 403∥ok;
+ * media download Content-Disposition∥octet-stream coherency.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -1979,6 +1978,332 @@ describe('race leftover send cache∥openid expired after #232', () => {
         req('GET', `/_matrix/federation/v1/openid/userinfo?access_token=gone-${i}`, env),
       ]);
       expect(results.map((r) => r.status).sort((a, b) => a - b)).toEqual([200, 401]);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// After #241: residual S2S TOCTOU — processed_pdus / thumbnail clamp /
+// hierarchy pagination / get_missing 403 / media Disposition
+// ---------------------------------------------------------------------------
+
+describe('race leftover send processed_pdus accept∥reject TOCTOU after #241', () => {
+  it('seeded accept∥reject under Promise.all', async () => {
+    const db = seedBasicRoom({
+      processedPdus: {
+        '$ok': { accepted: 1, rejection_reason: null },
+        '$no': { accepted: 0, rejection_reason: 'nope' },
+      },
+      selectBarrier: {
+        match: (sql) => sql.includes('SELECT accepted, rejection_reason FROM processed_pdus'),
+        count: 2,
+      },
+    });
+    const env = makeEnv(db);
+    const results = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-prev-a', env, {
+        pdus: [
+          {
+            event_id: '$ok',
+            room_id: ROOM,
+            sender: `@m:${FED_ORIGIN}`,
+            type: 'm.room.message',
+            content: {},
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-prev-b', env, {
+        pdus: [
+          {
+            event_id: '$no',
+            room_id: ROOM,
+            sender: `@m:${FED_ORIGIN}`,
+            type: 'm.room.message',
+            content: {},
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    const a = (results[0].body as { pdus: Record<string, { error?: string }> }).pdus;
+    const b = (results[1].body as { pdus: Record<string, { error?: string }> }).pdus;
+    expect(a['$ok']).toEqual({});
+    expect(b['$no'].error).toBe('nope');
+  });
+
+  it('invalid PDU structure soft under race (no processed insert)', async () => {
+    const db = seedBasicRoom();
+    const env = makeEnv(db);
+    const results = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-struct-a', env, {
+        pdus: [{ event_id: '$bad1', room_id: ROOM }],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-struct-b', env, {
+        pdus: [{ event_id: '$bad2', room_id: ROOM, sender: 'noserver', type: 'm.room.message', content: {} }],
+      }),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    const a = (results[0].body as { pdus: Record<string, { error?: string }> }).pdus;
+    const b = (results[1].body as { pdus: Record<string, { error?: string }> }).pdus;
+    expect(a['$bad1'].error).toMatch(/Invalid PDU/);
+    expect(b['$bad2'].error).toMatch(/Invalid sender/);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`processed_pdus leftover flood-${i}`, async () => {
+      const db = seedBasicRoom({
+        processedPdus: {
+          [`$ok-${i}`]: { accepted: 1, rejection_reason: null },
+        },
+      });
+      const env = makeEnv(db);
+      const results = await Promise.all([
+        req('PUT', `/_matrix/federation/v1/send/flood-prev-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$ok-${i}`,
+              room_id: ROOM,
+              sender: `@m:${FED_ORIGIN}`,
+              type: 'm.room.message',
+              content: {},
+            },
+          ],
+        }),
+        req('PUT', `/_matrix/federation/v1/send/flood-empty-${i}`, env, { pdus: [] }),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover thumbnail width-clamp∥method=crop key barrier after #241', () => {
+  it('width=9999 clamps to 1920 thumb key under race', async () => {
+    const thumbKey = `thumb_${MEDIA_ID}_1920x96_scale`;
+    const media = mockR2(
+      {
+        [MEDIA_ID]: new Uint8Array([9, 9, 9]),
+        [thumbKey]: new Uint8Array([7, 7, 7]),
+      },
+      { getBarrier: { count: 2, match: (key) => key === thumbKey } }
+    );
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'pic.png' }],
+    });
+    const env = makeEnv(db, { media });
+    const path = `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=9999&height=96&method=scale`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => r.headers.get('Content-Type') === 'image/jpeg')).toBe(true);
+  });
+
+  it('method=crop key isolation vs scale fallback', async () => {
+    const cropKey = `thumb_${MEDIA_ID}_64x64_crop`;
+    const media = mockR2({
+      [MEDIA_ID]: new Uint8Array([4, 5, 6]),
+      [cropKey]: new Uint8Array([1, 1, 1]),
+    });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'pic.png' }],
+    });
+    const env = makeEnv(db, { media });
+    const [crop, scale] = await Promise.all([
+      req('GET', `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=64&height=64&method=crop`, env),
+      req('GET', `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=64&height=64&method=scale`, env),
+    ]);
+    expect(crop.status).toBe(200);
+    expect(scale.status).toBe(200);
+    expect(crop.headers.get('Content-Type')).toBe('image/jpeg');
+    expect(scale.headers.get('Content-Type')).toBe('image/png');
+    expect(scale.headers.get('X-Thumbnail-Generated')).toBe('false');
+  });
+
+  it('non-image thumbnail omits X-Thumbnail-Generated under race', async () => {
+    const media = mockR2({ [MEDIA_ID]: new Uint8Array([2, 2]) });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA_ID, content_type: 'application/pdf', filename: 'doc.pdf' }],
+    });
+    const env = makeEnv(db, { media });
+    const path = `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=32&height=32`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(results.every((r) => r.headers.get('Content-Type') === 'application/pdf')).toBe(true);
+    expect(results.every((r) => r.headers.get('X-Thumbnail-Generated') === null)).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`thumbnail clamp leftover flood-${i}`, async () => {
+      const media = mockR2({ [MEDIA_ID]: new Uint8Array([i]) });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: `p${i}.png` }],
+      });
+      const env = makeEnv(db, { media });
+      const w = i % 2 === 0 ? 9999 : 48;
+      const method = i % 2 === 0 ? 'scale' : 'crop';
+      const results = await Promise.all([
+        req('GET', `/_matrix/federation/v1/media/thumbnail/${MEDIA_ID}?width=${w}&height=48&method=${method}`, env),
+        req('GET', `/_matrix/federation/v1/media/download/${MEDIA_ID}`, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover hierarchy from=offset∥empty-via after #241', () => {
+  function hierarchyDb() {
+    const childA = '!child-a:example.com';
+    const childB = '!child-b:example.com';
+    const childDel = '!child-del:example.com';
+    const evtA = makeEvent({
+      event_id: '$ca',
+      event_type: 'm.space.child',
+      state_key: childA,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const evtB = makeEvent({
+      event_id: '$cb',
+      event_type: 'm.space.child',
+      state_key: childB,
+      content: JSON.stringify({ via: [SERVER], suggested: false }),
+    });
+    const evtDel = makeEvent({
+      event_id: '$cd',
+      event_type: 'm.space.child',
+      state_key: childDel,
+      content: JSON.stringify({ via: [], suggested: true }),
+    });
+    const name = makeEvent({
+      event_id: '$spname2',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Space' }),
+    });
+    const nameA = makeEvent({
+      event_id: '$na',
+      room_id: childA,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'A' }),
+    });
+    const nameB = makeEvent({
+      event_id: '$nb',
+      room_id: childB,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'B' }),
+    });
+    return createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: childA, room_version: '10', is_public: 1, created_at: 2 },
+        { room_id: childB, room_version: '10', is_public: 1, created_at: 3 },
+        { room_id: childDel, room_version: '10', is_public: 1, created_at: 4 },
+      ],
+      events: [evtA, evtB, evtDel, name, nameA, nameB],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', childA), evtA.event_id],
+        [stateKey(ROOM, 'm.space.child', childB), evtB.event_id],
+        [stateKey(ROOM, 'm.space.child', childDel), evtDel.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+        [stateKey(childA, 'm.room.name', ''), nameA.event_id],
+        [stateKey(childB, 'm.room.name', ''), nameB.event_id],
+      ]),
+    });
+  }
+
+  it('from=offset_1 omits space root under race', async () => {
+    const env = makeEnv(hierarchyDb());
+    const base = `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}`;
+    const [page0, page1] = await Promise.all([
+      req('GET', `${base}?limit=10`, env),
+      req('GET', `${base}?limit=10&from=offset_1`, env),
+    ]);
+    expect(statusesOf([page0, page1])).toEqual([200, 200]);
+    expect((page0.body as { room: { room_id: string } | null }).room?.room_id).toBe(ROOM);
+    // offset>0 skips adding space root; room may be first child or null after empty-via skip
+    expect((page1.body as { room: { room_id: string } | null }).room?.room_id).not.toBe(ROOM);
+  });
+
+  it('empty-via child skipped; suggested_only filters', async () => {
+    const env = makeEnv(hierarchyDb());
+    const path = `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?suggested_only=true&limit=10`;
+    const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    for (const r of results) {
+      const body = r.body as { room: { room_id: string } | null; children: Array<{ room_id: string }> };
+      expect(body.room?.room_id).toBe(ROOM);
+      expect(body.children.every((c) => c.room_id !== '!child-del:example.com')).toBe(true);
+    }
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`hierarchy pagination leftover flood-${i}`, async () => {
+      const env = makeEnv(hierarchyDb());
+      const from = i % 2 === 0 ? '' : '&from=offset_1';
+      const results = await Promise.all([
+        req('GET', `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=5${from}`, env),
+        req('GET', `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?suggested_only=true&limit=5`, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race leftover get_missing_events 403∥ok + media Disposition after #241', () => {
+  it('get_missing 403 when origin has no member∥ok isolation', async () => {
+    const okDb = seedBasicRoom();
+    const forbiddenDb = seedBasicRoom({
+      memberships: [{ room_id: ROOM, user_id: LOCAL_USER, membership: 'join' }],
+    });
+    const body = {
+      earliest_events: [],
+      latest_events: ['$member:example.com'],
+      limit: 10,
+      min_depth: 0,
+    };
+    const path = `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`;
+    const [ok, forbidden] = await Promise.all([
+      req('POST', path, makeEnv(okDb), body),
+      req('POST', path, makeEnv(forbiddenDb), body),
+    ]);
+    expect(ok.status).toBe(200);
+    expect(forbidden.status).toBe(403);
+    expect((forbidden.body as { errcode: string }).errcode).toBe('M_FORBIDDEN');
+  });
+
+  it('media download Content-Disposition + Cache-Control coherency', async () => {
+    const media = mockR2({ [MEDIA_ID]: new Uint8Array([1, 2, 3]) });
+    const withName = createFedDb({
+      media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: 'pic.png' }],
+    });
+    const noMeta = createFedDb();
+    // R2 hit without D1 metadata → octet-stream, no Content-Disposition
+    const mediaOnly = mockR2({ [MEDIA_ID]: new Uint8Array([9, 9]) });
+    const [named, octet] = await Promise.all([
+      req('GET', `/_matrix/federation/v1/media/download/${MEDIA_ID}`, makeEnv(withName, { media })),
+      req('GET', `/_matrix/federation/v1/media/download/${MEDIA_ID}`, makeEnv(noMeta, { media: mediaOnly })),
+    ]);
+    expect(named.status).toBe(200);
+    expect(octet.status).toBe(200);
+    expect(named.headers.get('Content-Disposition')).toBe('inline; filename="pic.png"');
+    expect(named.headers.get('Cache-Control')).toContain('immutable');
+    expect(octet.headers.get('Content-Type')).toBe('application/octet-stream');
+    expect(octet.headers.get('Content-Disposition')).toBeNull();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`get_missing/media leftover flood-${i}`, async () => {
+      const media = mockR2({ [MEDIA_ID]: new Uint8Array([i]) });
+      const db = seedBasicRoom({
+        media: [{ media_id: MEDIA_ID, content_type: 'image/png', filename: `f${i}.png` }],
+      });
+      const env = makeEnv(db, { media });
+      const results = await Promise.all([
+        req('POST', `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`, env, {
+          earliest_events: [],
+          latest_events: ['$member:example.com'],
+          limit: 5,
+        }),
+        req('GET', `/_matrix/federation/v1/media/download/${MEDIA_ID}`, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      expect(results[1].headers.get('Content-Disposition')).toBe(`inline; filename="f${i}.png"`);
     });
   }
 });
