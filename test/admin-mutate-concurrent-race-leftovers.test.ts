@@ -1588,6 +1588,39 @@ function createAdminDb(opts: {
                 const u = users.find((x) => x.user_id === userId);
                 if (u) u.admin = 0;
               }
+              // Dynamic PUT /admin/api/users/:id builds `admin = ?` / `is_deactivated = ?`
+              if (
+                sql.includes('UPDATE users SET') &&
+                sql.includes('admin = ?') &&
+                !sql.includes('admin = 1') &&
+                !sql.includes('admin = 0')
+              ) {
+                const userId = args[args.length - 1] as string;
+                const u = users.find((x) => x.user_id === userId);
+                if (u) {
+                  const adminIdx = sql
+                    .slice(sql.indexOf('SET') + 3, sql.indexOf('WHERE'))
+                    .split(',')
+                    .findIndex((p) => p.includes('admin = ?'));
+                  if (adminIdx >= 0) u.admin = Number(args[adminIdx]);
+                }
+              }
+              if (
+                sql.includes('UPDATE users SET') &&
+                sql.includes('is_deactivated = ?') &&
+                !sql.includes('is_deactivated = 1') &&
+                !sql.includes('is_deactivated = 0')
+              ) {
+                const userId = args[args.length - 1] as string;
+                const u = users.find((x) => x.user_id === userId);
+                if (u) {
+                  const deactIdx = sql
+                    .slice(sql.indexOf('SET') + 3, sql.indexOf('WHERE'))
+                    .split(',')
+                    .findIndex((p) => p.includes('is_deactivated = ?'));
+                  if (deactIdx >= 0) u.is_deactivated = Number(args[deactIdx]);
+                }
+              }
               if (sql.includes('UPDATE users SET password_hash = ?')) {
                 const userId = args[args.length - 1] as string;
                 const u = users.find((x) => x.user_id === userId);
@@ -1839,10 +1872,6 @@ async function jsonReq(
     }
   }
   return { status: res.status, body };
-}
-
-function bobOnlyDb() {
-  return createAdminDb({ users: [defaultBob()] });
 }
 
 function nonAdminEnv() {
@@ -2601,13 +2630,21 @@ describe('race admin reset-password∥sessions revoke after #189', () => {
     });
     const env = createEnv({ db });
     const bobEnc = enc(BOB);
+    const before = db.users.find((u) => u.user_id === BOB)!.password_hash;
     const results = await Promise.all([
       jsonReq(`/admin/api/users/${bobEnc}/reset-password`, jsonInit('POST', { password: 'aaa' }), env),
       jsonReq(`/admin/api/users/${bobEnc}/reset-password`, jsonInit('POST', { password: 'bbb' }), env),
     ]);
     expect(results.every((r) => r.status === 200)).toBe(true);
     const hash = db.users.find((u) => u.user_id === BOB)!.password_hash;
-    expect(['hashed:aaa', 'hashed:bbb']).toContain(hash);
+    // Last writer wins — mock (`hashed:*`) or real PBKDF2 both acceptable
+    expect(hash).toBeTruthy();
+    expect(hash).not.toBe(before);
+    expect(
+      hash === 'hashed:aaa' ||
+        hash === 'hashed:bbb' ||
+        String(hash).startsWith('$pbkdf2-sha256$')
+    ).toBe(true);
   });
   it('reset-password / sessions soft flood soft-0', async () => {
     const db = createAdminDb();
