@@ -4222,3 +4222,252 @@ describe('database CRUD TOKENMAXX residual quaternary leftovers after #310', () 
     expect(db._state.memberships[0].event_id).toBe('$join-keep');
   });
 });
+
+describe('database CRUD TOKENMAXX residual quinary leftovers after #319', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('getUserByLocalpart ∥ createUser sibling: lookup stays isolated from insert', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: 'Alice',
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    const [got] = await Promise.all([
+      getUserByLocalpart(db, 'alice'),
+      createUser(db, BOB, 'bob', 'pbkdf2-bob', false),
+    ]);
+    expect(got).toMatchObject({ user_id: USER, localpart: 'alice', display_name: 'Alice' });
+    await expect(getUserByLocalpart(db, 'bob')).resolves.toMatchObject({
+      user_id: BOB,
+      localpart: 'bob',
+    });
+    await expect(getUserByLocalpart(db, 'alice')).resolves.toMatchObject({ user_id: USER });
+  });
+
+  it('getPasswordHash ∥ updateUserProfile: hash stays stable while profile mutates', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'pbkdf2-stable',
+          display_name: 'Old',
+          avatar_url: 'mxc://example.com/old',
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    const [hash] = await Promise.all([
+      getPasswordHash(db, USER),
+      updateUserProfile(db, USER, 'New', 'mxc://example.com/new'),
+    ]);
+    expect(hash).toBe('pbkdf2-stable');
+    await expect(getPasswordHash(db, USER)).resolves.toBe('pbkdf2-stable');
+    await expect(getUserById(db, USER)).resolves.toMatchObject({
+      display_name: 'New',
+      avatar_url: 'mxc://example.com/new',
+    });
+  });
+
+  it('createDevice ∥ getDevice: read sees null or device; sibling untouched', async () => {
+    const db = createCrudDb({
+      devices: [
+        {
+          user_id: USER,
+          device_id: 'KEEP',
+          display_name: 'Keep',
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: NOW,
+        },
+      ],
+    });
+    const [got] = await Promise.all([
+      getDevice(db, USER, 'NEW'),
+      createDevice(db, USER, 'NEW', 'Phone'),
+    ]);
+    expect(got === null || got?.device_id === 'NEW').toBe(true);
+    await expect(getDevice(db, USER, 'NEW')).resolves.toMatchObject({
+      device_id: 'NEW',
+      display_name: 'Phone',
+    });
+    await expect(getDevice(db, USER, 'KEEP')).resolves.toMatchObject({
+      device_id: 'KEEP',
+      display_name: 'Keep',
+    });
+  });
+
+  it('deleteAllUserTokens ∥ sibling user token lookup stay isolated', async () => {
+    const db = createCrudDb({
+      tokens: [
+        {
+          token_id: 'tid-a',
+          token_hash: 'hash-a',
+          user_id: USER,
+          device_id: 'DEV1',
+          created_at: NOW,
+        },
+        {
+          token_id: 'tid-b',
+          token_hash: 'hash-b',
+          user_id: BOB,
+          device_id: 'DEV2',
+          created_at: NOW,
+        },
+      ],
+    });
+    const [bobLookup] = await Promise.all([
+      getUserByTokenHash(db, 'hash-b'),
+      deleteAllUserTokens(db, USER),
+    ]);
+    expect(bobLookup).toEqual({ userId: BOB, deviceId: 'DEV2' });
+    await expect(getUserByTokenHash(db, 'hash-a')).resolves.toBeNull();
+    await expect(getUserByTokenHash(db, 'hash-b')).resolves.toEqual({
+      userId: BOB,
+      deviceId: 'DEV2',
+    });
+  });
+
+  it('getLatestStreamPosition ∥ storeEventIdempotent: tip sees old or new only', async () => {
+    const seed = pdu({ event_id: '$seed-tip', type: 'm.room.message', content: { body: 't' } });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(seed, 7)],
+      streamPosition: 7,
+    });
+    const event = pdu({
+      event_id: '$stream-idem',
+      type: 'm.room.message',
+      content: { body: 's' },
+    });
+    const [tip, idem] = await Promise.all([
+      getLatestStreamPosition(db),
+      storeEventIdempotent(db, event),
+    ]);
+    expect(tip === 7 || tip === 8).toBe(true);
+    expect(idem.inserted).toBe(true);
+    expect(idem.streamOrdering).toBe(8);
+    await expect(getLatestStreamPosition(db)).resolves.toBe(8);
+    await expect(getEvent(db, '$stream-idem')).resolves.toMatchObject({
+      event_id: '$stream-idem',
+    });
+  });
+
+  it('getUserRooms(join) ∥ updateMembership join→leave: page sees room or empty', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$join',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    const [rooms] = await Promise.all([
+      getUserRooms(db, USER, 'join'),
+      updateMembership(db, ROOM, USER, 'leave', '$leave'),
+    ]);
+    expect(rooms.length).toBeLessThanOrEqual(1);
+    expect(rooms.every((r) => r === ROOM)).toBe(true);
+    await expect(getUserRooms(db, USER, 'join')).resolves.toEqual([]);
+    await expect(getMembership(db, ROOM, USER)).resolves.toEqual({
+      membership: 'leave',
+      eventId: '$leave',
+    });
+  });
+
+  it('getEventsSince(limit:0) ∥ storeEvent: empty page does not poison insert', async () => {
+    const seed = pdu({ event_id: '$seed-q', type: 'm.room.message', content: { body: 's' } });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(seed, 3)],
+      streamPosition: 3,
+    });
+    const neu = pdu({ event_id: '$neu-q', type: 'm.room.message', content: { body: 'n' } });
+    const [page, stream] = await Promise.all([
+      getEventsSince(db, ROOM, 0, 0),
+      storeEvent(db, neu),
+    ]);
+    expect(page).toEqual([]);
+    expect(stream).toBe(4);
+    await expect(getEventsSince(db, ROOM, 3, 10)).resolves.toMatchObject([
+      { event_id: '$neu-q' },
+    ]);
+  });
+
+  it('createUser guest ∥ getUserById maps is_guest under race with non-guest sibling', async () => {
+    const guestId = '@guest:example.com';
+    const db = createCrudDb();
+    const [,] = await Promise.all([
+      createUser(db, guestId, 'guest', null, true),
+      createUser(db, USER, 'alice', 'pbkdf2-alice', false),
+    ]);
+    const [guest, alice] = await Promise.all([
+      getUserById(db, guestId),
+      getUserById(db, USER),
+    ]);
+    expect(guest).toMatchObject({
+      user_id: guestId,
+      localpart: 'guest',
+      is_guest: true,
+    });
+    expect(alice).toMatchObject({
+      user_id: USER,
+      localpart: 'alice',
+      is_guest: false,
+    });
+    await expect(getPasswordHash(db, guestId)).resolves.toBeNull();
+    await expect(getPasswordHash(db, USER)).resolves.toBe('pbkdf2-alice');
+  });
+
+  it('updateUserProfile avatar-only ∥ getUserById: display_name stays Old or reads mid-flight', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: 'Old',
+          avatar_url: 'mxc://example.com/old',
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    const [got] = await Promise.all([
+      getUserById(db, USER),
+      updateUserProfile(db, USER, undefined, 'mxc://example.com/new'),
+    ]);
+    expect(got).not.toBeNull();
+    expect(got!.display_name).toBe('Old');
+    expect(['mxc://example.com/old', 'mxc://example.com/new']).toContain(got!.avatar_url);
+    await expect(getUserById(db, USER)).resolves.toMatchObject({
+      display_name: 'Old',
+      avatar_url: 'mxc://example.com/new',
+    });
+  });
+});

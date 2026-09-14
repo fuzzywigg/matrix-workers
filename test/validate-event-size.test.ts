@@ -580,3 +580,101 @@ describe('validateEventSize TOKENMAXX residual quaternary leftovers after #310',
     }
   });
 });
+
+describe('validateEventSize TOKENMAXX residual quinary leftovers after #319', () => {
+  it('boolean/number primitive content ok ∥ soft-reject neither mutates under race', async () => {
+    const boolEvt = baseEvent({ body: 'x' });
+    (boolEvt as { content: unknown }).content = true;
+    const numEvt = baseEvent({ body: 'x' });
+    (numEvt as { content: unknown }).content = 0;
+    const overhead = JSON.stringify({ body: '' }).length;
+    const bad = baseEvent({ body: 'z'.repeat(65_536 - overhead + 1) });
+    const beforeBool = JSON.stringify(boolEvt);
+    const beforeNum = JSON.stringify(numEvt);
+    const beforeBad = JSON.stringify(bad);
+    const [okBool, okNum, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(boolEvt as PDU);
+        return 'ok-bool';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(numEvt as PDU);
+        return 'ok-num';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(bad);
+        return 'bad';
+      }),
+    ]);
+    expect(okBool.status).toBe('fulfilled');
+    expect(okNum.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      expect((badResult.reason as MatrixApiError).message).toBe(
+        'Event content exceeds 65536 byte limit (got 65537)'
+      );
+    }
+    expect(JSON.stringify(boolEvt)).toBe(beforeBool);
+    expect(JSON.stringify(numEvt)).toBe(beforeNum);
+    expect(JSON.stringify(bad)).toBe(beforeBad);
+    expect(boolEvt.content).toBe(true);
+    expect(numEvt.content).toBe(0);
+  });
+
+  it('empty {} content ok ∥ hard-reject exact message under race', async () => {
+    const empty = baseEvent({});
+    const hard = baseEvent({ body: 'ok' });
+    hard.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    const hardLen = JSON.stringify(hard).length;
+    expect(JSON.stringify(empty.content).length).toBe(2);
+    expect(hardLen).toBeGreaterThan(921_600);
+    const beforeEmpty = JSON.stringify(empty);
+    const beforeHard = JSON.stringify(hard);
+    const [okResult, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(empty);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(hard);
+        return 'bad';
+      }),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      expect((badResult.reason as MatrixApiError).message).toBe(
+        `Serialized event exceeds 921600 byte D1 row limit (got ${hardLen})`
+      );
+    }
+    expect(JSON.stringify(empty)).toBe(beforeEmpty);
+    expect(JSON.stringify(hard)).toBe(beforeHard);
+  });
+
+  it('nested soft-over exact message ∥ soft exact-boundary ok under race', async () => {
+    const nested = baseEvent({ nested: { blob: 'n'.repeat(65_536) } });
+    const nestedLen = JSON.stringify(nested.content).length;
+    expect(nestedLen).toBeGreaterThan(65_536);
+    const overhead = JSON.stringify({ body: '' }).length;
+    const at = baseEvent({ body: 'y'.repeat(65_536 - overhead) });
+    expect(JSON.stringify(at.content).length).toBe(65_536);
+    const beforeNested = JSON.stringify(nested);
+    const beforeAt = JSON.stringify(at);
+    const [badResult, okResult] = await Promise.allSettled([
+      Promise.resolve().then(() => validateEventSize(nested)),
+      Promise.resolve().then(() => {
+        validateEventSize(at);
+        return 'ok';
+      }),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      expect((badResult.reason as MatrixApiError).message).toBe(
+        `Event content exceeds 65536 byte limit (got ${nestedLen})`
+      );
+    }
+    expect(JSON.stringify(nested)).toBe(beforeNested);
+    expect(JSON.stringify(at)).toBe(beforeAt);
+  });
+});

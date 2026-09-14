@@ -874,3 +874,140 @@ describe('errors TOKENMAXX residual quaternary leftovers after #310', () => {
     expect(emptyCustom.headers.get('Content-Type')).toBe('application/json');
   });
 });
+
+describe('errors TOKENMAXX residual quinary leftovers after #319', () => {
+  it('userInUse/roomInUse/guestAccess/invalidRoomState/unsupportedRoomVersion default exacts under race', async () => {
+    const [user, room, guest, state, ver] = await Promise.all([
+      Promise.resolve(Errors.userInUse().toResponse()),
+      Promise.resolve(Errors.roomInUse().toResponse()),
+      Promise.resolve(Errors.guestAccessForbidden().toResponse()),
+      Promise.resolve(Errors.invalidRoomState().toResponse()),
+      Promise.resolve(Errors.unsupportedRoomVersion().toResponse()),
+    ]);
+    expect(new Set([user, room, guest, state, ver]).size).toBe(5);
+    expect(user.status).toBe(400);
+    expect(room.status).toBe(400);
+    expect(guest.status).toBe(403);
+    expect(state.status).toBe(400);
+    expect(ver.status).toBe(400);
+    await expect(user.json()).resolves.toEqual({
+      errcode: 'M_USER_IN_USE',
+      error: 'User ID already taken',
+    });
+    await expect(room.json()).resolves.toEqual({
+      errcode: 'M_ROOM_IN_USE',
+      error: 'Room alias already taken',
+    });
+    await expect(guest.json()).resolves.toEqual({
+      errcode: 'M_GUEST_ACCESS_FORBIDDEN',
+      error: 'Guest access forbidden',
+    });
+    await expect(state.json()).resolves.toEqual({
+      errcode: 'M_INVALID_ROOM_STATE',
+      error: 'Invalid room state',
+    });
+    await expect(ver.json()).resolves.toEqual({
+      errcode: 'M_UNSUPPORTED_ROOM_VERSION',
+      error: 'Unsupported room version',
+    });
+  });
+
+  it('withErrorHandler success ∥ MatrixApiError ∥ unexpected throw stay isolated under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const [ok, err, boom] = await Promise.all([
+      withErrorHandler(async () => ({ ok: true, n: 1 })),
+      withErrorHandler(async () => {
+        throw Errors.userInUse('taken');
+      }),
+      withErrorHandler(async () => {
+        throw new TypeError('boom-quinary');
+      }),
+    ]);
+    expect(ok).toEqual({ ok: true, n: 1 });
+    expect(err).toBeInstanceOf(Response);
+    expect(boom).toBeInstanceOf(Response);
+    expect((err as Response).status).toBe(400);
+    expect((boom as Response).status).toBe(500);
+    await expect((err as Response).json()).resolves.toEqual({
+      errcode: 'M_USER_IN_USE',
+      error: 'taken',
+    });
+    await expect((boom as Response).json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN',
+      error: 'An unknown error occurred',
+    });
+    expect(spy).toHaveBeenCalledWith('Unexpected error:', expect.any(TypeError));
+    spy.mockRestore();
+  });
+
+  it('limitExceeded retryAfterMs 0 omit ∥ positive include ∥ toJSON under race', async () => {
+    const [omit, keep, keepNeg] = await Promise.all([
+      Promise.resolve(Errors.limitExceeded('zero', 0).toResponse()),
+      Promise.resolve(Errors.limitExceeded('pos', 2500).toResponse()),
+      Promise.resolve(Errors.limitExceeded('neg', -1).toJSON()),
+    ]);
+    expect(omit.status).toBe(429);
+    expect(keep.status).toBe(429);
+    await expect(omit.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'zero',
+    });
+    await expect(keep.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'pos',
+      retry_after_ms: 2500,
+    });
+    expect(keepNeg).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'neg',
+      retry_after_ms: -1,
+    });
+  });
+
+  it('withErrorHandler races userInUse + roomInUse + guestAccessForbidden defaults', async () => {
+    const [a, b, c] = await Promise.all([
+      withErrorHandler(async () => {
+        throw Errors.userInUse();
+      }),
+      withErrorHandler(async () => {
+        throw Errors.roomInUse();
+      }),
+      withErrorHandler(async () => {
+        throw Errors.guestAccessForbidden();
+      }),
+    ]);
+    expect((a as Response).status).toBe(400);
+    expect((b as Response).status).toBe(400);
+    expect((c as Response).status).toBe(403);
+    await expect((a as Response).json()).resolves.toEqual({
+      errcode: 'M_USER_IN_USE',
+      error: 'User ID already taken',
+    });
+    await expect((b as Response).json()).resolves.toEqual({
+      errcode: 'M_ROOM_IN_USE',
+      error: 'Room alias already taken',
+    });
+    await expect((c as Response).json()).resolves.toEqual({
+      errcode: 'M_GUEST_ACCESS_FORBIDDEN',
+      error: 'Guest access forbidden',
+    });
+  });
+
+  it('jsonResponse nested/null/array bodies ∥ emptyResponse custom stay independent under race', async () => {
+    const [nested, nul, arr, empty] = await Promise.all([
+      Promise.resolve(jsonResponse({ a: { b: [1, null] } }, 200)),
+      Promise.resolve(jsonResponse(null, 200)),
+      Promise.resolve(jsonResponse([1, 2, 3], 202)),
+      Promise.resolve(emptyResponse(201)),
+    ]);
+    expect(new Set([nested, nul, arr, empty]).size).toBe(4);
+    expect(nested.status).toBe(200);
+    expect(nul.status).toBe(200);
+    expect(arr.status).toBe(202);
+    expect(empty.status).toBe(201);
+    await expect(nested.json()).resolves.toEqual({ a: { b: [1, null] } });
+    await expect(nul.json()).resolves.toBeNull();
+    await expect(arr.json()).resolves.toEqual([1, 2, 3]);
+    await expect(empty.json()).resolves.toEqual({});
+  });
+});
