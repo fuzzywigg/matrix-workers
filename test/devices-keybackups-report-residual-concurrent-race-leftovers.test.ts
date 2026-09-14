@@ -1,5 +1,5 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 — residual
+ * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / after #241 — residual
  * *devices + key-backups + report* concurrent-race / TOCTOU slices not covered by
  * #174 (devices-keybackups-report), #200 (report + server-notices; server-notices
  * left alone), or the first residual pass (#220).
@@ -26,6 +26,12 @@
  *   report — leave→ban still INSERT; join→invite still INSERT; score clamp extremes;
  *     room/user re-report keeps resolved; admin resolve∥GET; from pagination∥resolve;
  *     Infinity score vs numeric.
+ *
+ * Deepen after #241 focus (devices + key-backups only; report left alone):
+ *   devices — empty-string∥right password; auth:null∥dummy; delete_devices empty∥ids;
+ *     PUT '' display_name∥DELETE; password-missing∥dummy.
+ *   key-backups — GET-session∥DELETE-session; PUT-room∥DELETE-session; auth_data:{}∥full;
+ *     GET version/:v∥DELETE version; empty-rooms PUT∥DELETE-all; devices∥keys isolation.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -2996,3 +3002,253 @@ describe('cross-module deepen isolation residual after #232', () => {
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// deepen residual after #241 (devices + key-backups only; report left alone)
+// ---------------------------------------------------------------------------
+
+describe('race devices empty-string∥right password DELETE residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`empty password∥right password DELETE #${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: `EP${i}` })] });
+      const path = `${DEVICES}/EP${i}`;
+      const [empty, right] = await Promise.all([
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: '' } })
+        ),
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: PASS } })
+        ),
+      ]);
+      expect([403, 404]).toContain(empty.status);
+      expect([200, 404, 403]).toContain(right.status);
+      expect(statusesOf([empty, right]).some((s) => s === 200 || s === 404)).toBe(true);
+    });
+  }
+});
+
+describe('race devices auth:null∥dummy DELETE residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`auth:null UIA∥dummy DELETE #${i}`, async () => {
+      const id = `AN${i}`;
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const path = `${DEVICES}/${id}`;
+      const [uia, del] = await Promise.all([
+        devicesReq(db, path, jsonInit('DELETE', { auth: null })),
+        devicesReq(db, path, jsonInit('DELETE', { auth: { type: 'm.login.dummy' } })),
+      ]);
+      expect([401, 200, 404]).toContain(uia.status);
+      expect([200, 404]).toContain(del.status);
+      expect(db.devices.find((d) => d.device_id === id)).toBeUndefined();
+    });
+  }
+});
+
+describe('race devices delete_devices empty∥ids residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`empty list∥delete target soft race #${i}`, async () => {
+      const id = `DE${i}`;
+      const db = createDevicesDb({
+        devices: [seedDevice({ device_id: id }), seedDevice({ device_id: OTHER_DEV })],
+      });
+      const [empty, del] = await Promise.all([
+        devicesReq(
+          db,
+          DELETE_DEVICES,
+          jsonInit('POST', { devices: [], auth: { type: 'm.login.dummy' } })
+        ),
+        devicesReq(
+          db,
+          DELETE_DEVICES,
+          jsonInit('POST', { devices: [id], auth: { type: 'm.login.dummy' } })
+        ),
+      ]);
+      expect(empty.status).toBe(200);
+      expect(del.status).toBe(200);
+      expect(db.devices.map((d) => d.device_id)).toEqual([OTHER_DEV]);
+    });
+  }
+});
+
+describe('race devices PUT empty-string display_name∥DELETE residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`PUT '' ∥ DELETE same device #${i}`, async () => {
+      const id = `ES${i}`;
+      const db = createDevicesDb({
+        devices: [seedDevice({ device_id: id, display_name: `was-${i}` })],
+      });
+      const path = `${DEVICES}/${id}`;
+      const [put, del] = await Promise.all([
+        devicesReq(db, path, jsonInit('PUT', { display_name: '' })),
+        devicesReq(db, path, jsonInit('DELETE', { auth: { type: 'm.login.dummy' } })),
+      ]);
+      expect([200, 404]).toContain(put.status);
+      expect([200, 404]).toContain(del.status);
+      expect(db.devices.find((d) => d.device_id === id)).toBeUndefined();
+    });
+  }
+});
+
+describe('race devices password-missing∥dummy DELETE residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`password type no field∥dummy DELETE #${i}`, async () => {
+      const id = `PM${i}`;
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const path = `${DEVICES}/${id}`;
+      const [missing, dummy] = await Promise.all([
+        devicesReq(db, path, jsonInit('DELETE', { auth: { type: 'm.login.password' } })),
+        devicesReq(db, path, jsonInit('DELETE', { auth: { type: 'm.login.dummy' } })),
+      ]);
+      expect([403, 404]).toContain(missing.status);
+      expect([200, 404]).toContain(dummy.status);
+      expect(db.devices.find((d) => d.device_id === id)).toBeUndefined();
+    });
+  }
+});
+
+describe('race key-backups GET-session∥DELETE-session residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`GET session∥DELETE session #${i}`, async () => {
+      const sid = `gs${i}`;
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 1 })],
+        keys: [
+          seedKey({
+            session_id: sid,
+            session_data: JSON.stringify({ ciphertext: `c-${i}` }),
+          }),
+        ],
+      });
+      const path = `${KEYS}/${ROOM_ENC}/${sid}?version=1`;
+      const [got, del] = await Promise.all([
+        keysReq(db, path, authInit('GET')),
+        keysReq(db, path, authInit('DELETE')),
+      ]);
+      expect([200, 404]).toContain(got.status);
+      expect(del.status).toBe(200);
+      expect(db.keys.find((k) => k.session_id === sid)).toBeUndefined();
+      expect((del.body as { count: number }).count).toBe(0);
+    });
+  }
+});
+
+describe('race key-backups PUT-room∥DELETE-session residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`PUT room refill∥DELETE session COUNT #${i}`, async () => {
+      const sid = SESSION;
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 1, etag: `old-${i}` })],
+        keys: [seedKey({ session_id: sid })],
+      });
+      const [put, del] = await Promise.all([
+        keysReq(
+          db,
+          `${KEYS}/${ROOM_ENC}?version=1`,
+          jsonInit('PUT', {
+            sessions: {
+              [sid]: sessionPayload(`room-${i}`),
+              [`extra-${i}`]: sessionPayload(`extra-${i}`),
+            },
+          })
+        ),
+        keysReq(db, `${KEYS}/${ROOM_ENC}/${sid}?version=1`, authInit('DELETE')),
+      ]);
+      expect(put.status).toBe(200);
+      expect(del.status).toBe(200);
+      // Final COUNT is coherent with remaining rows after both ops.
+      expect(db.versions[0].count).toBe(db.keys.length);
+      expect(db.versions[0].etag).not.toBe(`old-${i}`);
+    });
+  }
+});
+
+describe('race key-backups auth_data:{}∥full LWW residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`empty auth_data∥full auth_data LWW #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, auth_data: JSON.stringify(AUTH_DATA) })],
+      });
+      const full = { ...AUTH_DATA, public_key: `full-${i}` };
+      const [empty, filled] = await Promise.all([
+        keysReq(db, `${VERSION}/1`, jsonInit('PUT', { auth_data: {} })),
+        keysReq(db, `${VERSION}/1`, jsonInit('PUT', { auth_data: full })),
+      ]);
+      expect(empty.status).toBe(200);
+      expect(filled.status).toBe(200);
+      expect(['{}', JSON.stringify(full)]).toContain(db.versions[0].auth_data);
+    });
+  }
+});
+
+describe('race key-backups GET version/:v∥DELETE version residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`GET specific∥soft-delete version #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, etag: `v-${i}` })],
+        keys: [seedKey()],
+      });
+      const [got, del] = await Promise.all([
+        keysReq(db, `${VERSION}/1`, authInit('GET')),
+        keysReq(db, `${VERSION}/1`, authInit('DELETE')),
+      ]);
+      expect([200, 404]).toContain(got.status);
+      expect(del.status).toBe(200);
+      expect(db.versions[0].deleted).toBe(1);
+      expect(db.keys).toHaveLength(0);
+      if (got.status === 200) {
+        expect((got.body as { version: string }).version).toBe('1');
+      }
+    });
+  }
+});
+
+describe('race key-backups empty-rooms PUT∥DELETE-all residual after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`empty rooms PUT∥DELETE all keys #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 1, etag: `er-${i}` })],
+        keys: [seedKey({ session_id: `k${i}` })],
+      });
+      const [put, del] = await Promise.all([
+        keysReq(db, `${KEYS}?version=1`, jsonInit('PUT', { rooms: {} })),
+        keysReq(db, `${KEYS}?version=1`, authInit('DELETE')),
+      ]);
+      expect(put.status).toBe(200);
+      expect(del.status).toBe(200);
+      expect(db.keys).toHaveLength(0);
+      expect(db.versions[0].count).toBe(0);
+      expect(db.versions[0].etag).not.toBe(`er-${i}`);
+    });
+  }
+});
+
+describe('cross-module devices∥key-backups isolation residual after #241', () => {
+  for (let i = 0; i < 6; i++) {
+    it(`devices DELETE + keys DELETE-session isolation #${i}`, async () => {
+      const devicesDb = createDevicesDb({
+        devices: [seedDevice({ device_id: `XD${i}` })],
+      });
+      const keysDb = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 1 })],
+        keys: [seedKey({ session_id: `xs${i}` })],
+      });
+      const [d, k] = await Promise.all([
+        devicesReq(
+          devicesDb,
+          `${DEVICES}/XD${i}`,
+          jsonInit('DELETE', { auth: { type: 'm.login.dummy' } })
+        ),
+        keysReq(keysDb, `${KEYS}/${ROOM_ENC}/xs${i}?version=1`, authInit('DELETE')),
+      ]);
+      expect(d.status).toBe(200);
+      expect(k.status).toBe(200);
+      expect(devicesDb.devices).toHaveLength(0);
+      expect(keysDb.keys).toHaveLength(0);
+      expect(keysDb.versions[0].count).toBe(0);
+    });
+  }
+});
