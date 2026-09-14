@@ -271,3 +271,117 @@ describe('validateEventSize TOKENMAXX residual leftovers after #264', () => {
     }
   });
 });
+
+describe('validateEventSize TOKENMAXX residual leftovers after #272', () => {
+  it('concurrent hard-cap rejects stay independent MatrixApiError instances', async () => {
+    const a = baseEvent({ body: 'ok-a' });
+    const b = baseEvent({ body: 'ok-b' });
+    a.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-a-${i}:example.com`);
+    b.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-b-${i}:example.com`);
+    const beforeA = JSON.stringify(a);
+    const beforeB = JSON.stringify(b);
+    const lenA = JSON.stringify(a).length;
+    const lenB = JSON.stringify(b).length;
+    expect(JSON.stringify(a.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(b.content).length).toBeLessThanOrEqual(65_536);
+    expect(lenA).toBeGreaterThan(921_600);
+    expect(lenB).toBeGreaterThan(921_600);
+    const [ra, rb] = await Promise.all([
+      Promise.resolve().then(() => {
+        try {
+          validateEventSize(a);
+          return null;
+        } catch (err) {
+          return err as MatrixApiError;
+        }
+      }),
+      Promise.resolve().then(() => {
+        try {
+          validateEventSize(b);
+          return null;
+        } catch (err) {
+          return err as MatrixApiError;
+        }
+      }),
+    ]);
+    expect(ra).toBeInstanceOf(MatrixApiError);
+    expect(rb).toBeInstanceOf(MatrixApiError);
+    expect(ra).not.toBe(rb);
+    expect(ra!.errcode).toBe('M_TOO_LARGE');
+    expect(rb!.status).toBe(413);
+    expect(ra!.message).toMatch(/D1 row limit/);
+    expect(rb!.message).toMatch(/D1 row limit/);
+    expect(ra!.message).toMatch(new RegExp(String(lenA)));
+    expect(rb!.message).toMatch(new RegExp(String(lenB)));
+    expect(JSON.stringify(a)).toBe(beforeA);
+    expect(JSON.stringify(b)).toBe(beforeB);
+  });
+
+  it('concurrent hard-cap ok + hard-cap reject: ok succeeds, reject throws, neither mutates', async () => {
+    const ok = baseEvent({ body: 'boundary-ok' });
+    // Inflate just under the hard cap via prev_events padding
+    ok.prev_events = Array.from({ length: 35_000 }, (_, i) => `$p-${i}:example.com`);
+    while (JSON.stringify(ok).length > 921_600) {
+      ok.prev_events.pop();
+    }
+    expect(JSON.stringify(ok).length).toBeLessThanOrEqual(921_600);
+    expect(JSON.stringify(ok.content).length).toBeLessThanOrEqual(65_536);
+
+    const bad = baseEvent({ body: 'boundary-bad' });
+    bad.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    expect(JSON.stringify(bad.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(bad).length).toBeGreaterThan(921_600);
+
+    const beforeOk = JSON.stringify(ok);
+    const beforeBad = JSON.stringify(bad);
+    const [okResult, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(ok);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(bad);
+        return 'bad';
+      }),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      expect(badResult.reason).toBeInstanceOf(MatrixApiError);
+      expect((badResult.reason as MatrixApiError).message).toMatch(/D1 row limit/);
+    }
+    expect(JSON.stringify(ok)).toBe(beforeOk);
+    expect(JSON.stringify(bad)).toBe(beforeBad);
+  });
+
+  it('soft-cap exact boundary concurrent with soft-reject embeds observed length', async () => {
+    const overhead = JSON.stringify({ body: '' }).length;
+    const ok = baseEvent({ body: 'y'.repeat(65_536 - overhead) });
+    const bad = baseEvent({ body: 'z'.repeat(65_536 - overhead + 1) });
+    expect(JSON.stringify(ok.content).length).toBe(65_536);
+    expect(JSON.stringify(bad.content).length).toBe(65_537);
+    const beforeOk = JSON.stringify(ok);
+    const beforeBad = JSON.stringify(bad);
+    const contentLen = JSON.stringify(bad.content).length;
+    const [okResult, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(ok);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(bad);
+        return 'bad';
+      }),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      const e = badResult.reason as MatrixApiError;
+      expect(e.message).toMatch(/content exceeds/);
+      expect(e.message).toMatch(/65536/);
+      expect(e.message).toMatch(new RegExp(String(contentLen)));
+    }
+    expect(JSON.stringify(ok)).toBe(beforeOk);
+    expect(JSON.stringify(bad)).toBe(beforeBad);
+  });
+});

@@ -966,3 +966,137 @@ describe('federation signing TOKENMAXX residual leftovers after #264', () => {
     ).not.toBe((s2.signatures as Record<string, Record<string, string>>)['ex.com'][keyId]);
   });
 });
+
+describe('crypto TOKENMAXX residual leftovers after #272', () => {
+  it('concurrent verifyPassword pins iteration-reject console.error messages', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const [lo, hi] = await Promise.all([
+      verifyPassword('password1', '$pbkdf2-sha256$99999$c2FsdA==$aGFzaA=='),
+      verifyPassword('password1', '$pbkdf2-sha256$2000001$c2FsdA==$aGFzaA=='),
+    ]);
+    expect(lo).toBe(false);
+    expect(hi).toBe(false);
+    expect(spy).toHaveBeenCalledTimes(2);
+    const messages = spy.mock.calls.map((c) => String(c[0]));
+    expect(messages.some((m) => m.includes('invalid iteration count: 99999'))).toBe(true);
+    expect(messages.some((m) => m.includes('invalid iteration count: 2000001'))).toBe(true);
+    expect(messages.every((m) => m.startsWith('[crypto] Rejecting stored hash with invalid iteration count:'))).toBe(
+      true
+    );
+    spy.mockRestore();
+  });
+
+  it('calculateContentHash concurrent strip leaves signatures/unsigned maps intact', async () => {
+    const a: Record<string, unknown> = {
+      type: 'm.test',
+      content: { n: 1 },
+      signatures: { 'a.example.com': { 'ed25519:1': 'sig-a' } },
+      unsigned: { age: 1 },
+    };
+    const b: Record<string, unknown> = {
+      type: 'm.test',
+      content: { n: 2 },
+      signatures: { 'b.example.com': { 'ed25519:1': 'sig-b' } },
+      unsigned: { age: 2 },
+    };
+    const beforeA = JSON.stringify(a);
+    const beforeB = JSON.stringify(b);
+    const [ha, hb] = await Promise.all([calculateContentHash(a), calculateContentHash(b)]);
+    expect(ha).not.toBe(hb);
+    const [okA, badCross, okB] = await Promise.all([
+      verifyContentHash(a, ha),
+      verifyContentHash(b, ha),
+      verifyContentHash(b, hb),
+    ]);
+    expect(okA).toBe(true);
+    expect(badCross).toBe(false);
+    expect(okB).toBe(true);
+    expect(JSON.stringify(a)).toBe(beforeA);
+    expect(JSON.stringify(b)).toBe(beforeB);
+  });
+});
+
+describe('federation signing TOKENMAXX residual leftovers after #272', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('concurrent verifySignature catch paths log independently of a valid verify', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test', content: { n: 1 } }, 'ex.com', keyId, privateKeyJwk);
+    const garbageKey = '!!!not-valid-base64url!!!';
+    const truncated = {
+      ...signed,
+      signatures: {
+        'ex.com': {
+          [keyId]: 'AA',
+        },
+      },
+    };
+    const [ok, badKey, badSig] = await Promise.all([
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'ex.com', keyId, garbageKey),
+      verifySignature(truncated, 'ex.com', keyId, publicKey),
+    ]);
+    expect(ok).toBe(true);
+    expect(badKey).toBe(false);
+    expect(badSig).toBe(false);
+    expect(spy.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(
+      spy.mock.calls.every((c) => String(c[0]) === 'Signature verification failed:')
+    ).toBe(true);
+    spy.mockRestore();
+  });
+
+  it('concurrent dual-keyId signJson from a shared signed base merges without clobber', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const once = await signJson({ type: 'm.test', content: { n: 0 } }, 'ex.com', a.keyId, a.privateKeyJwk);
+    const [signedA, signedB] = await Promise.all([
+      signJson(once, 'ex.com', a.keyId, a.privateKeyJwk),
+      signJson(once, 'ex.com', b.keyId, b.privateKeyJwk),
+    ]);
+    // Merge both independent results the way a caller would combine concurrent keyIds
+    const merged = {
+      ...once,
+      signatures: {
+        'ex.com': {
+          ...(signedA.signatures as Record<string, Record<string, string>>)['ex.com'],
+          ...(signedB.signatures as Record<string, Record<string, string>>)['ex.com'],
+        },
+      },
+    };
+    expect(Object.keys((merged.signatures as Record<string, Record<string, string>>)['ex.com']).sort()).toEqual(
+      [a.keyId, b.keyId].sort()
+    );
+    expect(await verifySignature(merged, 'ex.com', a.keyId, a.publicKey)).toBe(true);
+    expect(await verifySignature(merged, 'ex.com', b.keyId, b.publicKey)).toBe(true);
+  });
+
+  it('concurrent generateSigningKeyPairLegacy pairs sign/verify in isolation', async () => {
+    const [legacyA, legacyB] = await Promise.all([
+      generateSigningKeyPairLegacy(),
+      generateSigningKeyPairLegacy(),
+    ]);
+    expect(legacyA.keyId).not.toBe(legacyB.keyId);
+    const [signedA, signedB] = await Promise.all([
+      signJson({ type: 'm.test', content: { side: 'a' } }, 'a.example.com', legacyA.keyId, legacyA.privateKey),
+      signJson({ type: 'm.test', content: { side: 'b' } }, 'b.example.com', legacyB.keyId, legacyB.privateKey),
+    ]);
+    const [okA, okB, badCross] = await Promise.all([
+      verifySignature(signedA, 'a.example.com', legacyA.keyId, legacyA.publicKey),
+      verifySignature(signedB, 'b.example.com', legacyB.keyId, legacyB.publicKey),
+      verifySignature(signedA, 'a.example.com', legacyA.keyId, legacyB.publicKey),
+    ]);
+    expect(okA).toBe(true);
+    expect(okB).toBe(true);
+    expect(badCross).toBe(false);
+  });
+});
