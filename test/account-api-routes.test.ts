@@ -1,7 +1,7 @@
 /**
  * TOKENMAXX HEAVY deepen — account management API routes only (src/api/account.ts).
- * Avoids keys (#99), key-backups, search, oauth, and PR #100 devices/aliases/relations/tags/profile.
- * Tests-only — no product inventing.
+ * Soft-cap leftovers after #128 (push) / #132 (login). Avoids devices/federation/sliding-sync/
+ * sync/voip/rooms/oidc/media/relations. Tests-only — no product inventing.
  * Exercises password UIA, deactivate, 3PIDs, email/msisdn stubs, registration token, OpenID.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -2553,5 +2553,657 @@ describe('account TOKENMAXX empty-string + truthiness edges after #103', () => {
       expires_in: 3600,
     });
     expect(cache.puts.length).toBe(1);
+  });
+});
+
+// =============================================================================
+// TOKENMAXX HEAVY leftovers after #128/#132 — account soft-cap deepen
+// =============================================================================
+
+describe('account password — SQL bind + logout_devices leftovers', () => {
+  it('UPDATE binds [newHash, userId] and DELETE tokens when logout_devices omitted', async () => {
+    const db = createAccountDb();
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/password',
+      jsonInit('POST', { new_password: STRONG_PW, auth: passwordAuth() })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+    const upd = db.updates.find((u) => u.sql.includes('password_hash'));
+    expect(upd?.args).toEqual([`hashed:${STRONG_PW}`, USER]);
+    expect(db.deletes.some((d) => d.sql.includes('access_tokens') && d.args[0] === USER)).toBe(
+      true
+    );
+  });
+
+  it('logout_devices:0 is falsy → tokens retained', async () => {
+    const db = createAccountDb();
+    const before = db.tokens.length;
+    db.tokens.push({ token_hash: 'keep', user_id: USER, device_id: DEVICE });
+    const env = createEnv({ db });
+    await request(
+      env,
+      '/_matrix/client/v3/account/password',
+      jsonInit('POST', {
+        new_password: STRONG_PW,
+        logout_devices: 0 as unknown as boolean,
+        auth: passwordAuth(),
+      })
+    );
+    expect(db.tokens.length).toBe(before + 1);
+    expect(db.tokens.some((t) => t.token_hash === 'keep')).toBe(true);
+  });
+
+  it('rejects new_password:null / false / 0 as missing', async () => {
+    const env = createEnv();
+    for (const new_password of [null, false, 0]) {
+      const res = await request(
+        env,
+        '/_matrix/client/v3/account/password',
+        jsonInit('POST', { new_password, auth: passwordAuth() })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+    }
+  });
+
+  it('UIA challenge shape is flows/params/session only', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/password',
+      jsonInit('POST', { new_password: STRONG_PW })
+    );
+    expect(res.status).toBe(401);
+    expect(Object.keys(res.body as object).sort()).toEqual(['flows', 'params', 'session']);
+    expect(res.body).toEqual({
+      flows: [{ stages: ['m.login.password'] }],
+      params: {},
+      session: 'pinned-uia-session-16',
+    });
+  });
+
+  it('password email stub ignores body and always M_THREEPID_NOT_FOUND', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/password/email/requestToken',
+      jsonInit('POST', {
+        email: 'x@y.z',
+        client_secret: 'sec',
+        send_attempt: 99,
+      })
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      errcode: 'M_THREEPID_NOT_FOUND',
+      error: 'Email-based password reset is not supported',
+    });
+  });
+});
+
+describe('account deactivate — erase membership + bind leftovers', () => {
+  it('without erase does not touch display_name/avatar or memberships', async () => {
+    const db = createAccountDb({
+      memberships: [{ room_id: '!r:example.com', user_id: USER, membership: 'join' }],
+    });
+    // seed profile fields
+    const user = db.users.get(USER)!;
+    user.display_name = 'Alice';
+    user.avatar_url = 'mxc://example.com/a';
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/deactivate',
+      jsonInit('POST', { auth: passwordAuth() })
+    );
+    expect(res.body).toEqual({ id_server_unbind_result: 'no-support' });
+    expect(db.users.get(USER)?.is_deactivated).toBe(1);
+    expect(db.users.get(USER)?.display_name).toBe('Alice');
+    expect(db.memberships[0].membership).toBe('join');
+  });
+
+  it('erase leaves invite/ban memberships untouched (only join→leave)', async () => {
+    const db = createAccountDb({
+      memberships: [
+        { room_id: '!a:example.com', user_id: USER, membership: 'join' },
+        { room_id: '!b:example.com', user_id: USER, membership: 'invite' },
+        { room_id: '!c:example.com', user_id: USER, membership: 'ban' },
+        { room_id: '!d:example.com', user_id: BOB, membership: 'join' },
+      ],
+    });
+    const env = createEnv({ db });
+    await request(
+      env,
+      '/_matrix/client/v3/account/deactivate',
+      jsonInit('POST', { erase: true, auth: passwordAuth() })
+    );
+    expect(db.memberships.find((m) => m.room_id === '!a:example.com')?.membership).toBe('leave');
+    expect(db.memberships.find((m) => m.room_id === '!b:example.com')?.membership).toBe('invite');
+    expect(db.memberships.find((m) => m.room_id === '!c:example.com')?.membership).toBe('ban');
+    expect(db.memberships.find((m) => m.room_id === '!d:example.com')?.membership).toBe('join');
+  });
+
+  it('erase:0 is falsy → no profile wipe', async () => {
+    const db = createAccountDb();
+    db.users.get(USER)!.display_name = 'Keep';
+    const env = createEnv({ db });
+    await request(
+      env,
+      '/_matrix/client/v3/account/deactivate',
+      jsonInit('POST', { erase: 0 as unknown as boolean, auth: passwordAuth() })
+    );
+    expect(db.users.get(USER)?.display_name).toBe('Keep');
+  });
+
+  it('deactivate UPDATE is_deactivated bind is [userId]', async () => {
+    const db = createAccountDb();
+    const env = createEnv({ db });
+    await request(
+      env,
+      '/_matrix/client/v3/account/deactivate',
+      jsonInit('POST', { auth: passwordAuth() })
+    );
+    const upd = db.updates.find((u) => u.sql.includes('is_deactivated'));
+    expect(upd?.args).toEqual([USER]);
+  });
+
+  it('skips password verify when stored hash exists but auth.password empty string', async () => {
+    // `storedHash && auth.password` — empty string is falsy → skip verify
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/deactivate',
+      jsonInit('POST', { auth: { type: 'm.login.password', password: '' } })
+    );
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('account 3pid — list/add/delete bind leftovers', () => {
+  it('GET 3pid maps validated_at/added_at without extra fields', async () => {
+    const db = createAccountDb({
+      threepids: [
+        {
+          user_id: USER,
+          medium: 'email',
+          address: 'a@example.com',
+          validated_at: 111,
+          added_at: 222,
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const res = await request(env, '/_matrix/client/v3/account/3pid');
+    expect(res.body).toEqual({
+      threepids: [
+        { medium: 'email', address: 'a@example.com', validated_at: 111, added_at: 222 },
+      ],
+    });
+  });
+
+  it('GET 3pid excludes other users rows', async () => {
+    const db = createAccountDb({
+      threepids: [
+        {
+          user_id: BOB,
+          medium: 'email',
+          address: 'bob@example.com',
+          validated_at: 1,
+          added_at: 1,
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const res = await request(env, '/_matrix/client/v3/account/3pid');
+    expect(res.body).toEqual({ threepids: [] });
+  });
+
+  it('add 3pid INSERT OR REPLACE binds user/email/now/now and deletes session', async () => {
+    const db = createAccountDb();
+    emailMocks.getValidatedSession.mockResolvedValueOnce({ email: 'new@example.com' });
+    const env = createEnv({ db });
+    const before = Date.now();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/add',
+      jsonInit('POST', {
+        client_secret: 'sec',
+        sid: 'sid-1',
+        auth: { type: 'm.login.password' },
+      })
+    );
+    const after = Date.now();
+    expect(res.status).toBe(200);
+    const ins = db.inserts.find((i) => i.sql.includes('user_threepids'));
+    expect(ins?.args[0]).toBe(USER);
+    expect(ins?.args[1]).toBe('new@example.com');
+    expect(ins?.args[2]).toBeGreaterThanOrEqual(before);
+    expect(ins?.args[2]).toBeLessThanOrEqual(after);
+    expect(ins?.args[3]).toBe(ins?.args[2]);
+    expect(db.deletes.some((d) => d.args[0] === 'sid-1')).toBe(true);
+  });
+
+  it('add 3pid UIA requires m.login.password specifically', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/add',
+      jsonInit('POST', {
+        client_secret: 'sec',
+        sid: 'sid',
+        auth: { type: 'm.login.dummy' },
+      })
+    );
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({
+      flows: [{ stages: ['m.login.password'] }],
+    });
+  });
+
+  it('delete 3pid binds [userId, medium, address]', async () => {
+    const db = createAccountDb({
+      threepids: [
+        {
+          user_id: USER,
+          medium: 'email',
+          address: 'del@example.com',
+          validated_at: 1,
+          added_at: 1,
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/delete',
+      jsonInit('POST', { medium: 'email', address: 'del@example.com' })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ id_server_unbind_result: 'no-support' });
+    const del = db.deletes.find((d) => d.sql.includes('user_threepids'));
+    expect(del?.args).toEqual([USER, 'email', 'del@example.com']);
+  });
+
+  it('delete rejects empty medium/address strings', async () => {
+    const env = createEnv();
+    for (const body of [
+      { medium: '', address: 'a@b.c' },
+      { medium: 'email', address: '' },
+    ]) {
+      const res = await request(
+        env,
+        '/_matrix/client/v3/account/3pid/delete',
+        jsonInit('POST', body)
+      );
+      expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+    }
+  });
+
+  it('bind and unbind stubs are stable errcode/body', async () => {
+    const env = createEnv();
+    const bind = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/bind',
+      jsonInit('POST', {})
+    );
+    expect(bind.status).toBe(400);
+    expect(bind.body).toEqual({
+      errcode: 'M_THREEPID_AUTH_FAILED',
+      error: 'Identity server binding is not supported',
+    });
+    const unbind = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/unbind',
+      jsonInit('POST', {})
+    );
+    expect(unbind.status).toBe(200);
+    expect(unbind.body).toEqual({ id_server_unbind_result: 'no-support' });
+  });
+});
+
+describe('account email requestToken / submit_token leftovers', () => {
+  it('send_attempt:null is defined (not undefined) so request proceeds', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', {
+        client_secret: 'sec',
+        email: 'ok@example.com',
+        send_attempt: null,
+      })
+    );
+    // Handler checks `send_attempt === undefined` only — null is considered present.
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ sid: 'sid-new' });
+  });
+
+  it('accepts send_attempt:0 (defined) and creates session', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', {
+        client_secret: 'sec',
+        email: 'zero@example.com',
+        send_attempt: 0,
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ sid: 'sid-new' });
+    expect(emailMocks.createVerificationSession).toHaveBeenCalled();
+  });
+
+  it('email format rejects spaces and missing domain', async () => {
+    const env = createEnv();
+    for (const email of ['a @b.c', 'nodomain@', '@nodomain.com', 'plain']) {
+      const res = await request(
+        env,
+        '/_matrix/client/v3/account/3pid/email/requestToken',
+        jsonInit('POST', { client_secret: 's', email, send_attempt: 1 })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ errcode: 'M_INVALID_EMAIL' });
+    }
+  });
+
+  it('on email send failure deletes session and returns 500 M_THREEPID_DENIED', async () => {
+    emailMocks.sendVerificationEmail.mockResolvedValueOnce({
+      success: false,
+      error: 'smtp down',
+    });
+    emailMocks.createVerificationSession.mockResolvedValueOnce({
+      sessionId: 'sid-fail',
+      token: '999999',
+    });
+    const db = createAccountDb();
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', {
+        client_secret: 'sec',
+        email: 'fail@example.com',
+        send_attempt: 1,
+      })
+    );
+    expect(res.status).toBe(500);
+    expect(res.body).toMatchObject({
+      errcode: 'M_THREEPID_DENIED',
+      error: 'smtp down',
+    });
+    expect(db.deletes.some((d) => d.args[0] === 'sid-fail')).toBe(true);
+  });
+
+  it('POST submit_token success body is { success: true }', async () => {
+    emailMocks.validateEmailToken.mockResolvedValueOnce({ success: true });
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/submit_token',
+      jsonInit('POST', { sid: 's', client_secret: 'c', token: '123456' })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+  });
+
+  it('GET submit_token failure surfaces M_THREEPID_AUTH_FAILED', async () => {
+    emailMocks.validateEmailToken.mockResolvedValueOnce({
+      success: false,
+      error: 'bad code',
+    });
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/submit_token?sid=s&client_secret=c&token=bad'
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      errcode: 'M_THREEPID_AUTH_FAILED',
+      error: 'bad code',
+    });
+  });
+
+  it('msisdn 3pid requestToken is 403 M_THREEPID_DENIED', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/msisdn/requestToken',
+      jsonInit('POST', { client_secret: 's', phone: '+1', country: 'US', send_attempt: 1 })
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({
+      errcode: 'M_THREEPID_DENIED',
+      error: 'Phone verification is not supported',
+    });
+  });
+});
+
+describe('account registration_token + openid leftovers', () => {
+  it('registration token validity always { valid: false } for any non-empty token', async () => {
+    const env = createEnv();
+    for (const token of ['abc', '0', 'token with spaces', '🔐']) {
+      const res = await request(
+        env,
+        `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent(token)}`
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ valid: false });
+    }
+  });
+
+  it('openid forbids other user even when URL-encoded', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      `/_matrix/client/v3/user/${encodeURIComponent(BOB)}/openid/request_token`,
+      jsonInit('POST', {})
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('openid stores CACHE key openid_token:* with expirationTtl 3600', async () => {
+    const cache = mockKv();
+    const env = createEnv({ cacheKv: cache });
+    const before = Date.now();
+    const res = await request(
+      env,
+      `/_matrix/client/v3/user/${encodeURIComponent(USER)}/openid/request_token`,
+      jsonInit('POST', {})
+    );
+    expect(res.status).toBe(200);
+    const body = res.body as {
+      access_token: string;
+      token_type: string;
+      matrix_server_name: string;
+      expires_in: number;
+    };
+    expect(body.token_type).toBe('Bearer');
+    expect(body.matrix_server_name).toBe(SERVER);
+    expect(body.expires_in).toBe(3600);
+    expect(body.access_token).not.toMatch(/[+/=]/);
+    expect(cache.puts[0].key).toBe(`openid_token:${body.access_token}`);
+    expect(cache.puts[0].options?.expirationTtl).toBe(3600);
+    const stored = JSON.parse(cache.puts[0].value) as {
+      user_id: string;
+      created_at: number;
+      expires_at: number;
+    };
+    expect(stored.user_id).toBe(USER);
+    expect(stored.created_at).toBeGreaterThanOrEqual(before);
+    expect(stored.expires_at).toBe(stored.created_at + 3_600_000);
+  });
+
+  it('openid successive calls mint distinct tokens', async () => {
+    const cache = mockKv();
+    const env = createEnv({ cacheKv: cache });
+    const a = await request(
+      env,
+      `/_matrix/client/v3/user/${encodeURIComponent(USER)}/openid/request_token`,
+      jsonInit('POST', {})
+    );
+    const b = await request(
+      env,
+      `/_matrix/client/v3/user/${encodeURIComponent(USER)}/openid/request_token`,
+      jsonInit('POST', {})
+    );
+    expect((a.body as { access_token: string }).access_token).not.toBe(
+      (b.body as { access_token: string }).access_token
+    );
+    expect(cache.puts).toHaveLength(2);
+  });
+});
+
+describe('account TOKENMAXX soft-cap lifecycles', () => {
+  it('password change → deactivate erase lifecycle', async () => {
+    const db = createAccountDb({
+      memberships: [{ room_id: '!x:example.com', user_id: USER, membership: 'join' }],
+      tokens: [
+        { token_hash: 't1', user_id: USER, device_id: DEVICE },
+        { token_hash: 't2', user_id: USER, device_id: 'OTHER' },
+      ],
+    });
+    db.users.get(USER)!.display_name = 'Alice';
+    const env = createEnv({ db });
+
+    const pw = await request(
+      env,
+      '/_matrix/client/v3/account/password',
+      jsonInit('POST', {
+        new_password: STRONG_PW,
+        logout_devices: false,
+        auth: passwordAuth(),
+      })
+    );
+    expect(pw.status).toBe(200);
+    expect(db.tokens).toHaveLength(2);
+
+    // password hash changed — update mock so deactivate can still verify with CURRENT_PW?
+    // deactivate uses getPasswordHash + verifyPassword(auth.password, storedHash)
+    // storedHash is now hashed:STRONG_PW; verifyPassword mock checks mockok:password
+    // so deactivate with CURRENT_PW would fail. Use auth without password (skip verify)
+    // OR reset hash. Reset hash for deactivate path:
+    db.users.get(USER)!.password_hash = `mockok:${CURRENT_PW}`;
+
+    const deact = await request(
+      env,
+      '/_matrix/client/v3/account/deactivate',
+      jsonInit('POST', { erase: true, auth: passwordAuth() })
+    );
+    expect(deact.status).toBe(200);
+    expect(db.users.get(USER)?.is_deactivated).toBe(1);
+    expect(db.users.get(USER)?.display_name).toBeNull();
+    expect(db.memberships[0].membership).toBe('leave');
+    expect(db.tokens).toHaveLength(0);
+  });
+
+  it('email requestToken → submit_token → add 3pid → list → delete', async () => {
+    const db = createAccountDb();
+    const env = createEnv({ db });
+
+    emailMocks.createVerificationSession.mockResolvedValueOnce({
+      sessionId: 'sid-flow',
+      token: '111222',
+    });
+    const reqTok = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/email/requestToken',
+      jsonInit('POST', {
+        client_secret: 'flow-sec',
+        email: 'flow@example.com',
+        send_attempt: 1,
+      })
+    );
+    expect(reqTok.body).toEqual({ sid: 'sid-flow' });
+
+    emailMocks.validateEmailToken.mockResolvedValueOnce({ success: true });
+    const submit = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/submit_token',
+      jsonInit('POST', {
+        sid: 'sid-flow',
+        client_secret: 'flow-sec',
+        token: '111222',
+      })
+    );
+    expect(submit.body).toEqual({ success: true });
+
+    emailMocks.getValidatedSession.mockResolvedValueOnce({ email: 'flow@example.com' });
+    const add = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/add',
+      jsonInit('POST', {
+        client_secret: 'flow-sec',
+        sid: 'sid-flow',
+        auth: { type: 'm.login.password' },
+      })
+    );
+    expect(add.status).toBe(200);
+
+    const list = await request(env, '/_matrix/client/v3/account/3pid');
+    expect((list.body as { threepids: Array<{ address: string }> }).threepids.map((t) => t.address)).toContain(
+      'flow@example.com'
+    );
+
+    const del = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/delete',
+      jsonInit('POST', { medium: 'email', address: 'flow@example.com' })
+    );
+    expect(del.status).toBe(200);
+    const list2 = await request(env, '/_matrix/client/v3/account/3pid');
+    expect(list2.body).toEqual({ threepids: [] });
+  });
+
+  it('errcode vocabulary leftovers across account stubs', async () => {
+    const env = createEnv();
+    const cases: Array<{ path: string; init: RequestInit; code: string }> = [
+      {
+        path: '/_matrix/client/v3/account/password',
+        init: {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+          body: '{',
+        },
+        code: 'M_BAD_JSON',
+      },
+      {
+        path: '/_matrix/client/v3/account/password',
+        init: jsonInit('POST', { auth: passwordAuth() }),
+        code: 'M_MISSING_PARAM',
+      },
+      {
+        path: '/_matrix/client/v3/account/3pid/email/requestToken',
+        init: jsonInit('POST', {
+          client_secret: 's',
+          email: 'bad',
+          send_attempt: 1,
+        }),
+        code: 'M_INVALID_EMAIL',
+      },
+      {
+        path: '/_matrix/client/v3/account/3pid/msisdn/requestToken',
+        init: jsonInit('POST', {}),
+        code: 'M_THREEPID_DENIED',
+      },
+      {
+        path: '/_matrix/client/v3/account/password/email/requestToken',
+        init: jsonInit('POST', {}),
+        code: 'M_THREEPID_NOT_FOUND',
+      },
+      {
+        path: `/_matrix/client/v3/user/${encodeURIComponent(BOB)}/openid/request_token`,
+        init: jsonInit('POST', {}),
+        code: 'M_FORBIDDEN',
+      },
+    ];
+    for (const c of cases) {
+      const res = await request(env, c.path, c.init);
+      expect(res.body).toMatchObject({ errcode: c.code });
+    }
   });
 });
