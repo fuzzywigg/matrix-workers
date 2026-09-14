@@ -1056,3 +1056,145 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #241', () => {
     ]);
   });
 });
+
+describe('notify / auth-chain / servers TOKENMAXX residual leftovers after #252', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('getAuthChain with only-missing seed ids returns an empty chain', async () => {
+    const events = new Map<string, PDU>([['$known', pdu('$known', [])]]);
+    const chain = await getAuthChain(createAuthChainDb(events), ['$missing', '$also-missing']);
+    expect(chain).toEqual([]);
+  });
+
+  it('getAuthChain seed of missing tip with known auth child still yields empty (tip never loaded)', async () => {
+    // Tip id is marked seen but getEventsByIds returns nothing for it — auth children never enqueued
+    const events = new Map<string, PDU>([['$child', pdu('$child', [])]]);
+    const chain = await getAuthChain(createAuthChainDb(events), ['$ghost']);
+    expect(chain).toEqual([]);
+  });
+
+  it('getStateAtEvent includes auth events whose state_key is the empty string', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$leaf',
+        pdu('$leaf', ['$create'], {
+          type: 'm.room.member',
+          state_key: '@u:ex.com',
+          content: { membership: 'join' },
+        }),
+      ],
+      [
+        '$create',
+        pdu('$create', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:ex.com' },
+        }),
+      ],
+    ]);
+    const state = await getStateAtEvent(createAuthChainDb(events), '$leaf');
+    expect(state).toHaveLength(1);
+    expect(state[0].event_id).toBe('$create');
+    expect(state[0].state_key).toBe('');
+  });
+
+  it('getStateAtEvent with empty auth_events returns []', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$solo',
+        pdu('$solo', [], {
+          type: 'm.room.message',
+          content: { body: 'x' },
+        }),
+      ],
+    ]);
+    // Delete state_key so the leaf itself would not qualify even if included
+    delete (events.get('$solo') as { state_key?: string }).state_key;
+    await expect(getStateAtEvent(createAuthChainDb(events), '$solo')).resolves.toEqual([]);
+  });
+
+  it('notifyUsersOfEvent resolves when every Sync DO fails', async () => {
+    const env = {
+      notifies: [] as { userId: string; body: unknown }[],
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(..._args: unknown[]) {
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    return {
+                      results: [{ user_id: '@a:example.com' }, { user_id: '@b:example.com' }] as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: () => ({
+          async fetch() {
+            throw new Error('all down');
+          },
+        }),
+      },
+    } as any;
+    await expect(
+      notifyUsersOfEvent(env, '!r:example.com', '$e', 'm.room.message')
+    ).resolves.toBeUndefined();
+    expect(env.notifies).toHaveLength(0);
+    expect(console.error).toHaveBeenCalledTimes(2);
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @a:example.com of event:',
+      expect.any(Error)
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @b:example.com of event:',
+      expect.any(Error)
+    );
+  });
+
+  it('getServersInRoomsWithUser binds the userId twice (self-join filter)', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare() {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            return {
+              async all<T>() {
+                return { results: [{ server_name: 'peer.example.com' }] as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    await expect(getServersInRoomsWithUser(db, '@alice:example.com')).resolves.toEqual([
+      'peer.example.com',
+    ]);
+    expect(binds).toEqual([['@alice:example.com', '@alice:example.com']]);
+  });
+
+  it('getAuthChain does not re-enqueue auth ids already present in the seed batch', async () => {
+    const events = new Map<string, PDU>([
+      ['$a', pdu('$a', ['$b'])],
+      ['$b', pdu('$b', [])],
+    ]);
+    // Seed both tip and its auth child — child must appear once
+    const chain = await getAuthChain(createAuthChainDb(events), ['$a', '$b']);
+    expect(chain.map((e) => e.event_id).sort()).toEqual(['$a', '$b']);
+    expect(new Set(chain.map((e) => e.event_id)).size).toBe(2);
+  });
+});

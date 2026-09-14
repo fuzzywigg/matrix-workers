@@ -425,3 +425,53 @@ describe('errors TOKENMAXX leftovers after #241', () => {
     spy.mockRestore();
   });
 });
+
+describe('errors TOKENMAXX residual leftovers after #252', () => {
+  it('toJSON omits retry_after_ms when retryAfterMs is undefined', () => {
+    const err = new MatrixApiError(ErrorCodes.M_FORBIDDEN, 'nope', 403);
+    expect(err.toJSON()).toEqual({ errcode: 'M_FORBIDDEN', error: 'nope' });
+    expect(err.toJSON()).not.toHaveProperty('retry_after_ms');
+  });
+
+  it('conflict factory pins 409 / M_CONFLICT with custom message', () => {
+    const err = Errors.conflict('race');
+    expect(err.status).toBe(409);
+    expect(err.errcode).toBe(ErrorCodes.M_CONFLICT);
+    expect(err.message).toBe('race');
+    expect(err.toJSON()).toEqual({ errcode: 'M_CONFLICT', error: 'race' });
+  });
+
+  it('withErrorHandler passes through non-Response success values', async () => {
+    await expect(withErrorHandler(async () => ({ ok: true }))).resolves.toEqual({ ok: true });
+    await expect(withErrorHandler(async () => 42)).resolves.toBe(42);
+  });
+
+  it('tooLarge default message and status', async () => {
+    const err = Errors.tooLarge();
+    expect(err.status).toBe(413);
+    expect(err.errcode).toBe(ErrorCodes.M_TOO_LARGE);
+    expect(err.message).toBe('Request too large');
+    const res = err.toResponse();
+    await expect(res.json()).resolves.toEqual({
+      errcode: 'M_TOO_LARGE',
+      error: 'Request too large',
+    });
+  });
+
+  it('jsonResponse default status is 200 when omitted', async () => {
+    const res = jsonResponse({ a: 1 });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ a: 1 });
+  });
+
+  it('withErrorHandler maps string throws to M_UNKNOWN and logs the string', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = (await withErrorHandler(async () => {
+      throw 'boom';
+    })) as Response;
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toMatchObject({ errcode: 'M_UNKNOWN' });
+    expect(spy).toHaveBeenCalledWith('Unexpected error:', 'boom');
+    spy.mockRestore();
+  });
+});

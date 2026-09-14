@@ -157,3 +157,40 @@ describe('validateEventSize TOKENMAXX leftovers after #241', () => {
     expect(() => validateEventSize(event)).not.toThrow(/D1 row limit/);
   });
 });
+
+describe('validateEventSize TOKENMAXX residual leftovers after #252', () => {
+  it('accepts a full PDU one byte under the hard cap', () => {
+    const event = baseEvent({ body: 'ok' });
+    const target = 921_599;
+    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    while (JSON.stringify(event).length > target) {
+      event.auth_events.pop();
+    }
+    const need = target - JSON.stringify(event).length;
+    if (need > 0) {
+      event.auth_events.push(`$p${'x'.repeat(Math.max(0, need - 2))}`);
+      while (JSON.stringify(event).length < target) {
+        event.auth_events[event.auth_events.length - 1] += 'x';
+      }
+      while (JSON.stringify(event).length > target) {
+        const last = event.auth_events[event.auth_events.length - 1];
+        event.auth_events[event.auth_events.length - 1] = last.slice(0, -1);
+      }
+    }
+    expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(event).length).toBe(target);
+    expect(() => validateEventSize(event)).not.toThrow();
+  });
+
+  it('does not mutate the event when validation succeeds or fails', () => {
+    const ok = baseEvent({ body: 'hi' });
+    const beforeOk = JSON.stringify(ok);
+    validateEventSize(ok);
+    expect(JSON.stringify(ok)).toBe(beforeOk);
+
+    const bad = baseEvent({ body: 'z'.repeat(70_000) });
+    const beforeBad = JSON.stringify(bad);
+    expect(() => validateEventSize(bad)).toThrow(MatrixApiError);
+    expect(JSON.stringify(bad)).toBe(beforeBad);
+  });
+});
