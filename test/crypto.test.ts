@@ -1444,3 +1444,161 @@ describe('federation signing TOKENMAXX residual quinary leftovers after #303', (
     });
   }
 });
+
+describe('crypto TOKENMAXX residual senary leftovers after #310', () => {
+  it('verifyPassword scheme/truncated/NaN rejects stay isolated from a valid verify under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const real = await hashPassword('password1');
+    const truncated = (() => {
+      const parts = real.split('$');
+      parts[4] = parts[4].slice(0, Math.max(1, parts[4].length - 2));
+      return parts.join('$');
+    })();
+    const [ok, badScheme, badTrunc, badNan] = await Promise.all([
+      verifyPassword('password1', real),
+      verifyPassword('password1', '$argon2id$100000$c2FsdA==$aGFzaA=='),
+      verifyPassword('password1', truncated),
+      verifyPassword('password1', '$pbkdf2-sha256$notanumber$c2FsdA==$aGFzaA=='),
+    ]);
+    expect(ok).toBe(true);
+    expect(badScheme).toBe(false);
+    expect(badTrunc).toBe(false);
+    expect(badNan).toBe(false);
+    // scheme reject is silent; NaN iteration logs once
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(String(spy.mock.calls[0][0])).toBe(
+      '[crypto] Rejecting stored hash with invalid iteration count: notanumber'
+    );
+    spy.mockRestore();
+  });
+
+  it('verifyContentHash empty expected ∥ correct ∥ cross-hash stay independent under race', async () => {
+    const a = { type: 'm.test', content: { side: 'a' } };
+    const b = { type: 'm.test', content: { side: 'b' } };
+    const hashA = await calculateContentHash(a);
+    const hashB = await calculateContentHash(b);
+    const [empty, ok, cross, hashAgain] = await Promise.all([
+      verifyContentHash(a, ''),
+      verifyContentHash(a, hashA),
+      verifyContentHash(b, hashA),
+      calculateContentHash(b),
+    ]);
+    expect(empty).toBe(false);
+    expect(ok).toBe(true);
+    expect(cross).toBe(false);
+    expect(hashAgain).toBe(hashB);
+  });
+
+  it('timingSafeEqual + hashToken + generateRandomString stay isolated under Promise.all', async () => {
+    const [eq, neq, len, tokA, tokB, empty, one, def] = await Promise.all([
+      Promise.resolve(timingSafeEqual('same', 'same')),
+      Promise.resolve(timingSafeEqual('same', 'samp')),
+      Promise.resolve(timingSafeEqual('ab', 'abc')),
+      hashToken('syt_senary_a'),
+      hashToken('syt_senary_b'),
+      Promise.resolve(generateRandomString(0)),
+      Promise.resolve(generateRandomString(1)),
+      Promise.resolve(generateRandomString()),
+    ]);
+    expect(eq).toBe(true);
+    expect(neq).toBe(false);
+    expect(len).toBe(false);
+    expect(tokA).not.toBe(tokB);
+    expect(tokA).not.toMatch(/[+/=]/);
+    expect(empty).toBe('');
+    expect(one).toMatch(/^[A-Za-z0-9]$/);
+    expect(def).toHaveLength(32);
+    expect(def).toMatch(/^[A-Za-z0-9]+$/);
+  });
+
+  it('canonicalJson bigint/function/undefined race stays deterministic', async () => {
+    const [bigintObj, fnObj, undefArr, nested] = await Promise.all([
+      Promise.resolve(canonicalJson({ n: 1n })),
+      Promise.resolve(canonicalJson({ f: () => 1 })),
+      Promise.resolve(canonicalJson([undefined, null])),
+      Promise.resolve(canonicalJson({ z: 1, a: { b: undefined } })),
+    ]);
+    expect(bigintObj).toBe('{"n":null}');
+    expect(fnObj).toBe('{"f":null}');
+    expect(undefArr).toBe('[null,null]');
+    expect(nested).toBe('{"a":{"b":null},"z":1}');
+  });
+});
+
+describe('federation signing TOKENMAXX residual senary leftovers after #310', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('generateSigningKeyPair ∥ Legacy produce distinct keyIds that both sign/verify under race', async () => {
+    const [a, legacy] = await Promise.all([
+      generateSigningKeyPair(),
+      generateSigningKeyPairLegacy(),
+    ]);
+    expect(a.keyId).toMatch(/^ed25519:[0-9a-f]{8}$/);
+    expect(legacy.keyId).toMatch(/^ed25519:[0-9a-f]{8}$/);
+    expect(a.keyId).not.toBe(legacy.keyId);
+    const [signedA, signedL] = await Promise.all([
+      signJson({ type: 'm.test', content: { k: 'a' } }, 'ex.com', a.keyId, a.privateKeyJwk),
+      signJson({ type: 'm.test', content: { k: 'l' } }, 'ex.com', legacy.keyId, legacy.privateKey),
+    ]);
+    const [okA, okL, cross] = await Promise.all([
+      verifySignature(signedA, 'ex.com', a.keyId, a.publicKey),
+      verifySignature(signedL, 'ex.com', legacy.keyId, legacy.publicKey),
+      verifySignature(signedA, 'ex.com', a.keyId, legacy.publicKey),
+    ]);
+    expect(okA).toBe(true);
+    expect(okL).toBe(true);
+    expect(cross).toBe(false);
+  });
+
+  it('signJson overwrite same server+keyId ∥ verify of pre-overwrite snapshot stays true', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const first = await signJson(
+      { type: 'm.test', content: { n: 1 } },
+      'ex.com',
+      keyId,
+      privateKeyJwk
+    );
+    const snapshot = structuredClone(first);
+    const [rewritten, stillOk, missing] = await Promise.all([
+      signJson({ type: 'm.test', content: { n: 2 } }, 'ex.com', keyId, privateKeyJwk),
+      verifySignature(snapshot, 'ex.com', keyId, publicKey),
+      verifySignature(snapshot, 'other.example.com', keyId, publicKey),
+    ]);
+    expect(stillOk).toBe(true);
+    expect(missing).toBe(false);
+    expect(await verifySignature(rewritten, 'ex.com', keyId, publicKey)).toBe(true);
+    expect(
+      (rewritten.signatures as Record<string, Record<string, string>>)['ex.com'][keyId]
+    ).not.toBe((snapshot.signatures as Record<string, Record<string, string>>)['ex.com'][keyId]);
+  });
+
+  it('concurrent verifySignature garbage pubkey catch ∥ empty sig ∥ valid stay isolated', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test', content: { ok: true } }, 'ex.com', keyId, privateKeyJwk);
+    const emptySig = {
+      ...signed,
+      signatures: { 'ex.com': { [keyId]: '' } },
+    };
+    const [ok, garbage, empty] = await Promise.all([
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'ex.com', keyId, '!!!not-base64!!!'),
+      verifySignature(emptySig, 'ex.com', keyId, publicKey),
+    ]);
+    expect(ok).toBe(true);
+    expect(garbage).toBe(false);
+    expect(empty).toBe(false);
+    expect(spy.mock.calls.some((c) => String(c[0]).includes('Signature verification failed'))).toBe(
+      true
+    );
+    spy.mockRestore();
+  });
+});
