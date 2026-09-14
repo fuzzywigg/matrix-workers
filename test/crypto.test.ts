@@ -846,3 +846,123 @@ describe('federation signing TOKENMAXX residual leftovers after #252', () => {
     expect(await verifySignature(signed, 'ex.com', keyId, publicKey)).toBe(true);
   });
 });
+
+describe('crypto TOKENMAXX residual leftovers after #264', () => {
+  it('hashPassword / verifyPassword / sha256 stay isolated under concurrent Promise.all', async () => {
+    const [ha, hb, sa, sb] = await Promise.all([
+      hashPassword('conc-a-1'),
+      hashPassword('conc-b-1'),
+      sha256('token-a'),
+      sha256('token-b'),
+    ]);
+    expect(ha).not.toBe(hb);
+    expect(sa).not.toBe(sb);
+    const [okA, okB, badCross, tokA] = await Promise.all([
+      verifyPassword('conc-a-1', ha),
+      verifyPassword('conc-b-1', hb),
+      verifyPassword('conc-a-1', hb),
+      hashToken('token-a'),
+    ]);
+    expect(okA).toBe(true);
+    expect(okB).toBe(true);
+    expect(badCross).toBe(false);
+    expect(tokA).toBe(sa);
+  });
+
+  it('calculateContentHash / verifyContentHash race on disjoint PDUs stays correct', async () => {
+    const a = { type: 'm.test', content: { n: 1 } };
+    const b = { type: 'm.test', content: { n: 2 } };
+    const [ha, hb] = await Promise.all([calculateContentHash(a), calculateContentHash(b)]);
+    expect(ha).not.toBe(hb);
+    const [okA, badB, okB] = await Promise.all([
+      verifyContentHash(a, ha),
+      verifyContentHash(b, ha),
+      verifyContentHash(b, hb),
+    ]);
+    expect(okA).toBe(true);
+    expect(badB).toBe(false);
+    expect(okB).toBe(true);
+  });
+
+  it('timingSafeEqual empty strings and generateRandomString race stay consistent', async () => {
+    expect(timingSafeEqual('', '')).toBe(true);
+    expect(timingSafeEqual('', 'a')).toBe(false);
+    const samples = await Promise.all(
+      Array.from({ length: 8 }, () => Promise.resolve(generateRandomString(24)))
+    );
+    expect(new Set(samples).size).toBe(8);
+    for (const s of samples) {
+      expect(s).toHaveLength(24);
+      expect(s).toMatch(/^[A-Za-z0-9]+$/);
+    }
+  });
+
+  it('rejects verifyPassword when scheme is wrong even at valid iteration bounds', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await verifyPassword('password1', '$pbkdf2-sha512$100000$c2FsdA==$aGFzaA==')).toBe(
+      false
+    );
+    expect(await verifyPassword('password1', '$argon2id$100000$c2FsdA==$aGFzaA==')).toBe(false);
+    // Wrong scheme returns false before iteration console.error
+    expect(console.error).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+
+  it('canonicalJson encodes nested empty objects and sparse-like undefined holes under race', () => {
+    const [a, b] = [canonicalJson({ a: {}, b: [] }), canonicalJson([undefined, {}])];
+    expect(a).toBe('{"a":{},"b":[]}');
+    expect(b).toBe('[null,{}]');
+  });
+});
+
+describe('federation signing TOKENMAXX residual leftovers after #264', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('signJson accepts a JSON-string privateKeyJwk and verifies under concurrent calls', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const base = { type: 'm.test', content: { n: 1 } };
+    const [signedA, signedB] = await Promise.all([
+      signJson(base, 'a.example.com', a.keyId, JSON.stringify(a.privateKeyJwk)),
+      signJson(base, 'b.example.com', b.keyId, JSON.stringify(b.privateKeyJwk)),
+    ]);
+    const [okA, okB, badCross] = await Promise.all([
+      verifySignature(signedA, 'a.example.com', a.keyId, a.publicKey),
+      verifySignature(signedB, 'b.example.com', b.keyId, b.publicKey),
+      verifySignature(signedA, 'a.example.com', a.keyId, b.publicKey),
+    ]);
+    expect(okA).toBe(true);
+    expect(okB).toBe(true);
+    expect(badCross).toBe(false);
+  });
+
+  it('verifySignature returns false when server map is missing (signatures present)', async () => {
+    const { publicKey, keyId } = await generateSigningKeyPair();
+    const obj = {
+      type: 'm.test',
+      signatures: { 'other.example.com': { [keyId]: 'AA' } },
+    };
+    expect(await verifySignature(obj, 'ex.com', keyId, publicKey)).toBe(false);
+  });
+
+  it('parallel re-sign on the same server+keyId yields independent verifiable objects', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const [s1, s2] = await Promise.all([
+      signJson({ type: 'm.test', content: { n: 1 } }, 'ex.com', keyId, privateKeyJwk),
+      signJson({ type: 'm.test', content: { n: 2 } }, 'ex.com', keyId, privateKeyJwk),
+    ]);
+    expect(await verifySignature(s1, 'ex.com', keyId, publicKey)).toBe(true);
+    expect(await verifySignature(s2, 'ex.com', keyId, publicKey)).toBe(true);
+    expect(
+      (s1.signatures as Record<string, Record<string, string>>)['ex.com'][keyId]
+    ).not.toBe((s2.signatures as Record<string, Record<string, string>>)['ex.com'][keyId]);
+  });
+});

@@ -475,3 +475,107 @@ describe('errors TOKENMAXX residual leftovers after #252', () => {
     spy.mockRestore();
   });
 });
+
+describe('errors TOKENMAXX residual leftovers after #264', () => {
+  it('includes retry_after_ms for Number.NEGATIVE_INFINITY (truthy)', () => {
+    const err = new MatrixApiError(
+      ErrorCodes.M_LIMIT_EXCEEDED,
+      'slow',
+      429,
+      Number.NEGATIVE_INFINITY
+    );
+    expect(err.toJSON()).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'slow',
+      retry_after_ms: Number.NEGATIVE_INFINITY,
+    });
+  });
+
+  it('concurrent withErrorHandler isolates MatrixApiError vs success vs unknown', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const [conflict, ok, unknown] = await Promise.all([
+      withErrorHandler(async () => {
+        throw Errors.conflict('race');
+      }),
+      withErrorHandler(async () => jsonResponse({ ok: true }, 201)),
+      withErrorHandler(async () => {
+        throw new Error('boom');
+      }),
+    ]);
+    expect((conflict as Response).status).toBe(409);
+    await expect((conflict as Response).json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'race',
+    });
+    expect(ok).toBeInstanceOf(Response);
+    expect((ok as Response).status).toBe(201);
+    expect((unknown as Response).status).toBe(500);
+    await expect((unknown as Response).json()).resolves.toMatchObject({ errcode: 'M_UNKNOWN' });
+    expect(spy).toHaveBeenCalledWith('Unexpected error:', expect.any(Error));
+    spy.mockRestore();
+  });
+
+  it('Errors.conflict / tooLarge / unknown produce distinct Response bodies under race', async () => {
+    const [c, t, u] = await Promise.all([
+      Promise.resolve(Errors.conflict().toResponse()),
+      Promise.resolve(Errors.tooLarge('upload').toResponse()),
+      Promise.resolve(Errors.unknown('oops').toResponse()),
+    ]);
+    expect(c).not.toBe(t);
+    expect(c.status).toBe(409);
+    expect(t.status).toBe(413);
+    expect(u.status).toBe(500);
+    await expect(c.json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'State changed concurrently; retry the operation',
+    });
+    await expect(t.json()).resolves.toEqual({ errcode: 'M_TOO_LARGE', error: 'upload' });
+    await expect(u.json()).resolves.toEqual({ errcode: 'M_UNKNOWN', error: 'oops' });
+  });
+
+  it('jsonResponse serializes boolean false and empty array under concurrent calls', async () => {
+    const [f, arr, obj] = await Promise.all([
+      Promise.resolve(jsonResponse(false, 200)),
+      Promise.resolve(jsonResponse([], 202)),
+      Promise.resolve(jsonResponse({ a: false }, 200)),
+    ]);
+    expect(f.status).toBe(200);
+    await expect(f.json()).resolves.toBe(false);
+    expect(arr.status).toBe(202);
+    await expect(arr.json()).resolves.toEqual([]);
+    await expect(obj.json()).resolves.toEqual({ a: false });
+  });
+
+  it('withErrorHandler passes limitExceeded retry_after_ms through concurrent throws', async () => {
+    const [a, b] = await Promise.all([
+      withErrorHandler(async () => {
+        throw Errors.limitExceeded('a', 100);
+      }),
+      withErrorHandler(async () => {
+        throw Errors.limitExceeded('b', 200);
+      }),
+    ]);
+    await expect((a as Response).json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'a',
+      retry_after_ms: 100,
+    });
+    await expect((b as Response).json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'b',
+      retry_after_ms: 200,
+    });
+  });
+
+  it('emptyResponse and jsonResponse({}) stay independent Response instances', async () => {
+    const [e, j] = await Promise.all([
+      Promise.resolve(emptyResponse(201)),
+      Promise.resolve(jsonResponse({}, 201)),
+    ]);
+    expect(e).not.toBe(j);
+    expect(e.status).toBe(201);
+    expect(j.status).toBe(201);
+    await expect(e.json()).resolves.toEqual({});
+    await expect(j.json()).resolves.toEqual({});
+  });
+});

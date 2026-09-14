@@ -194,3 +194,80 @@ describe('validateEventSize TOKENMAXX residual leftovers after #252', () => {
     expect(JSON.stringify(bad)).toBe(beforeBad);
   });
 });
+
+describe('validateEventSize TOKENMAXX residual leftovers after #264', () => {
+  it('concurrent soft-cap rejects stay independent MatrixApiError instances', async () => {
+    const a = baseEvent({ body: 'a'.repeat(70_000) });
+    const b = baseEvent({ body: 'b'.repeat(70_000) });
+    const beforeA = JSON.stringify(a);
+    const beforeB = JSON.stringify(b);
+    const [ra, rb] = await Promise.all([
+      Promise.resolve().then(() => {
+        try {
+          validateEventSize(a);
+          return null;
+        } catch (err) {
+          return err as MatrixApiError;
+        }
+      }),
+      Promise.resolve().then(() => {
+        try {
+          validateEventSize(b);
+          return null;
+        } catch (err) {
+          return err as MatrixApiError;
+        }
+      }),
+    ]);
+    expect(ra).toBeInstanceOf(MatrixApiError);
+    expect(rb).toBeInstanceOf(MatrixApiError);
+    expect(ra).not.toBe(rb);
+    expect(ra!.errcode).toBe('M_TOO_LARGE');
+    expect(rb!.status).toBe(413);
+    expect(ra!.message).toMatch(/content exceeds/);
+    expect(rb!.message).toMatch(/content exceeds/);
+    expect(JSON.stringify(a)).toBe(beforeA);
+    expect(JSON.stringify(b)).toBe(beforeB);
+  });
+
+  it('concurrent ok + soft-cap reject: ok succeeds, reject throws, neither mutates', async () => {
+    const ok = baseEvent({ body: 'hi' });
+    const bad = baseEvent({ body: 'z'.repeat(70_000) });
+    const beforeOk = JSON.stringify(ok);
+    const beforeBad = JSON.stringify(bad);
+    const [okResult, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(ok);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(bad);
+        return 'bad';
+      }),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      expect(badResult.reason).toBeInstanceOf(MatrixApiError);
+      expect((badResult.reason as MatrixApiError).message).toMatch(/content exceeds/);
+    }
+    expect(JSON.stringify(ok)).toBe(beforeOk);
+    expect(JSON.stringify(bad)).toBe(beforeBad);
+  });
+
+  it('soft-cap error message embeds the observed content byte length', () => {
+    const overhead = JSON.stringify({ body: '' }).length;
+    const body = 'q'.repeat(65_536 - overhead + 3);
+    const event = baseEvent({ body });
+    const contentLen = JSON.stringify(event.content).length;
+    expect(contentLen).toBe(65_539);
+    try {
+      validateEventSize(event);
+      expect.unreachable('should throw');
+    } catch (err) {
+      const e = err as MatrixApiError;
+      expect(e.message).toMatch(/65536/);
+      expect(e.message).toMatch(new RegExp(String(contentLen)));
+    }
+  });
+});
