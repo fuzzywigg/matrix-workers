@@ -1,19 +1,18 @@
 /**
- * TOKENMAXX HEAVY leftovers after #221 / deepen after #232 — oidc-auth
- * *concurrent race / TOCTOU* for `src/api/oidc-auth.ts` (providers / login /
- * callback / auth_metadata / MSC3861 identity reset).
+ * TOKENMAXX HEAVY leftovers after #221 / deepen after #232 / residual after #238
+ * — oidc-auth *concurrent race / TOCTOU* for `src/api/oidc-auth.ts`
+ * (providers / login / callback / auth_metadata / MSC3861 identity reset).
  *
  * Soft/route leftovers for oidc-auth are deep (#113/#143/#147) but concurrent-
  * race coverage was near-zero: only a sequential "consumes state exactly once"
  * case in oidc-auth-api-routes (no Promise.all / SESSIONS get-barrier double-
  * spend / parallel login state mint / identity-reset races).
  *
- * Distinct from tip #221 (oauth Matrix-as-OIDC-provider), #220 (devices+
- * keybackups+report residual), #219 (admin+federation), #218 (filters+
- * capabilities), #217 (appservice+auth-middleware), and saturated
+ * Distinct from tip #241 (devices+keybackups residual), #240 (room-cache),
+ * #239 (admin+federation), #238 (this slice's prior deepen), and saturated
  * keys/media/rooms/voip/sync/push/login-qr-identity concurrent-race files.
- * Orthogonal to oauth-concurrent-race (#221) — this slice is *external IdP*
- * SSO, not `/oauth/*` AS provider.
+ * Orthogonal to oauth-concurrent-race — this slice is *external IdP* SSO,
+ * not `/oauth/*` AS provider.
  *
  * Focus: parallel login distinct oidc_state mint; callback state double-
  * consume get-barrier TOCTOU; distinct-state parallel redeem; provider
@@ -21,6 +20,10 @@
  * existing-link UPDATE∥UPDATE; auto-create dual INSERT race; identity
  * reset∥reset stream/KV/DO; auth_metadata soft floods; method/query/KV
  * fail soft under Promise.all; TTL bind contracts.
+ * Residual after #238: claims.name display_name UPDATE, redirectUri exchange
+ * bind, link email/name UPDATE, icon_url, KV user: wipe, dual-provider
+ * state, success page device bind, deriveUsername claim, SSO device name,
+ * signatures DELETE args.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -3678,6 +3681,375 @@ describe('race leftover MSC3861 identity reset fail isolation after #232', () =>
       expect(statusesOf(results)).toEqual([200, 200]);
       expect(results.every((r) => JSON.stringify(r.body) === '{}')).toBe(true);
       expect(db.streamPositions.device_keys).toBe(102 + i);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// After #238 / tip after #241: residual callback binds / providers icon /
+// identity-reset KV+signatures / dual-provider state niches unsaturated by
+// the #232 deepen.
+// ---------------------------------------------------------------------------
+
+describe('race residual oidc claims.name + redirectUri + link UPDATE after #238', () => {
+  it('claims.name triggers display_name UPDATE under parallel auto-create', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'named-a');
+    const s2 = seedState(sessions, 'named-b');
+    validateIDToken
+      .mockResolvedValueOnce({
+        sub: 'named-sub-a',
+        preferred_username: 'nameda',
+        name: 'Named Alice',
+      })
+      .mockResolvedValueOnce({
+        sub: 'named-sub-b',
+        preferred_username: 'namedb',
+        name: 'Named Bob',
+      });
+    deriveUsername.mockImplementation((claims: { preferred_username?: string }) =>
+      claims.preferred_username || 'fallback'
+    );
+    getUserById.mockResolvedValue(null);
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret, auto_create_users: 1 })],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    expect(results.every((r) => r.text.includes('Login Successful'))).toBe(true);
+    const nameUpdates = db.updates.filter((u) => u.sql.includes('UPDATE users SET display_name'));
+    expect(nameUpdates.length).toBeGreaterThanOrEqual(2);
+    const names = nameUpdates.map((u) => u.args[0] as string).sort();
+    expect(names).toEqual(['Named Alice', 'Named Bob'].sort());
+  });
+
+  it('exchangeCodeForTokens receives redirectUri from state under parallel', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'ru-a', {
+      redirectUri: `https://hs-a.example.com/auth/oidc/${PROVIDER_ID}/callback`,
+    });
+    const s2 = seedState(sessions, 'ru-b', {
+      redirectUri: `https://hs-b.example.com/auth/oidc/${PROVIDER_ID}/callback`,
+    });
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret })],
+      links: [
+        {
+          id: 10,
+          provider_id: PROVIDER_ID,
+          external_id: 'ext-sub-1',
+          user_id: USER,
+          external_email: null,
+          external_name: null,
+        },
+      ],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=code-ru-a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=code-ru-b&state=${s2}`, {}, env),
+    ]);
+    expect(results.every((r) => r.text.includes('Login Successful'))).toBe(true);
+    const redirectArgs = exchangeCodeForTokens.mock.calls.map((c) => c[4] as string).sort();
+    expect(redirectArgs).toEqual(
+      [
+        `https://hs-a.example.com/auth/oidc/${PROVIDER_ID}/callback`,
+        `https://hs-b.example.com/auth/oidc/${PROVIDER_ID}/callback`,
+      ].sort()
+    );
+    const codes = exchangeCodeForTokens.mock.calls.map((c) => c[3] as string).sort();
+    expect(codes).toEqual(['code-ru-a', 'code-ru-b'].sort());
+  });
+
+  it('existing-link UPDATE binds email/name from claims under parallel', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'em-a');
+    const s2 = seedState(sessions, 'em-b');
+    validateIDToken
+      .mockResolvedValueOnce({
+        sub: 'ext-sub-1',
+        email: 'a@example.com',
+        name: 'Alice A',
+        preferred_username: 'alice',
+      })
+      .mockResolvedValueOnce({
+        sub: 'ext-sub-1',
+        email: 'b@example.com',
+        name: 'Alice B',
+        preferred_username: 'alice',
+      });
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret })],
+      links: [
+        {
+          id: 20,
+          provider_id: PROVIDER_ID,
+          external_id: 'ext-sub-1',
+          user_id: USER,
+          external_email: null,
+          external_name: null,
+        },
+      ],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    expect(results.every((r) => r.text.includes('Login Successful'))).toBe(true);
+    const linkUpdates = db.updates.filter((u) => u.sql.includes('UPDATE idp_user_links SET last_login_at'));
+    expect(linkUpdates.length).toBeGreaterThanOrEqual(2);
+    const emails = linkUpdates.map((u) => u.args[1] as string).sort();
+    const names = linkUpdates.map((u) => u.args[2] as string).sort();
+    expect(emails).toEqual(['a@example.com', 'b@example.com'].sort());
+    expect(names).toEqual(['Alice A', 'Alice B'].sort());
+  });
+
+  it('deriveUsername receives provider username_claim under parallel', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'uc-a');
+    const s2 = seedState(sessions, 'uc-b');
+    validateIDToken
+      .mockResolvedValueOnce({
+        sub: 'uc-sub-a',
+        preferred_username: 'pref-a',
+        email: 'a@example.com',
+      })
+      .mockResolvedValueOnce({
+        sub: 'uc-sub-b',
+        preferred_username: 'pref-b',
+        email: 'b@example.com',
+      });
+    deriveUsername.mockImplementation(
+      (_claims: unknown, claim: string) => `derived-${claim}`
+    );
+    getUserById.mockResolvedValue(null);
+    const db = createOidcRaceDb({
+      providers: [
+        seedProvider({
+          client_secret_encrypted: secret,
+          auto_create_users: 1,
+          username_claim: 'preferred_username',
+        }),
+      ],
+    });
+    // Second callback uses a distinct provider id path but same seeded provider —
+    // both hit the same provider.username_claim.
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    expect(results.every((r) => r.text.includes('Login Successful'))).toBe(true);
+    expect(deriveUsername.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(deriveUsername.mock.calls.every((c) => c[1] === 'preferred_username')).toBe(true);
+  });
+
+  it('createDevice display_name embeds SSO Login (provider.name) under parallel', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'dev-a');
+    const s2 = seedState(sessions, 'dev-b');
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret, name: 'Google Workspace' })],
+      links: [
+        {
+          id: 30,
+          provider_id: PROVIDER_ID,
+          external_id: 'ext-sub-1',
+          user_id: USER,
+          external_email: null,
+          external_name: null,
+        },
+      ],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    expect(results.every((r) => r.text.includes('Login Successful'))).toBe(true);
+    expect(createDevice.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(
+      createDevice.mock.calls.every((c) => c[3] === 'SSO Login (Google Workspace)')
+    ).toBe(true);
+  });
+
+  it('success page embeds userId + distinct deviceId under parallel', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'sp-a');
+    const s2 = seedState(sessions, 'sp-b');
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret })],
+      links: [
+        {
+          id: 40,
+          provider_id: PROVIDER_ID,
+          external_id: 'ext-sub-1',
+          user_id: USER,
+          external_email: null,
+          external_name: null,
+        },
+      ],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    expect(results.every((r) => r.text.includes(USER))).toBe(true);
+    expect(results.every((r) => r.text.includes('Login Successful'))).toBe(true);
+    const devices = results.map((r) => {
+      const m = r.text.match(/Device ID<\/label>\s*<div class="value">([^<]+)/);
+      return m?.[1];
+    });
+    expect(devices[0]).toBeTruthy();
+    expect(devices[1]).toBeTruthy();
+    expect(devices[0]).not.toBe(devices[1]);
+  });
+});
+
+describe('race residual oidc providers icon + dual-provider state + reset KV after #238', () => {
+  it('providers list surfaces icon_url under parallel', async () => {
+    const db = createOidcRaceDb({
+      providers: [
+        seedProvider({ icon_url: 'https://cdn.example.com/google.svg' }),
+        seedProvider({
+          id: PROVIDER_B,
+          name: 'GitHub',
+          display_order: 2,
+          icon_url: 'https://cdn.example.com/github.svg',
+        }),
+      ],
+    });
+    const env = envFor({ db });
+    const results = await Promise.all([
+      request('/auth/oidc/providers', {}, env),
+      request('/auth/oidc/providers', {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    for (const r of results) {
+      const byId = Object.fromEntries(
+        r.body.providers.map((p: { id: string; icon_url: string }) => [p.id, p.icon_url])
+      );
+      expect(byId[PROVIDER_ID]).toBe('https://cdn.example.com/google.svg');
+      expect(byId[PROVIDER_B]).toBe('https://cdn.example.com/github.svg');
+    }
+  });
+
+  it('dual-provider login isolates providerId in oidc_state under parallel', async () => {
+    const sessions = mockKv();
+    const db = createOidcRaceDb({
+      providers: [
+        seedProvider(),
+        seedProvider({ id: PROVIDER_B, name: 'GitHub', display_order: 2 }),
+      ],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/login?return_to=/g`, {}, env),
+      request(`/auth/oidc/${PROVIDER_B}/login?return_to=/gh`, {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([302, 302]);
+    const stored = Object.values(sessions.data).map((v) => JSON.parse(v));
+    const byReturn = Object.fromEntries(stored.map((s) => [s.returnTo, s.providerId]));
+    expect(byReturn['/g']).toBe(PROVIDER_ID);
+    expect(byReturn['/gh']).toBe(PROVIDER_B);
+  });
+
+  it('provider disable between sequential callbacks — second Provider Not Found', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'dis-a');
+    const s2 = seedState(sessions, 'dis-b');
+    const provider = seedProvider({ client_secret_encrypted: secret });
+    const db = createOidcRaceDb({
+      providers: [provider],
+      links: [
+        {
+          id: 50,
+          provider_id: PROVIDER_ID,
+          external_id: 'ext-sub-1',
+          user_id: USER,
+          external_email: null,
+          external_name: null,
+        },
+      ],
+    });
+    const env = envFor({ sessions, db });
+    const first = await request(
+      `/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`,
+      {},
+      env
+    );
+    provider.enabled = 0;
+    const second = await request(
+      `/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`,
+      {},
+      env
+    );
+    expect(first.text).toContain('Login Successful');
+    expect(second.text).toContain('Provider Not Found');
+  });
+
+  it('identity reset deletes CROSS_SIGNING_KEYS user: key under dual reset', async () => {
+    const crossSigning = mockKv({ [`user:${USER}`]: 'cached-keys', [`user:@bob:${SERVER}`]: 'other' });
+    const db = createOidcRaceDb({ streamPositions: { device_keys: 7 } });
+    const env = envFor({ db, userKeys: createUserKeysStub(), crossSigning });
+    const path = '/_matrix/client/unstable/org.matrix.msc3861/account/identity/reset';
+    const results = await Promise.all([
+      request(path, { method: 'POST' }, env),
+      request(path, { method: 'POST' }, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    expect(crossSigning.data[`user:${USER}`]).toBeUndefined();
+    expect(crossSigning.data[`user:@bob:${SERVER}`]).toBe('other');
+    expect(crossSigning.deletes.filter((k) => k === `user:${USER}`).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('cross_signing_signatures DELETE binds user_id twice under dual reset', async () => {
+    const db = createOidcRaceDb({ streamPositions: { device_keys: 11 } });
+    const env = envFor({ db, userKeys: createUserKeysStub() });
+    const path = '/_matrix/client/unstable/org.matrix.msc3861/account/identity/reset';
+    const results = await Promise.all([
+      request(path, { method: 'POST' }, env),
+      request(path, { method: 'POST' }, env),
+    ]);
+    expect(statusesOf(results)).toEqual([200, 200]);
+    const sigDeletes = db.deletes.filter((d) => d.sql.includes('cross_signing_signatures'));
+    expect(sigDeletes).toHaveLength(2);
+    for (const d of sigDeletes) {
+      expect(d.args[0]).toBe(USER);
+      expect(d.args[1]).toBe(USER);
+    }
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`dual-provider state residual flood-${i}`, async () => {
+      const sessions = mockKv();
+      const db = createOidcRaceDb({
+        providers: [
+          seedProvider(),
+          seedProvider({ id: PROVIDER_B, name: 'GitHub', display_order: 2 }),
+        ],
+      });
+      const env = envFor({ sessions, db });
+      const results = await Promise.all([
+        request(`/auth/oidc/${PROVIDER_ID}/login?return_to=/f${i}a`, {}, env),
+        request(`/auth/oidc/${PROVIDER_B}/login?return_to=/f${i}b`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([302, 302]);
+      const stored = Object.values(sessions.data).map((v) => JSON.parse(v));
+      expect(stored.map((s) => s.providerId).sort()).toEqual([PROVIDER_B, PROVIDER_ID].sort());
+      expect(stored.every((s) => typeof s.nonce === 'string' && s.nonce.length > 0)).toBe(true);
     });
   }
 });
