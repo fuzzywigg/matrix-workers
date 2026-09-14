@@ -104,7 +104,6 @@ import oidcAuth, { encryptSecret, decryptSecret } from '../src/api/oidc-auth';
 
 const SERVER = 'example.com';
 const USER = '@alice:example.com';
-const BOB = '@bob:example.com';
 const PROVIDER_ID = 'google';
 const PROVIDER_B = 'github';
 const ISSUER = 'https://accounts.example-idp.com';
