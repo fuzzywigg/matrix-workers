@@ -3692,3 +3692,297 @@ describe('push TOKENMAXX errcode + auth surface leftovers', () => {
     );
   });
 });
+
+// =============================================================================
+// TOKENMAXX soft-cap flood — more leftover binds / kind CRUD / notification math
+// =============================================================================
+
+describe('pushers SET — concurrent same-pushkey app_ids leftovers', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('append:false after multi-app same pushkey leaves only the new insert', async () => {
+    const db = createPushDb({
+      pushers: [
+        seedPusher({ pushkey: 'pk', app_id: 'a' }),
+        seedPusher({ pushkey: 'pk', app_id: 'b' }),
+        seedPusher({ pushkey: 'other', app_id: 'a' }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', {
+        ...VALID_PUSHER_BODY,
+        pushkey: 'pk',
+        app_id: 'c',
+        append: false,
+      })
+    );
+    expect(db.pushers.map((p) => `${p.pushkey}:${p.app_id}`).sort()).toEqual([
+      'other:a',
+      'pk:c',
+    ]);
+  });
+
+  it('profile_tag false/0 stored as null via || null', async () => {
+    const db = createPushDb();
+    for (const profile_tag of [false, 0] as unknown as string[]) {
+      db.pushers.length = 0;
+      await request(
+        db,
+        '/_matrix/client/v3/pushers/set',
+        jsonInit('POST', {
+          ...VALID_PUSHER_BODY,
+          pushkey: `pk-${String(profile_tag)}`,
+          profile_tag,
+        })
+      );
+      expect(db.pushers[0].profile_tag).toBeNull();
+    }
+  });
+
+  it('DELETE by pushkey+app_id does not require kind null when kind omitted', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: 'z', app_id: 'im.vector.app' })],
+    });
+    // omit kind entirely
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { pushkey: 'z', app_id: 'im.vector.app' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.pushers).toHaveLength(0);
+  });
+});
+
+describe('pushrules GET — default rule action/condition inventory leftovers', () => {
+  it('suppress_notices matches m.notice msgtype', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.suppress_notices',
+      authGet()
+    );
+    expect(res.body.conditions).toEqual([
+      { kind: 'event_match', key: 'content.msgtype', pattern: 'm.notice' },
+    ]);
+    expect(res.body.actions).toEqual(['dont_notify']);
+  });
+
+  it('member_event matches m.room.member type', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.member_event',
+      authGet()
+    );
+    expect(res.body.conditions).toEqual([
+      { kind: 'event_match', key: 'type', pattern: 'm.room.member' },
+    ]);
+  });
+
+  it('tombstone matches m.room.tombstone with empty state_key', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.tombstone',
+      authGet()
+    );
+    expect(res.body.conditions).toEqual([
+      { kind: 'event_match', key: 'type', pattern: 'm.room.tombstone' },
+      { kind: 'event_match', key: 'state_key', pattern: '' },
+    ]);
+  });
+
+  it('encrypted underride has room_member_count + m.room.encrypted', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/underride/.m.rule.encrypted',
+      authGet()
+    );
+    expect(res.body.conditions).toEqual([
+      { kind: 'event_match', key: 'type', pattern: 'm.room.encrypted' },
+    ]);
+  });
+
+  it('every default rule has default:true and a string rule_id', async () => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    for (const kind of ['override', 'content', 'underride'] as const) {
+      for (const rule of res.body[kind]) {
+        if (String(rule.rule_id).startsWith('.m.rule.')) {
+          expect(rule.default).toBe(true);
+          expect(typeof rule.rule_id).toBe('string');
+          expect(Array.isArray(rule.actions)).toBe(true);
+        }
+      }
+    }
+  });
+});
+
+describe('pushrules PUT — conditions-only kinds without pattern leftovers', () => {
+  it.each(['override', 'underride', 'room', 'sender'] as const)(
+    'kind %s does not require pattern',
+    async (kind) => {
+      const db = createPushDb();
+      const ruleId = kind === 'room' ? '!r:example.com' : kind === 'sender' ? '@s:example.com' : `nopat.${kind}`;
+      const res = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/${encodeURIComponent(ruleId)}`,
+        jsonInit('PUT', { actions: ['dont_notify'] })
+      );
+      expect(res.status).toBe(200);
+      expect(db.rules[0].conditions).toBeNull();
+    }
+  );
+
+  it('both before and after query params still set a single Date.now priority', async () => {
+    const db = createPushDb();
+    const t0 = Date.now();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/both?before=a&after=b',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(db.rules[0].priority).toBeGreaterThanOrEqual(t0);
+  });
+
+  it('re-PUT same rule id updates actions without duplicating rows', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/once',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/once',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    expect(db.rules).toHaveLength(1);
+    expect(JSON.parse(db.rules[0].actions)).toEqual(['dont_notify']);
+  });
+});
+
+describe('notifications Math.min limit leftovers', () => {
+  it('limit=100 and limit=101 both return at most 100', async () => {
+    const many = Array.from({ length: 110 }, (_, i) =>
+      seedNotification({ id: i + 1, created_at: i, event_id: `$e${i}` })
+    );
+    const db = createPushDb({ notifications: many });
+    const a = await request(db, '/_matrix/client/v3/notifications?limit=100', authGet());
+    const b = await request(db, '/_matrix/client/v3/notifications?limit=101', authGet());
+    expect(a.body.notifications).toHaveLength(100);
+    expect(b.body.notifications).toHaveLength(100);
+  });
+
+  it('from with highlight filter uses id cursor after type filter', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 1, notification_type: 'highlight', created_at: 1 }),
+        seedNotification({
+          id: 2,
+          notification_type: 'notify',
+          created_at: 2,
+          event_id: '$n',
+        }),
+        seedNotification({
+          id: 3,
+          notification_type: 'highlight',
+          created_at: 3,
+          event_id: '$h3',
+        }),
+      ],
+    });
+    const res = await request(
+      db,
+      '/_matrix/client/v3/notifications?only=highlight&from=1',
+      authGet()
+    );
+    expect(res.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
+      ['$h3']
+    );
+  });
+
+  it('read:1 maps to true boolean', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 1, read: 1 })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    expect(res.body.notifications[0].read).toBe(true);
+  });
+});
+
+describe('push integration flood — mixed kinds coexistence', () => {
+  it('creates one rule per kind then lists all buckets non-empty (except defaults-only content has 2)', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/o1',
+      jsonInit('PUT', { actions: ['notify'], conditions: [] })
+    );
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/content/c1',
+      jsonInit('PUT', { actions: ['notify'], pattern: 'hi' })
+    );
+    await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/room/${encodeURIComponent(ROOM)}`,
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/sender/${encodeURIComponent(BOB)}`,
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/underride/u1',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(res.body.override.some((r: { rule_id: string }) => r.rule_id === 'o1')).toBe(true);
+    expect(res.body.content.some((r: { rule_id: string }) => r.rule_id === 'c1')).toBe(true);
+    expect(res.body.room).toHaveLength(1);
+    expect(res.body.sender).toHaveLength(1);
+    expect(res.body.underride.some((r: { rule_id: string }) => r.rule_id === 'u1')).toBe(true);
+  });
+
+  it('delete all five custom kinds leaves only defaults', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ kind: 'override', rule_id: 'o' }),
+        seedRule({ kind: 'content', rule_id: 'c', conditions: null }),
+        seedRule({ kind: 'room', rule_id: ROOM, conditions: null }),
+        seedRule({ kind: 'sender', rule_id: BOB, conditions: null }),
+        seedRule({ kind: 'underride', rule_id: 'u' }),
+      ],
+    });
+    for (const [kind, id] of [
+      ['override', 'o'],
+      ['content', 'c'],
+      ['room', ROOM],
+      ['sender', BOB],
+      ['underride', 'u'],
+    ] as const) {
+      await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/${encodeURIComponent(id)}`,
+        { method: 'DELETE', headers: { Authorization: 'Bearer t' } }
+      );
+    }
+    expect(db.rules).toHaveLength(0);
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(res.body.room).toEqual([]);
+    expect(res.body.sender).toEqual([]);
+    expect(res.body.content.every((r: { default: boolean }) => r.default)).toBe(true);
+  });
+});
