@@ -1007,3 +1007,511 @@ describe('identity leftovers GET /account — bad scheme flood', () => {
     expect(body.errcode).toBe('M_MISSING_TOKEN');
   });
 });
+
+
+describe('identity leftovers extractBearerToken edge leftovers', () => {
+  it('requires exact "Bearer " prefix (case-sensitive)', async () => {
+    for (const auth of ['bearer tok', 'BEARER tok', 'BearerTok']) {
+      const { status, body } = await jsonRequest(`${BASE}/account`, {
+        headers: { Authorization: auth },
+      });
+      expect(status).toBe(401);
+      expect(body.errcode).toBe('M_MISSING_TOKEN');
+    }
+  });
+
+  it('leading space before Bearer may be header-trimmed to a valid Bearer', async () => {
+    // Fetch/Hono often trim header values, so " Bearer tok" becomes "Bearer tok".
+    const { status, body } = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: ' Bearer tok' },
+    });
+    expect(status).toBe(200);
+    expect(body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('ignores access_token query param for account (header only)', async () => {
+    const { status, body } = await jsonRequest(`${BASE}/account?access_token=query-tok`);
+    expect(status).toBe(401);
+    expect(body.errcode).toBe('M_MISSING_TOKEN');
+  });
+
+  it('accepts Bearer with spaces inside token slice after prefix', async () => {
+    const { status, body } = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: 'Bearer  spaced-token  ' },
+    });
+    expect(status).toBe(200);
+    expect(body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('Authorization Bearer works without other headers', async () => {
+    const { status } = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: 'Bearer multi-ok' },
+    });
+    expect(status).toBe(200);
+  });
+});
+
+describe('identity leftovers register Content-Type and method leftovers', () => {
+  it('GET account/register is not registered (404)', async () => {
+    const { status } = await jsonRequest(`${BASE}/account/register`);
+    expect(status).toBe(404);
+  });
+
+  it('PUT account/register is not registered (404)', async () => {
+    const { status } = await jsonRequest(`${BASE}/account/register`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(registerPayload()),
+    });
+    expect(status).toBe(404);
+  });
+
+  it('POST with charset in content-type still parses JSON', async () => {
+    const { status, body } = await jsonRequest(`${BASE}/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(registerPayload({ access_token: 'charset-ok' })),
+    });
+    expect(status).toBe(200);
+    expect(body).toEqual({ token: 'charset-ok' });
+  });
+
+  it('POST empty string body is M_BAD_JSON', async () => {
+    const { status, body } = await jsonRequest(`${BASE}/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '',
+    });
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_BAD_JSON');
+  });
+
+  it('POST whitespace-only body is M_BAD_JSON', async () => {
+    const { status, body } = await jsonRequest(`${BASE}/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '   \n\t  ',
+    });
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_BAD_JSON');
+  });
+
+  it('POST JSON null body throws when reading access_token (500)', async () => {
+    // c.req.json() succeeds with null; body.access_token then throws TypeError
+    const { status } = await jsonRequest(`${BASE}/account/register`, postJson(null));
+    expect(status).toBe(500);
+  });
+
+  it('POST nested access_token object echoes object token', async () => {
+    const nested = { nested: true };
+    const { status, body } = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: nested }))
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ token: nested });
+  });
+});
+
+describe('identity leftovers account soft-cap server name matrix', () => {
+
+  it('account user_id uses SERVER_NAME (example.com)', async () => {
+    const env = makeEnv();
+    (env as { SERVER_NAME: string }).SERVER_NAME = "example.com";
+    const { status, body } = await jsonRequest(
+      `${BASE}/account`,
+      { headers: { Authorization: 'Bearer t' } },
+      env
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ user_id: `@unknown:example.com` });
+  });
+
+  it('account user_id uses SERVER_NAME (matrix.example.com)', async () => {
+    const env = makeEnv();
+    (env as { SERVER_NAME: string }).SERVER_NAME = "matrix.example.com";
+    const { status, body } = await jsonRequest(
+      `${BASE}/account`,
+      { headers: { Authorization: 'Bearer t' } },
+      env
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ user_id: `@unknown:matrix.example.com` });
+  });
+
+  it('account user_id uses SERVER_NAME (localhost)', async () => {
+    const env = makeEnv();
+    (env as { SERVER_NAME: string }).SERVER_NAME = "localhost";
+    const { status, body } = await jsonRequest(
+      `${BASE}/account`,
+      { headers: { Authorization: 'Bearer t' } },
+      env
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ user_id: `@unknown:localhost` });
+  });
+
+  it('account user_id uses SERVER_NAME (127.0.0.1)', async () => {
+    const env = makeEnv();
+    (env as { SERVER_NAME: string }).SERVER_NAME = "127.0.0.1";
+    const { status, body } = await jsonRequest(
+      `${BASE}/account`,
+      { headers: { Authorization: 'Bearer t' } },
+      env
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ user_id: `@unknown:127.0.0.1` });
+  });
+
+  it('account user_id uses SERVER_NAME (hs.example.org:8448)', async () => {
+    const env = makeEnv();
+    (env as { SERVER_NAME: string }).SERVER_NAME = "hs.example.org:8448";
+    const { status, body } = await jsonRequest(
+      `${BASE}/account`,
+      { headers: { Authorization: 'Bearer t' } },
+      env
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ user_id: `@unknown:hs.example.org:8448` });
+  });
+
+  it('account user_id uses SERVER_NAME (xn--bcher-kva.example)', async () => {
+    const env = makeEnv();
+    (env as { SERVER_NAME: string }).SERVER_NAME = "xn--bcher-kva.example";
+    const { status, body } = await jsonRequest(
+      `${BASE}/account`,
+      { headers: { Authorization: 'Bearer t' } },
+      env
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ user_id: `@unknown:xn--bcher-kva.example` });
+  });
+});
+
+describe('identity leftovers register→account token passthrough flood', () => {
+
+  it('passthrough flood-0', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-0-z" }))
+    );
+    expect(reg.body.token).toBe("pass-0-z");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-1', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-1-zz" }))
+    );
+    expect(reg.body.token).toBe("pass-1-zz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-2', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-2-zzz" }))
+    );
+    expect(reg.body.token).toBe("pass-2-zzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-3', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-3-zzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-3-zzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-4', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-4-zzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-4-zzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-5', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-5-zzzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-5-zzzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-6', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-6-zzzzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-6-zzzzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-7', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-7-z" }))
+    );
+    expect(reg.body.token).toBe("pass-7-z");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-8', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-8-zz" }))
+    );
+    expect(reg.body.token).toBe("pass-8-zz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-9', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-9-zzz" }))
+    );
+    expect(reg.body.token).toBe("pass-9-zzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-10', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-10-zzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-10-zzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-11', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-11-zzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-11-zzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-12', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-12-zzzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-12-zzzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-13', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-13-zzzzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-13-zzzzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-14', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-14-z" }))
+    );
+    expect(reg.body.token).toBe("pass-14-z");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-15', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-15-zz" }))
+    );
+    expect(reg.body.token).toBe("pass-15-zz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-16', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-16-zzz" }))
+    );
+    expect(reg.body.token).toBe("pass-16-zzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-17', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-17-zzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-17-zzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-18', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-18-zzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-18-zzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-19', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-19-zzzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-19-zzzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-20', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-20-zzzzzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-20-zzzzzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-21', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-21-z" }))
+    );
+    expect(reg.body.token).toBe("pass-21-z");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-22', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-22-zz" }))
+    );
+    expect(reg.body.token).toBe("pass-22-zz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-23', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-23-zzz" }))
+    );
+    expect(reg.body.token).toBe("pass-23-zzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+
+  it('passthrough flood-24', async () => {
+    const reg = await jsonRequest(
+      `${BASE}/account/register`,
+      postJson(registerPayload({ access_token: "pass-24-zzzz" }))
+    );
+    expect(reg.body.token).toBe("pass-24-zzzz");
+    const acct = await jsonRequest(`${BASE}/account`, {
+      headers: { Authorization: `Bearer ${reg.body.token}` },
+    });
+    expect(acct.status).toBe(200);
+    expect(acct.body.user_id).toBe(`@unknown:${SERVER_NAME}`);
+  });
+});
