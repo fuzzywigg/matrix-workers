@@ -45,6 +45,7 @@ vi.mock('../src/utils/crypto', async (importOriginal) => {
 });
 
 import oauth, { hashClientSecret } from '../src/api/oauth';
+import { hashToken } from '../src/utils/crypto';
 
 type KvPut = { key: string; value: string; options?: { expirationTtl?: number } };
 type KvBarrier = { match: (key: string) => boolean; count: number };
@@ -1507,10 +1508,14 @@ describe('quinary oauth unsupported_grant_type exact description after #277 tip'
 
 describe('quinary oauth revoke+introspect token is required after #277 tip', () => {
   it('revoke miss ∥ introspect miss ∥ active introspect — binds token is required', async () => {
-    const sessions = mockKv();
-    const tok = 'rt-intro-active';
-    seedRefresh(sessions, tok);
-    const env = makeEnv({ sessions, db: aliceDb() });
+    const db = aliceDb();
+    const tok = 'at-intro-active';
+    db.tokensByHash.set(await hashToken(tok), {
+      user_id: USER_ID,
+      device_id: 'INTRO',
+      created_at: NOW,
+    });
+    const env = makeEnv({ db });
     const results = await Promise.all([
       request('/oauth/revoke', urlencoded({}), env),
       request('/oauth/introspect', urlencoded({}), env),
@@ -1528,10 +1533,14 @@ describe('quinary oauth revoke+introspect token is required after #277 tip', () 
 
   for (let i = 0; i < 12; i++) {
     it(`token is required revoke+introspect flood-${i}`, async () => {
-      const sessions = mockKv();
-      const tok = `rt-intro-f-${i}`;
-      seedRefresh(sessions, tok);
-      const env = makeEnv({ sessions, db: aliceDb() });
+      const db = aliceDb();
+      const tok = `at-intro-f-${i}`;
+      db.tokensByHash.set(await hashToken(tok), {
+        user_id: USER_ID,
+        device_id: `IF${i}`,
+        created_at: NOW,
+      });
+      const env = makeEnv({ db });
       const results = await Promise.all([
         request('/oauth/revoke', urlencoded({ token_type_hint: 'refresh_token' }), env),
         request('/oauth/introspect', jsonInit('POST', {}), env),
