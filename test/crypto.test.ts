@@ -1278,3 +1278,54 @@ describe('crypto TOKENMAXX residual tertiary leftovers after #290', () => {
     expect(over).toMatch(/at most 1000/);
   });
 });
+
+describe('crypto TOKENMAXX residual quaternary leftovers after #298', () => {
+  it('validatePasswordStrength concurrent letter/number exact strings stay independent', async () => {
+    const [noLetter, noNumber, okDigit, okSymbol, short, over] = await Promise.all([
+      Promise.resolve(validatePasswordStrength('12345678')),
+      Promise.resolve(validatePasswordStrength('password')),
+      Promise.resolve(validatePasswordStrength('abcdefgh1')),
+      Promise.resolve(validatePasswordStrength('abcdefg!')),
+      Promise.resolve(validatePasswordStrength('abcdef7')),
+      Promise.resolve(validatePasswordStrength(`${'a'.repeat(1000)}1`)),
+    ]);
+    expect(noLetter).toBe('Password must contain at least one letter');
+    expect(noNumber).toBe('Password must contain at least one number or special character');
+    expect(okDigit).toBeNull();
+    expect(okSymbol).toBeNull();
+    expect(short).toBe('Password must be at least 8 characters long');
+    expect(over).toBe('Password must be at most 1000 characters long');
+  });
+
+  it('validatePasswordStrength concurrent symbol-only / whitespace-only / unicode-letter exacts', async () => {
+    const [symbols, spaces, unicodeLetter, trailingSpace, mixedOk] = await Promise.all([
+      Promise.resolve(validatePasswordStrength('!!!!!!!!')),
+      Promise.resolve(validatePasswordStrength('        ')),
+      Promise.resolve(validatePasswordStrength('ééééééé1')),
+      Promise.resolve(validatePasswordStrength('abcdefgh ')),
+      Promise.resolve(validatePasswordStrength('1abcdefg')),
+    ]);
+    expect(symbols).toBe('Password must contain at least one letter');
+    expect(spaces).toBe('Password must contain at least one letter');
+    expect(unicodeLetter).toBe('Password must contain at least one letter');
+    expect(trailingSpace).toBe(
+      'Password must contain at least one number or special character'
+    );
+    expect(mixedOk).toBeNull();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`validatePasswordStrength exact complexity flood-${i}`, async () => {
+      const [letter, number, ok] = await Promise.all([
+        Promise.resolve(validatePasswordStrength(`${'9'.repeat(8 + (i % 3))}`)),
+        Promise.resolve(validatePasswordStrength(`${'a'.repeat(8 + (i % 3))}`)),
+        Promise.resolve(validatePasswordStrength(`pass${i}word1`)),
+      ]);
+      expect(letter).toBe('Password must contain at least one letter');
+      expect(number).toBe(
+        'Password must contain at least one number or special character'
+      );
+      expect(ok).toBeNull();
+    });
+  }
+});
