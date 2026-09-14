@@ -2920,3 +2920,636 @@ describe('register leftovers available unicode/whitespace soft reject flood', ()
     });
   }
 });
+
+// =============================================================================
+// Soft-cap flood continuation #2 — edge/failure/reliability leftovers
+// =============================================================================
+
+describe('oauth leftovers login page title soft reliability', () => {
+  it('title embeds serverName without escapeHtml (soft XSS surface)', () => {
+    const html = generateLoginPage('Client', 'req', 'srv<script>x');
+    expect(html).toContain('<title>Sign in - srv<script>x</title>');
+    expect(html).toContain('server-name">srv&lt;script&gt;x</span>');
+  });
+
+  it('clientName is escaped in subtitle but title still uses raw server', () => {
+    const html = generateLoginPage('<b>C</b>', 'req', 'raw&name');
+    expect(html).toContain('client-name">&lt;b&gt;C&lt;/b&gt;</span>');
+    expect(html).toContain('<title>Sign in - raw&name</title>');
+  });
+
+  it('falsy error variants omit error banner', () => {
+    for (const err of [undefined, '', undefined as unknown as string]) {
+      const html = generateLoginPage('C', 'id', 'srv', err);
+      expect(html).not.toContain('class="error"');
+    }
+  });
+
+  it('auth_request_id with angle brackets is attribute-escaped', () => {
+    const html = generateLoginPage('C', '"><img src=x>', 'srv');
+    expect(html).toContain('value="&quot;&gt;&lt;img src=x&gt;"');
+    expect(html).not.toContain('value=""><img');
+  });
+});
+
+describe('oauth leftovers uia pages script/session soft edges', () => {
+  it('success page escapes session inside postMessage script', () => {
+    const html = generateUiaSuccessPage("s'</script>", 'srv');
+    expect(html).toContain("session: 's&#039;&lt;/script&gt;'");
+    expect(html).toContain("session: 's&#039;&lt;/script&gt;' }, '*'");
+  });
+
+  it('success page escapes session in visible monospace block', () => {
+    const html = generateUiaSuccessPage('ab&cd<"e"', 'ex.com');
+    expect(html).toContain('Session: ab&amp;cd&lt;&quot;e&quot;');
+  });
+
+  it('cancelled page always posts uia_cancelled without session payload', () => {
+    const html = generateUiaCancelledPage('srv&x');
+    expect(html).toContain("type: 'uia_cancelled'");
+    expect(html).not.toContain('session:');
+    expect(html).toContain('<title>Cancelled - srv&amp;x</title>');
+  });
+
+  it('error page escapes title/message/server independently', () => {
+    const html = generateUiaErrorPage('T&1', 'M<2>', 'S"3');
+    expect(html).toContain('<title>T&amp;1 - S&quot;3</title>');
+    expect(html).toContain('<h1>T&amp;1</h1>');
+    expect(html).toContain('<p>M&lt;2&gt;</p>');
+  });
+});
+
+describe('oauth leftovers base64Url soft padding reliability', () => {
+  it('decode accepts canonical unpadded lengths 1..5 bytes', () => {
+    for (let len = 1; len <= 5; len++) {
+      const src = Uint8Array.from({ length: len }, (_, i) => (i * 17 + 3) & 0xff);
+      const enc = base64UrlEncode(src);
+      expect(enc).not.toMatch(/=/);
+      expect(Array.from(base64UrlDecode(enc))).toEqual(Array.from(src));
+    }
+  });
+
+  it('decode rejects whitespace-only input', () => {
+    expect(() => base64UrlDecode(' ')).toThrow();
+    expect(() => base64UrlDecode('\n\n')).toThrow();
+  });
+
+  it('decode rejects mixed url-safe and standard alphabet soft', () => {
+    // '+' is not valid in the input after -/_ remapping only; raw + may still decode via atob
+    // but '!' never maps — soft failure
+    expect(() => base64UrlDecode('ab!d')).toThrow();
+  });
+
+  it('hashClientSecret empty string is stable 43-char url-safe', async () => {
+    const h = await hashClientSecret('');
+    expect(h.length).toBe(43);
+    expect(h).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(await hashClientSecret('')).toBe(h);
+    expect(h).not.toBe(await hashClientSecret('x'));
+  });
+});
+
+describe('push leftovers matchesCondition sender_notification soft', () => {
+  it('sender_notification_permission always true regardless of event', () => {
+    expect(
+      matchesCondition({ kind: 'sender_notification_permission' }, {}, USER, 0)
+    ).toBe(true);
+    expect(
+      matchesCondition(
+        { kind: 'sender_notification_permission', key: 'room' },
+        { type: 'm.room.member' },
+        USER,
+        99
+      )
+    ).toBe(true);
+  });
+
+  it('unknown kinds remain vacuous true (soft default)', () => {
+    expect(
+      matchesCondition({ kind: 'not_a_real_kind' as 'event_match' }, msg, USER, 1)
+    ).toBe(true);
+    expect(
+      matchesCondition({ kind: '' as 'event_match' }, msg, USER, 1)
+    ).toBe(true);
+  });
+
+  it('room_member_count missing is → false', () => {
+    expect(matchesCondition({ kind: 'room_member_count' }, msg, USER, 5)).toBe(false);
+  });
+
+  it('event_property_is missing key → false even if value set', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_is', value: 'x' },
+        { content: { x: 'x' } },
+        USER,
+        1
+      )
+    ).toBe(false);
+  });
+});
+
+describe('push leftovers matchesRule pattern body soft failures', () => {
+  it('pattern rule false when content missing', () => {
+    const rule: PushRule = {
+      rule_id: '.m.rule.content',
+      default: false,
+      enabled: true,
+      pattern: 'hi',
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, {}, USER, 2)).toBe(false);
+    expect(matchesRule(rule, { content: null }, USER, 2)).toBe(false);
+  });
+
+  it('pattern rule false when body empty string', () => {
+    const rule: PushRule = {
+      rule_id: '.m.rule.content',
+      default: false,
+      enabled: true,
+      pattern: '*',
+      actions: ['notify'],
+    };
+    // empty body is falsy → early return false before glob
+    expect(matchesRule(rule, { content: { body: '' } }, USER, 2)).toBe(false);
+  });
+
+  it('no pattern and no conditions → true (catch-all soft)', () => {
+    const rule: PushRule = {
+      rule_id: 'catch',
+      default: false,
+      enabled: true,
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, {}, USER, 0)).toBe(true);
+  });
+
+  it('conditions every() short-circuits on first false', () => {
+    const rule: PushRule = {
+      rule_id: 'both',
+      default: false,
+      enabled: true,
+      conditions: [
+        { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        { kind: 'room_member_count', is: '==1' },
+      ],
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, msg, USER, 2)).toBe(false);
+    expect(matchesRule(rule, msg, USER, 1)).toBe(true);
+  });
+});
+
+describe('push leftovers evaluatePushRules highlight soft reliability', () => {
+  it('highlight value false clears highlight even with notify', async () => {
+    const result = await evaluatePushRules(
+      pushRulesDb([
+        {
+          kind: 'override',
+          rule_id: '.m.rule.master',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify', { set_tweak: 'highlight', value: false }]),
+          enabled: 1,
+        },
+      ]),
+      USER,
+      msg,
+      2
+    );
+    expect(result).toEqual({
+      notify: true,
+      highlight: false,
+      actions: ['notify', { set_tweak: 'highlight', value: false }],
+    });
+  });
+
+  it('highlight omitted value counts as highlight', async () => {
+    const result = await evaluatePushRules(
+      pushRulesDb([
+        {
+          kind: 'override',
+          rule_id: 'hl',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify', { set_tweak: 'highlight' }]),
+          enabled: 1,
+        },
+      ]),
+      USER,
+      msg,
+      2
+    );
+    expect(result.highlight).toBe(true);
+    expect(result.notify).toBe(true);
+  });
+
+  it('disabled custom override is skipped; custom underride still fires before defaults', async () => {
+    const result = await evaluatePushRules(
+      pushRulesDb([
+        {
+          kind: 'override',
+          rule_id: 'off',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 0,
+        },
+        {
+          kind: 'underride',
+          rule_id: 'on',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        },
+      ]),
+      USER,
+      msg,
+      2
+    );
+    // Custom underride is appended after defaults in getUserPushRules; default
+    // .m.rule.message matches first → notify+highlight from defaults.
+    expect(result.notify).toBe(true);
+    expect(result.highlight).toBe(true);
+    expect(result.actions).toEqual(
+      expect.arrayContaining(['notify', expect.objectContaining({ set_tweak: 'highlight' })])
+    );
+  });
+
+  it('empty custom ruleset still notifies via default .m.rule.message soft', async () => {
+    const result = await evaluatePushRules(pushRulesDb([]), USER, msg, 2);
+    expect(result.notify).toBe(true);
+    expect(result.highlight).toBe(true);
+    expect(result.actions).toEqual(
+      expect.arrayContaining([
+        'notify',
+        expect.objectContaining({ set_tweak: 'sound', value: 'default' }),
+        expect.objectContaining({ set_tweak: 'highlight', value: true }),
+      ])
+    );
+  });
+});
+
+describe('push leftovers notifyRoomMembers empty/corrupt soft reliability', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  it('no other members → no fetch and no queue', async () => {
+    const db = createPushDb({
+      members: [],
+      memberCount: 1,
+      pushRules: [
+        {
+          kind: 'override',
+          rule_id: 'n',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        },
+      ],
+    });
+    await notifyRoomMembersOfMessage(db, {} as Env, baseEvent());
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.queued).toEqual([]);
+  });
+
+  it('corrupt room name JSON falls back without throwing', async () => {
+    const db = createPushDb({
+      members: [PUSH_USER],
+      memberCount: 3,
+      roomNameContent: '{not-json',
+      pushRules: [
+        {
+          kind: 'override',
+          rule_id: 'n',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        },
+      ],
+      pushers: { [PUSH_USER]: [httpPusher()] },
+    });
+    await notifyRoomMembersOfMessage(db, {} as Env, baseEvent());
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.notification.room_name).toBe('Chat');
+  });
+
+  it('queueThrow is swallowed per-member (soft reliability)', async () => {
+    const db = createPushDb({
+      members: [PUSH_USER],
+      memberCount: 3,
+      queueThrow: true,
+      pushRules: [
+        {
+          kind: 'override',
+          rule_id: 'n',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        },
+      ],
+      pushers: { [PUSH_USER]: [httpPusher()] },
+    });
+    await expect(
+      notifyRoomMembersOfMessage(db, {} as Env, baseEvent())
+    ).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalled();
+    expect(db.queued).toEqual([]);
+  });
+
+  it('unreadCount null soft-defaults unread to 1 in payload', async () => {
+    const db = createPushDb({
+      members: [PUSH_USER],
+      memberCount: 3,
+      unreadCount: null,
+      pushRules: [
+        {
+          kind: 'override',
+          rule_id: 'n',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        },
+      ],
+      pushers: { [PUSH_USER]: [httpPusher()] },
+    });
+    await notifyRoomMembersOfMessage(db, {} as Env, baseEvent());
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.notification.counts.unread).toBe(1);
+  });
+});
+
+describe('push leftovers gateway format content soft reliability', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  it('event_id_only omits notification.content', async () => {
+    const db = createPushDb({
+      pushers: {
+        [PUSH_USER]: [
+          httpPusher({ format: 'event_id_only' }),
+        ],
+      },
+    });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 2 });
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.notification.content).toBeUndefined();
+  });
+
+  it('explicit non-event_id_only format includes content', async () => {
+    const db = createPushDb({
+      pushers: {
+        [PUSH_USER]: [
+          {
+            pushkey: 'pk',
+            kind: 'http',
+            app_id: 'app',
+            data: JSON.stringify({ url: 'https://push.example/g', format: 'full' }),
+          },
+        ],
+      },
+    });
+    const ev = baseEvent({ content: { body: 'secret', msgtype: 'm.text' } });
+    await sendPushNotification(db, PUSH_USER, ev, { unread: 1 });
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.notification.content).toEqual({ body: 'secret', msgtype: 'm.text' });
+  });
+
+  it('missing sender_display_name uses localpart soft', async () => {
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(
+      db,
+      PUSH_USER,
+      baseEvent({ sender: '@carol:example.com', sender_display_name: undefined }),
+      { unread: 1 }
+    );
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.notification.sender_display_name).toBe('carol');
+  });
+
+  it('gateway status 429 pins last_failure', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('slow', { status: 429 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 });
+    expect(db.updates[0]).toMatchObject({ kind: 'failure', ts: NOW });
+  });
+
+  it('gateway status 400 pins last_failure', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('bad', { status: 400 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(db, PUSH_USER, baseEvent(), { unread: 1 });
+    expect(db.updates[0].kind).toBe('failure');
+  });
+});
+
+describe('account-data leftovers empty content soft parse flood', () => {
+  it('empty string content parses as {} for global', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '', event_type: 'm.direct', content: '' }],
+    });
+    expect(await getGlobalAccountData(db, USER)).toEqual([
+      { type: 'm.direct', content: {} },
+    ]);
+  });
+
+  it('empty string content parses as {} for room', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '!r:x', event_type: 'm.tag', content: '' }],
+    });
+    expect(await getRoomAccountData(db, USER, '!r:x')).toEqual([
+      { type: 'm.tag', content: {} },
+    ]);
+  });
+
+  it('empty string content parses as {} for multi-room', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '!a:x', event_type: 'm.tag', content: '' }],
+    });
+    expect(await getAllRoomAccountData(db, USER, ['!a:x'])).toEqual({
+      '!a:x': [{ type: 'm.tag', content: {} }],
+    });
+  });
+
+  it('null content soft-parses as {} for room', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '!r:x', event_type: 'm.tag', content: null as unknown as string }],
+    });
+    expect(await getRoomAccountData(db, USER, '!r:x')).toEqual([
+      { type: 'm.tag', content: {} },
+    ]);
+  });
+
+  it('room since excludes when change pos equals since', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '!r:x', event_type: 'm.tag', content: '{"tags":{}}' }],
+      changes: [
+        { user_id: USER, room_id: '!r:x', event_type: 'm.tag', stream_position: 5 },
+      ],
+    });
+    expect(await getRoomAccountData(db, USER, '!r:x', 5)).toEqual([]);
+    expect(await getRoomAccountData(db, USER, '!r:x', 4)).toEqual([
+      { type: 'm.tag', content: { tags: {} } },
+    ]);
+  });
+});
+
+describe('register leftovers available taken variants soft reliability', () => {
+  it('guest user still counts as taken (M_USER_IN_USE)', async () => {
+    const db = createAvailableDb({
+      usersByLocalpart: new Map([
+        ['guest1', userRow({ user_id: '@guest1:example.com', localpart: 'guest1', is_guest: 1 })],
+      ]),
+    });
+    const { status, body } = await availableRequest(
+      availableEnv(db),
+      '/_matrix/client/v3/register/available?username=guest1'
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_USER_IN_USE');
+  });
+
+  it('deactivated user still counts as taken', async () => {
+    const db = createAvailableDb({
+      usersByLocalpart: new Map([
+        [
+          'gone',
+          userRow({
+            user_id: '@gone:example.com',
+            localpart: 'gone',
+            is_deactivated: 1,
+          }),
+        ],
+      ]),
+    });
+    const { status, body } = await availableRequest(
+      availableEnv(db),
+      '/_matrix/client/v3/register/available?username=gone'
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_USER_IN_USE');
+  });
+
+  it('admin user still counts as taken', async () => {
+    const db = createAvailableDb({
+      usersByLocalpart: new Map([
+        ['root', userRow({ user_id: '@root:example.com', localpart: 'root', admin: 1 })],
+      ]),
+    });
+    const { status, body } = await availableRequest(
+      availableEnv(db),
+      '/_matrix/client/v3/register/available?username=root'
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_USER_IN_USE');
+  });
+
+  it('binds exact localpart without case folding soft', async () => {
+    const db = createAvailableDb({
+      usersByLocalpart: new Map([
+        ['alice', userRow({ user_id: USER, localpart: 'alice' })],
+      ]),
+    });
+    // uppercase rejected before DB; lowercase taken hits DB
+    const upper = await availableRequest(
+      availableEnv(db),
+      '/_matrix/client/v3/register/available?username=Alice'
+    );
+    expect(upper.body.errcode).toBe('M_INVALID_USERNAME');
+    expect(db.selects).toHaveLength(0);
+    const lower = await availableRequest(
+      availableEnv(db),
+      '/_matrix/client/v3/register/available?username=alice'
+    );
+    expect(lower.body.errcode).toBe('M_USER_IN_USE');
+    expect(db.selects[0].args).toEqual(['alice']);
+  });
+});
+
+describe('register leftovers available soft reject control-char flood', () => {
+  const rejectCases = [
+    ['form-feed', 'a\fb'],
+    ['vertical-tab', 'a\vb'],
+    ['bom', '\ufeffalice'],
+    ['zwsp', 'a\u200bb'],
+    ['soft-hyphen', 'a\u00adb'],
+    ['rtl-mark', 'a\u200fb'],
+  ] as const;
+
+  for (const [label, username] of rejectCases) {
+    it(`rejects soft-invalid localpart (${label})`, async () => {
+      const { status, body } = await availableRequest(
+        availableEnv(createAvailableDb()),
+        `/_matrix/client/v3/register/available?username=${encodeURIComponent(username)}`
+      );
+      expect(status).toBe(400);
+      expect(body.errcode).toBe('M_INVALID_USERNAME');
+    });
+  }
+
+  it('accepts soft-valid all-digits localpart', async () => {
+    const { status, body } = await availableRequest(
+      availableEnv(createAvailableDb()),
+      '/_matrix/client/v3/register/available?username=123456'
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ available: true });
+  });
+
+  it('accepts soft-valid equals-only localpart', async () => {
+    const { status, body } = await availableRequest(
+      availableEnv(createAvailableDb()),
+      '/_matrix/client/v3/register/available?username==='
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ available: true });
+  });
+
+  it('accepts soft-valid slash-dot-underscore combo', async () => {
+    const { status, body } = await availableRequest(
+      availableEnv(createAvailableDb()),
+      '/_matrix/client/v3/register/available?username=a/b._=c-d'
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ available: true });
+  });
+});
+
+describe('oauth leftovers PKCE/plain whitespace soft verifier flood', () => {
+  it('plain rejects trailing space mismatch', async () => {
+    expect(await verifyCodeChallenge('abc ', 'abc', 'plain')).toBe(false);
+    expect(await verifyCodeChallenge('abc', 'abc ', 'plain')).toBe(false);
+  });
+
+  it('plain accepts identical strings with internal spaces', async () => {
+    expect(await verifyCodeChallenge('a b c', 'a b c', 'plain')).toBe(true);
+  });
+
+  it('S256 treats whitespace in verifier as significant', async () => {
+    const v1 = 'abc';
+    const v2 = 'abc ';
+    const h1 = base64UrlEncode(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v1))));
+    const h2 = base64UrlEncode(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v2))));
+    expect(h1).not.toBe(h2);
+    expect(await verifyCodeChallenge(v1, h1, 'S256')).toBe(true);
+    expect(await verifyCodeChallenge(v2, h1, 'S256')).toBe(false);
+    expect(await verifyCodeChallenge(v2, h2, 'S256')).toBe(true);
+  });
+
+  it('method nullish coerced string fails soft', async () => {
+    expect(await verifyCodeChallenge('x', 'x', String(null))).toBe(false);
+    expect(await verifyCodeChallenge('x', 'x', String(undefined))).toBe(false);
+  });
+});
