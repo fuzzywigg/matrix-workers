@@ -2862,3 +2862,221 @@ describe('database CRUD TOKENMAXX leftovers after #232', () => {
     await expect(getLatestStreamPosition(db)).resolves.toBe(9);
   });
 });
+
+describe('database CRUD TOKENMAXX leftovers after #241', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('getRoomEvents omits hashes/signatures even when the row stores them', async () => {
+    // SELECT * returns the columns, but the mapper never copies hashes/signatures
+    // (contrast getEvent / getEventsByIds which do).
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(
+          pdu({
+            event_id: '$h',
+            type: 'm.room.message',
+            content: { body: 'hi' },
+            hashes: { sha256: 'abc' },
+            signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+          }),
+          1
+        ),
+      ],
+    });
+    const { events } = await getRoomEvents(db, ROOM);
+    expect(events).toHaveLength(1);
+    expect(events[0]).not.toHaveProperty('hashes');
+    expect(events[0]).not.toHaveProperty('signatures');
+    expect(events[0].content).toEqual({ body: 'hi' });
+  });
+
+  it('getEventsSince / getRoomState also omit hashes and signatures', async () => {
+    const create = pdu({
+      event_id: '$c',
+      type: 'm.room.create',
+      state_key: '',
+      content: { creator: USER },
+      hashes: { sha256: 'c' },
+      signatures: { 'example.com': { 'ed25519:1': 's' } },
+    });
+    const msg = pdu({
+      event_id: '$m',
+      type: 'm.room.message',
+      content: { body: 'x' },
+      hashes: { sha256: 'm' },
+      signatures: { 'example.com': { 'ed25519:1': 's2' } },
+    });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(create, 1), eventRowFromPdu(msg, 2)],
+      roomState: [
+        { room_id: ROOM, event_type: 'm.room.create', state_key: '', event_id: '$c' },
+      ],
+    });
+    const since = await getEventsSince(db, ROOM, 0);
+    expect(since.every((e) => !('hashes' in e) && !('signatures' in e))).toBe(true);
+    const state = await getRoomState(db, ROOM);
+    expect(state).toHaveLength(1);
+    expect(state[0]).not.toHaveProperty('hashes');
+    expect(state[0]).not.toHaveProperty('signatures');
+  });
+
+  it('storeEvent rejects hard-cap oversized PDUs without writing a row', async () => {
+    const db = createCrudDb();
+    const event = pdu({
+      event_id: '$hard',
+      type: 'm.room.message',
+      content: { body: 'ok' },
+    });
+    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(event).length).toBeGreaterThan(921_600);
+    await expect(storeEvent(db, event)).rejects.toMatchObject({
+      errcode: 'M_TOO_LARGE',
+      status: 413,
+    });
+    expect(db._state.events).toHaveLength(0);
+  });
+
+  it('storeEventIdempotent treats missing meta.changes as inserted:false', async () => {
+    const db = createCrudDb();
+    const orig = db.prepare.bind(db);
+    db.prepare = ((sql: string) => {
+      if (sql.includes('INSERT OR IGNORE INTO events')) {
+        return {
+          bind() {
+            return {
+              async run() {
+                // No meta → (meta?.changes ?? 0) > 0 is false
+                return {};
+              },
+              first: async () => null,
+              all: async () => ({ results: [] }),
+            };
+          },
+        };
+      }
+      return orig(sql);
+    }) as typeof db.prepare;
+
+    const result = await storeEventIdempotent(
+      db,
+      pdu({ event_id: '$nomet', type: 'm.room.message', content: { body: 'x' } })
+    );
+    expect(result).toEqual({ inserted: false, streamOrdering: null });
+    expect(db._state.events).toHaveLength(0);
+    // Stream id is still allocated optimistically before INSERT
+    expect(db._state.streamPosition).toBe(1);
+  });
+
+  it('storeEventIdempotent defaults stream ordering to 1 when RETURNING is null', async () => {
+    const hybrid = createCrudDb({ streamPosition: 0 });
+    const orig = hybrid.prepare.bind(hybrid);
+    hybrid.prepare = ((sql: string) => {
+      if (sql.includes('UPDATE stream_positions')) {
+        return {
+          bind() {
+            return this;
+          },
+          first: async () => null,
+          all: async () => ({ results: [] }),
+          run: async () => ({ meta: { changes: 0 } }),
+        };
+      }
+      return orig(sql);
+    }) as typeof hybrid.prepare;
+
+    await expect(
+      storeEventIdempotent(
+        hybrid,
+        pdu({ event_id: '$fb-idem', type: 'm.room.message', content: { body: 'x' } })
+      )
+    ).resolves.toEqual({ inserted: true, streamOrdering: 1 });
+    expect(hybrid._state.events[0].stream_ordering).toBe(1);
+  });
+
+  it('getRoomEvents with limit 0 returns empty page and end fromToken/0', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$e1', type: 'm.room.message' }), 1)],
+    });
+    await expect(getRoomEvents(db, ROOM, 5, 0, 'b')).resolves.toEqual({
+      events: [],
+      end: 5,
+    });
+    await expect(getRoomEvents(db, ROOM, undefined, 0, 'f')).resolves.toEqual({
+      events: [],
+      end: 0,
+    });
+  });
+
+  it('getRoomEvents treats empty-string unsigned as falsy (maps to undefined)', async () => {
+    const db = createCrudDb({
+      events: [
+        {
+          event_id: '$u',
+          room_id: ROOM,
+          sender: USER,
+          event_type: 'm.room.message',
+          state_key: null,
+          content: '{}',
+          origin_server_ts: NOW,
+          unsigned: '',
+          depth: 1,
+          auth_events: '[]',
+          prev_events: '[]',
+          hashes: null,
+          signatures: null,
+          stream_ordering: 1,
+        },
+      ],
+    });
+    const { events } = await getRoomEvents(db, ROOM);
+    expect(events[0].unsigned).toBeUndefined();
+  });
+
+  it('getEventsByIds still maps hashes/signatures when getRoomEvents would omit them', async () => {
+    const event = pdu({
+      event_id: '$cmp',
+      type: 'm.room.message',
+      content: { body: 'cmp' },
+      hashes: { sha256: 'cmp' },
+      signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+    });
+    const db = createCrudDb({ events: [eventRowFromPdu(event, 1)] });
+    const [byId] = await getEventsByIds(db, ['$cmp']);
+    const { events: roomPage } = await getRoomEvents(db, ROOM);
+    expect(byId.hashes).toEqual({ sha256: 'cmp' });
+    expect(byId.signatures).toEqual({ 'example.com': { 'ed25519:1': 'sig' } });
+    expect(roomPage[0]).not.toHaveProperty('hashes');
+  });
+
+  it('storeEventIdempotent with null state_key still updates room_state when inserted', async () => {
+    const db = createCrudDb();
+    const event = pdu({
+      event_id: '$null-sk-idem',
+      type: 'm.room.name',
+      content: { name: 'Lobby' },
+    });
+    (event as { state_key: string | null }).state_key = null;
+    await expect(storeEventIdempotent(db, event)).resolves.toEqual({
+      inserted: true,
+      streamOrdering: 1,
+    });
+    expect(db._state.roomState.get(`${ROOM}\0m.room.name\0null`)).toBe('$null-sk-idem');
+  });
+
+  it('createDevice with explicit displayName binds the string (not null)', async () => {
+    const db = createCrudDb();
+    await createDevice(db, USER, 'PHONE', 'Pixel');
+    expect(db._state.devices[0]).toMatchObject({
+      user_id: USER,
+      device_id: 'PHONE',
+      display_name: 'Pixel',
+      created_at: NOW,
+    });
+  });
+});

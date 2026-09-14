@@ -357,3 +357,71 @@ describe('errors TOKENMAXX leftovers after #232', () => {
     spy.mockRestore();
   });
 });
+
+describe('errors TOKENMAXX leftovers after #241', () => {
+  it('limitExceeded.toResponse includes retry_after_ms in the JSON body', async () => {
+    const res = Errors.limitExceeded('slow', 2500).toResponse();
+    expect(res.status).toBe(429);
+    expect(res.headers.get('Content-Type')).toBe('application/json');
+    await expect(res.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'slow',
+      retry_after_ms: 2500,
+    });
+  });
+
+  it('toResponse omits retry_after_ms when retryAfterMs is 0 (falsy)', async () => {
+    const res = new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'slow', 429, 0).toResponse();
+    expect(res.status).toBe(429);
+    await expect(res.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'slow',
+    });
+  });
+
+  it('withErrorHandler does not console.error MatrixApiError throws', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = (await withErrorHandler(async () => {
+      throw Errors.forbidden('denied');
+    })) as Response;
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({
+      errcode: 'M_FORBIDDEN',
+      error: 'denied',
+    });
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('pins status 400 for missingParam / invalidParam and custom guestAccessForbidden message', () => {
+    expect(Errors.missingParam('user_id').status).toBe(400);
+    expect(Errors.invalidParam('limit').status).toBe(400);
+    expect(Errors.guestAccessForbidden('no guests').message).toBe('no guests');
+    expect(Errors.guestAccessForbidden('no guests').status).toBe(403);
+  });
+
+  it('jsonResponse serializes primitive string and number bodies', async () => {
+    await expect(jsonResponse('ok', 200).json()).resolves.toBe('ok');
+    await expect(jsonResponse(7, 201).json()).resolves.toBe(7);
+    expect(jsonResponse(7, 201).status).toBe(201);
+  });
+
+  it('emptyResponse body matches jsonResponse({}) at the same status', async () => {
+    const a = emptyResponse(201);
+    const b = jsonResponse({}, 201);
+    expect(a.status).toBe(b.status);
+    expect(a.headers.get('Content-Type')).toBe(b.headers.get('Content-Type'));
+    await expect(a.json()).resolves.toEqual(await b.json());
+  });
+
+  it('withErrorHandler maps undefined throws to M_UNKNOWN and logs them', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = (await withErrorHandler(async () => {
+      throw undefined;
+    })) as Response;
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toMatchObject({ errcode: 'M_UNKNOWN' });
+    expect(spy).toHaveBeenCalledWith('Unexpected error:', undefined);
+    spy.mockRestore();
+  });
+});

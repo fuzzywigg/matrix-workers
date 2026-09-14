@@ -900,3 +900,159 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #232', () => {
     );
   });
 });
+
+describe('notify / auth-chain / servers TOKENMAXX leftovers after #241', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('notifyUsersOfEvent with zero members still logs the notify line', async () => {
+    const env = {
+      notifies: [] as { userId: string; body: unknown }[],
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(..._args: unknown[]) {
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    return { results: [] as T[] };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: () => ({ name: 'unused' }),
+        get: () => ({
+          async fetch() {
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+    await notifyUsersOfEvent(env, '!r:example.com', '$none', 'm.room.message');
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      0,
+      'users of event',
+      '$none',
+      'users:',
+      ''
+    );
+  });
+
+  it('notifyUsersOfEvent binds roomId and names Sync DOs from each user_id', async () => {
+    const binds: unknown[][] = [];
+    const names: string[] = [];
+    const env = {
+      DB: {
+        prepare(_sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              binds.push(args);
+              return {
+                async all<T>() {
+                  return {
+                    results: [
+                      { user_id: '@alice:example.com' },
+                      { user_id: '@bob:example.com' },
+                    ] as T[],
+                  };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => {
+          names.push(name);
+          return { name };
+        },
+        get: (id: { name: string }) => ({
+          async fetch() {
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+    await notifyUsersOfEvent(env, '!lobby:example.com', '$e', 'm.room.message');
+    expect(binds).toEqual([['!lobby:example.com']]);
+    expect(names.sort()).toEqual(['@alice:example.com', '@bob:example.com']);
+  });
+
+  it('getStateAtEvent is one-level only (does not recurse into auth of auth)', async () => {
+    // Implementation fetches auth_events of the leaf via getEventsByIds — not getAuthChain.
+    const events = new Map<string, PDU>([
+      [
+        '$leaf',
+        pdu('$leaf', ['$parent'], {
+          type: 'm.room.member',
+          state_key: '@u:ex.com',
+          content: { membership: 'join' },
+        }),
+      ],
+      [
+        '$parent',
+        pdu('$parent', ['$grand'], {
+          type: 'm.room.member',
+          state_key: '@p:ex.com',
+          content: { membership: 'join' },
+        }),
+      ],
+      [
+        '$grand',
+        pdu('$grand', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:ex.com' },
+        }),
+      ],
+    ]);
+    const state = await getStateAtEvent(createAuthChainDb(events), '$leaf');
+    expect(state.map((e) => e.event_id)).toEqual(['$parent']);
+    expect(state.map((e) => e.event_id)).not.toContain('$grand');
+  });
+
+  it('getAuthChain handles a self-referential auth_events edge without looping', async () => {
+    const events = new Map<string, PDU>([['$self', pdu('$self', ['$self'])]]);
+    const chain = await getAuthChain(createAuthChainDb(events), ['$self']);
+    expect(chain).toHaveLength(1);
+    expect(chain[0].event_id).toBe('$self');
+  });
+
+  it('getServersInRoomsWithUser keeps empty-string server_name (only null is filtered)', async () => {
+    const db = {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async all<T>() {
+                return {
+                  results: [
+                    { server_name: '' },
+                    { server_name: 'peer.example.com' },
+                    { server_name: null },
+                  ] as T[],
+                };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    await expect(getServersInRoomsWithUser(db, '@alice:example.com')).resolves.toEqual([
+      '',
+      'peer.example.com',
+    ]);
+  });
+});

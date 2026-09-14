@@ -631,3 +631,102 @@ describe('federation signing TOKENMAXX leftovers after #232', () => {
     expect(await verifySignature(merged, 'b.example.com', b.keyId, b.publicKey)).toBe(true);
   });
 });
+
+describe('crypto TOKENMAXX leftovers after #241', () => {
+  it('rejects verifyPassword when stored hash is truncated (length mismatch)', async () => {
+    const real = await hashPassword('trunc-me-1');
+    const parts = real.split('$');
+    parts[4] = parts[4].slice(0, 8);
+    expect(await verifyPassword('trunc-me-1', parts.join('$'))).toBe(false);
+  });
+
+  it('rejects verifyPassword when the $-separated part count exceeds 5', async () => {
+    expect(
+      await verifyPassword('password1', '$pbkdf2-sha256$100000$c2FsdA==$aGFzaA==$extra')
+    ).toBe(false);
+  });
+
+  it('rejects verifyPassword when salt base64 is invalid (atob throws)', async () => {
+    await expect(
+      verifyPassword('password1', '$pbkdf2-sha256$100000$!!!not-b64!!!$aGFzaA==')
+    ).rejects.toThrow();
+  });
+
+  it('generateRandomString rejection-samples bytes >= 248 then still fills length', () => {
+    const orig = crypto.getRandomValues.bind(crypto);
+    let calls = 0;
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(((arr: Uint8Array) => {
+      calls += 1;
+      if (calls === 1) {
+        arr.fill(255); // all rejected (256 % 62 = 8 → maxValid 248)
+        return arr;
+      }
+      return orig(arr);
+    }) as typeof crypto.getRandomValues);
+    const s = generateRandomString(16);
+    expect(calls).toBeGreaterThan(1);
+    expect(s).toHaveLength(16);
+    expect(s).toMatch(/^[A-Za-z0-9]+$/);
+    vi.restoreAllMocks();
+  });
+
+  it('encodes object values that are undefined as null in canonicalJson', () => {
+    expect(canonicalJson({ a: undefined, b: 1 })).toBe('{"a":null,"b":1}');
+  });
+
+  it('rejects passwords that use only a trailing space as the non-letter class', () => {
+    expect(validatePasswordStrength('abcdefgh ')).toMatch(/number or special/);
+  });
+
+  it('calculateContentHash does not mutate the input signatures/unsigned maps', async () => {
+    const content = {
+      type: 'm.test',
+      content: { n: 1 },
+      signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+      unsigned: { age: 2 },
+    };
+    const before = JSON.stringify(content);
+    await calculateContentHash(content);
+    expect(JSON.stringify(content)).toBe(before);
+  });
+});
+
+describe('federation signing TOKENMAXX leftovers after #241', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('signJson overwrites the same serverName+keyId on re-sign', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const base = { type: 'm.test', content: { n: 1 } };
+    const once = await signJson(base, 'ex.com', keyId, privateKeyJwk);
+    const firstSig = (once.signatures as Record<string, Record<string, string>>)['ex.com'][keyId];
+    const twice = await signJson(
+      { ...once, content: { n: 2 } },
+      'ex.com',
+      keyId,
+      privateKeyJwk
+    );
+    const secondSig = (twice.signatures as Record<string, Record<string, string>>)['ex.com'][keyId];
+    expect(secondSig).not.toBe(firstSig);
+    expect(Object.keys((twice.signatures as Record<string, Record<string, string>>)['ex.com'])).toEqual([
+      keyId,
+    ]);
+    expect(await verifySignature(twice, 'ex.com', keyId, publicKey)).toBe(true);
+    expect(await verifySignature({ ...twice, content: { n: 1 } }, 'ex.com', keyId, publicKey)).toBe(
+      false
+    );
+  });
+
+  it('verifySignature returns false when the server map exists but the keyId slot is empty', async () => {
+    const { publicKey, keyId } = await generateSigningKeyPair();
+    const obj = { type: 'm.test', signatures: { 'ex.com': {} as Record<string, string> } };
+    expect(await verifySignature(obj, 'ex.com', keyId, publicKey)).toBe(false);
+  });
+});
