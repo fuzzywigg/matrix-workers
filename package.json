@@ -13,7 +13,7 @@
     "db:migrate:local": "wrangler d1 execute matrix-db --local --file=./migrations/schema.sql",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:media-presence-soft-concurrent": "vitest run test/media-api-concurrent-race-leftovers.test.ts test/media-api-soft-residual-second-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-concurrent-soft-leftovers.test.ts test/presence-receipts-typing-soft-residual-second-wave-concurrent-race-leftovers.test.ts",
+    "test:media-presence-soft-concurrent": "vitest run test/media-api-concurrent-race-leftovers.test.ts test/media-api-soft-residual-second-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-third-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-concurrent-soft-leftovers.test.ts test/presence-receipts-typing-soft-residual-second-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-third-wave-concurrent-race-leftovers.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/ test/",
     "worker:check": "wrangler deploy --dry-run --outdir=.wrangler-dry-run"
