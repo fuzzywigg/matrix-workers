@@ -651,3 +651,173 @@ describe('extractAccessToken TOKENMAXX HEAVY leftovers after #241', () => {
     expect(results).toEqual(['a', null, '+', null, 'q', null]);
   });
 });
+
+describe('extractAccessToken TOKENMAXX residual leftovers after #259', () => {
+  it('reads access_token over plain http:// (scheme-agnostic URL parse)', () => {
+    expect(
+      extractAccessToken(new Request('http://matrix.example.com/?access_token=http_tok'))
+    ).toBe('http_tok');
+  });
+
+  it('skips empty query segments (?&&access_token=…) and still finds the token', () => {
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?&&access_token=amp'))
+    ).toBe('amp');
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?=&access_token=empty_key'))
+    ).toBe('empty_key');
+  });
+
+  it('decodes percent-encoded & = # inside access_token values', () => {
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=a%26b'))
+    ).toBe('a&b');
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=a%3Db'))
+    ).toBe('a=b');
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=a%23b'))
+    ).toBe('a#b');
+  });
+
+  it('duplicate access_token with bare second key keeps the first non-empty value', () => {
+    expect(
+      extractAccessToken(
+        new Request('https://matrix.example.com/?access_token=first&access_token')
+      )
+    ).toBe('first');
+  });
+
+  it('rejects BOM (U+FEFF) in Authorization at Headers ByteString boundary', () => {
+    expect(() => {
+      const headers = new Headers();
+      headers.set('Authorization', 'Bearer\ufeffzw');
+    }).toThrow(/ByteString|greater than 255/i);
+  });
+
+  it('soft hyphen (U+00AD) is not JS \\s → Bearer miss; query wins when present', () => {
+    const headers = new Headers();
+    headers.set('Authorization', 'Bearer\u00adx');
+    expect(
+      extractAccessToken(
+        new Request('https://matrix.example.com/?access_token=from_q', { headers })
+      )
+    ).toBe('from_q');
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/', { headers }))
+    ).toBeNull();
+  });
+
+  it('mutating URL.searchParams after Request construction does not change extraction', () => {
+    const url = new URL('https://matrix.example.com/?access_token=orig');
+    const req = new Request(url);
+    url.searchParams.set('access_token', 'mutated');
+    expect(extractAccessToken(req)).toBe('orig');
+  });
+
+  it('reads access_token from an IDN host URL', () => {
+    expect(
+      extractAccessToken(new Request('https://mâtrix.example.com/?access_token=idn_tok'))
+    ).toBe('idn_tok');
+  });
+
+  it('percent-encoded query key %61ccess_token decodes to access_token', () => {
+    // searchParams decodes keys; %61 → "a"
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?%61ccess_token=enc_key'))
+    ).toBe('enc_key');
+  });
+
+  it('Fetch Headers trim a leading tab before Bearer so the regex still matches', () => {
+    const headers = new Headers();
+    headers.set('Authorization', '\tBearer tablead');
+    expect(headers.get('Authorization')).toBe('Bearer tablead');
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/', { headers }))
+    ).toBe('tablead');
+  });
+
+  it('Request.clone() preserves query access_token extraction', () => {
+    const req = new Request('https://matrix.example.com/?access_token=cloned');
+    expect(extractAccessToken(req.clone())).toBe('cloned');
+    expect(extractAccessToken(req)).toBe('cloned');
+  });
+
+  it('path percent-encoding (a%23b) does not invent an access_token', () => {
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/a%23b?foo=1'))
+    ).toBeNull();
+  });
+
+  it('trailing "&" after access_token still yields the token', () => {
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=trail&'))
+    ).toBe('trail');
+  });
+
+  it('soft-floods http∥&&∥%26∥soft-hyphen∥IDN∥%61-key isolation under Promise.all', async () => {
+    const softHeaders = new Headers();
+    softHeaders.set('Authorization', 'Bearer\u00adx');
+    const results = await Promise.all([
+      extractAccessToken(new Request('http://matrix.example.com/?access_token=a')),
+      extractAccessToken(new Request('https://matrix.example.com/?&&access_token=b')),
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=c%26d')),
+      extractAccessToken(
+        new Request('https://matrix.example.com/?access_token=e', { headers: softHeaders })
+      ),
+      extractAccessToken(new Request('https://mâtrix.example.com/?access_token=f')),
+      extractAccessToken(new Request('https://matrix.example.com/?%61ccess_token=g')),
+      extractAccessToken(new Request('https://matrix.example.com/a%23b')),
+      extractAccessToken(
+        new Request('https://matrix.example.com/?access_token=first&access_token')
+      ),
+    ]);
+    expect(results).toEqual(['a', 'b', 'c&d', 'e', 'f', 'g', null, 'first']);
+  });
+
+  it('soft-floods 96 distinct Bearer tokens under Promise.all without cross-talk', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 96 }, (_, i) =>
+        extractAccessToken(
+          new Request('https://matrix.example.com/', {
+            headers: { Authorization: `Bearer residual_${i}` },
+          })
+        )
+      )
+    );
+    expect(results).toEqual(Array.from({ length: 96 }, (_, i) => `residual_${i}`));
+  });
+
+  it('mixed residual header∥query∥miss resolutions stay isolated', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 36 }, (_, i) => {
+        const kind = i % 4;
+        if (kind === 0) {
+          return extractAccessToken(
+            new Request('https://matrix.example.com/', {
+              headers: { Authorization: `Bearer rh_${i}` },
+            })
+          );
+        }
+        if (kind === 1) {
+          return extractAccessToken(
+            new Request(`https://matrix.example.com/?access_token=rq_${i}`)
+          );
+        }
+        if (kind === 2) {
+          return extractAccessToken(
+            new Request(`http://matrix.example.com/?%61ccess_token=rk_${i}`)
+          );
+        }
+        return extractAccessToken(new Request('https://matrix.example.com/a%23b'));
+      })
+    );
+    for (let i = 0; i < results.length; i++) {
+      const kind = i % 4;
+      if (kind === 0) expect(results[i]).toBe(`rh_${i}`);
+      else if (kind === 1) expect(results[i]).toBe(`rq_${i}`);
+      else if (kind === 2) expect(results[i]).toBe(`rk_${i}`);
+      else expect(results[i]).toBeNull();
+    }
+  });
+});
