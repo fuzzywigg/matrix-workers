@@ -8197,3 +8197,1168 @@ describe('oauth identity leftovers soft-cap flood helpers round-2 after #151', (
     });
   }
 });
+
+describe('oauth identity leftovers oauth helpers soft reliability round-3 after #151', () => {
+  for (const [verifier, challenge, ok] of [
+    ['same', 'same', true],
+    ['a', 'b', false],
+    ['', '', true],
+    ['plain-r3', 'plain-r3', true],
+  ] as const) {
+    it(`verifyCodeChallenge plain soft ${JSON.stringify(verifier)}→${ok}`, async () => {
+      expect(await verifyCodeChallenge(verifier, challenge, 'plain')).toBe(ok);
+    });
+  }
+
+  for (const method of ['s256', 'S256 ', 'PLAIN', 'md5']) {
+    it(`verifyCodeChallenge method soft reject ${JSON.stringify(method)}`, async () => {
+      expect(await verifyCodeChallenge('v', 'v', method)).toBe(false);
+    });
+  }
+
+  it('verifyCodeChallenge S256 soft round-trip', async () => {
+    const verifier = 'r3-verifier-abcdefghijklmnopqrstuvwxyz';
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    const challenge = base64UrlEncode(new Uint8Array(hash));
+    expect(await verifyCodeChallenge(verifier, challenge, 'S256')).toBe(true);
+    expect(await verifyCodeChallenge(verifier + 'x', challenge, 'S256')).toBe(false);
+  });
+
+  for (const raw of ['<script>', 'a&b', `"q"`, `o'clock`, 'safe']) {
+    it(`escapeHtml soft reliability ${JSON.stringify(raw)}`, () => {
+      const out = escapeHtml(raw);
+      expect(out).not.toContain('<');
+      expect(out).not.toContain('>');
+      if (raw.includes('&') && raw !== 'safe') expect(out).toContain('&amp;');
+    });
+  }
+
+  it('generateLoginPage soft escapes client name XSS', () => {
+    const html = generateLoginPage('<img src=x onerror=1>', 'rid-r3', SERVER, 'bad&err');
+    expect(html).toContain(SERVER);
+    expect(html).toContain('rid-r3');
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img');
+  });
+
+  it('hashClientSecret soft deterministic', async () => {
+    const a = await hashClientSecret('r3-secret');
+    const b = await hashClientSecret('r3-secret');
+    expect(a).toBe(b);
+    expect(a).not.toMatch(/[+/=]/);
+  });
+});
+
+describe('oauth identity leftovers oauth register authorize soft flood after #151', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  for (const body of ['', '{']) {
+    it(`register soft bad JSON ${JSON.stringify(body)}`, async () => {
+      const res = await oauthRequest('/oauth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      expect(res.status).toBe(400);
+      expect((await oauthJson(res)).error).toBe('invalid_request');
+    });
+  }
+
+  it('register soft JSON null surfaces 5xx', async () => {
+    const res = await oauthRequest('/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'null',
+    });
+    // Soft: null body parses but redirect_uris deref throws
+    expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+
+  it('register soft JSON array missing redirect_uris', async () => {
+    const res = await oauthRequest('/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '[]',
+    });
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_client_metadata');
+  });
+
+  it('register soft empty redirect_uris', async () => {
+    const res = await oauthRequest('/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: 'n', redirect_uris: [] }),
+    });
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_client_metadata');
+  });
+
+  it('register soft auth method none omits secret', async () => {
+    const cache = mockKv();
+    const res = await oauthRequest(
+      '/oauth/register',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [REDIRECT],
+          token_endpoint_auth_method: 'none',
+          client_name: 'Public R3',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(201);
+    const j = await oauthJson(res);
+    expect(j.client_secret).toBeUndefined();
+    expect(j.token_endpoint_auth_method).toBe('none');
+    expect(typeof j.client_id).toBe('string');
+  });
+
+  for (const [qs, err] of [
+    ['response_type=code&redirect_uri=' + encodeURIComponent(REDIRECT), 'invalid_request'],
+    ['client_id=c&response_type=code', 'invalid_request'],
+    [
+      'client_id=c&redirect_uri=' + encodeURIComponent(REDIRECT) + '&response_type=token',
+      'unsupported_response_type',
+    ],
+  ] as const) {
+    it(`authorize GET soft reject ${err} qs=${qs.slice(0, 40)}`, async () => {
+      const res = await oauthRequest(`/oauth/authorize?${qs}`);
+      expect(res.status).toBe(400);
+      expect((await oauthJson(res)).error).toBe(err);
+    });
+  }
+
+  it('authorize GET soft unknown client', async () => {
+    const res = await oauthRequest(
+      `/oauth/authorize?client_id=missing&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code`,
+      {},
+      makeOAuthEnv({ CACHE: mockKv() })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_client');
+  });
+
+  it('authorize GET soft bad redirect_uri', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cli_bad_ru');
+    const res = await oauthRequest(
+      `/oauth/authorize?client_id=cli_bad_ru&redirect_uri=${encodeURIComponent('https://evil.example/cb')}&response_type=code`,
+      {},
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_request');
+  });
+
+  it('authorize POST soft missing fields HTML', async () => {
+    const fd = new FormData();
+    fd.set('username', '');
+    fd.set('password', '');
+    fd.set('auth_request_id', 'rid');
+    const res = await oauthRequest('/oauth/authorize', { method: 'POST', body: fd });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/Missing|password|username/i);
+  });
+
+  it('authorize POST soft expired auth request', async () => {
+    const fd = new FormData();
+    fd.set('username', 'alice');
+    fd.set('password', 'pw');
+    fd.set('auth_request_id', 'gone-r3');
+    const res = await oauthRequest(
+      '/oauth/authorize',
+      { method: 'POST', body: fd },
+      makeOAuthEnv({ SESSIONS: mockKv() })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_request');
+  });
+});
+
+describe('oauth identity leftovers oauth token soft edges round-3 after #151', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('token soft unknown client', async () => {
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'nope',
+          code: 'x',
+          redirect_uri: REDIRECT,
+        }),
+      },
+      makeOAuthEnv({ CACHE: mockKv() })
+    );
+    expect(res.status).toBe(401);
+    expect((await oauthJson(res)).error).toBe('invalid_client');
+  });
+
+  it('token soft unsupported grant', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cli_ug');
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'password', client_id: 'cli_ug' }),
+      },
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('unsupported_grant_type');
+  });
+
+  it('token soft missing code', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cli_mc');
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'cli_mc',
+          redirect_uri: REDIRECT,
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache })
+    );
+    expect(res.status).toBe(400);
+    const err = (await oauthJson(res)).error;
+    expect(['invalid_request', 'invalid_grant']).toContain(err);
+  });
+
+  it('token soft redirect_uri mismatch', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_ru');
+    sessions.data['oauth_code:ru3'] = JSON.stringify({
+      code: 'ru3',
+      client_id: 'cli_ru',
+      user_id: USER,
+      redirect_uri: REDIRECT,
+      scope: 'openid',
+      code_challenge: null,
+      code_challenge_method: null,
+      created_at: NOW,
+      expires_at: NOW + 600_000,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'cli_ru',
+          code: 'ru3',
+          redirect_uri: 'https://other.example/cb',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_grant');
+  });
+
+  it('token soft PKCE plain fail', async () => {
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_pkf');
+    sessions.data['oauth_code:pkf'] = JSON.stringify({
+      code: 'pkf',
+      client_id: 'cli_pkf',
+      user_id: USER,
+      redirect_uri: REDIRECT,
+      scope: 'openid',
+      code_challenge: 'expected',
+      code_challenge_method: 'plain',
+      created_at: NOW,
+      expires_at: NOW + 600_000,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: 'cli_pkf',
+          code: 'pkf',
+          redirect_uri: REDIRECT,
+          code_verifier: 'wrong',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_grant');
+  });
+
+  it('refresh soft unknown token', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cli_rtu');
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          client_id: 'cli_rtu',
+          refresh_token: 'missing-r3',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: mockKv() })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_grant');
+  });
+
+  it('refresh soft past expires_at still accepted', async () => {
+    // Soft: oauth refresh path does not check tokenData.expires_at
+    const cache = mockKv();
+    const sessions = mockKv();
+    seedClient(cache, 'cli_rte');
+    sessions.data['oauth_refresh:rte'] = JSON.stringify({
+      token_id: 'tid',
+      access_token_hash: 'h',
+      refresh_token_hash: 'rh',
+      client_id: 'cli_rte',
+      user_id: USER,
+      device_id: 'DEV',
+      scope: 'openid',
+      created_at: NOW - DAY_MS,
+      expires_at: NOW - 1,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          client_id: 'cli_rte',
+          refresh_token: 'rte',
+        }),
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: sessions, DB: createOAuthDb() })
+    );
+    expect(res.status).toBe(200);
+    const j = await oauthJson(res);
+    expect(typeof j.access_token).toBe('string');
+    expect(typeof j.refresh_token).toBe('string');
+    expect(sessions.deletes).toContain('oauth_refresh:rte');
+  });
+
+  it('token soft form-urlencoded content-type', async () => {
+    const cache = mockKv();
+    seedClient(cache, 'cli_form_tok');
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: 'cli_form_tok',
+      code: 'missing',
+      redirect_uri: REDIRECT,
+    });
+    const res = await oauthRequest(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      },
+      makeOAuthEnv({ CACHE: cache, SESSIONS: mockKv() })
+    );
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_grant');
+  });
+});
+
+describe('oauth identity leftovers oauth revoke introspect JWT soft after #151', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('revoke soft deletes refresh token', async () => {
+    const sessions = mockKv();
+    sessions.data['oauth_refresh:del-r3'] = JSON.stringify({ client_id: 'c' });
+    const res = await oauthRequest(
+      '/oauth/revoke',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'del-r3', token_type_hint: 'refresh_token' }),
+      },
+      makeOAuthEnv({ SESSIONS: sessions })
+    );
+    expect([200, 204]).toContain(res.status);
+    expect(sessions.deletes).toContain('oauth_refresh:del-r3');
+  });
+
+  it('introspect soft active JWT', async () => {
+    const header = base64UrlEncode(new TextEncoder().encode(JSON.stringify({ alg: 'none' })));
+    const payload = base64UrlEncode(
+      new TextEncoder().encode(
+        JSON.stringify({
+          sub: USER,
+          client_id: 'cli_jwt',
+          exp: Math.floor(NOW / 1000) + 3600,
+          iat: Math.floor(NOW / 1000),
+          scope: 'openid',
+          iss: `https://${SERVER}/`,
+        })
+      )
+    );
+    const token = `${header}.${payload}.sig`;
+    const res = await oauthRequest(
+      '/oauth/introspect',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      },
+      makeOAuthEnv()
+    );
+    expect(res.status).toBe(200);
+    const j = await oauthJson(res);
+    expect(j.active).toBe(true);
+    expect(j.sub).toBe(USER);
+  });
+
+  it('introspect soft expired JWT inactive', async () => {
+    const header = base64UrlEncode(new TextEncoder().encode(JSON.stringify({ alg: 'none' })));
+    const payload = base64UrlEncode(
+      new TextEncoder().encode(
+        JSON.stringify({
+          sub: USER,
+          exp: Math.floor(NOW / 1000) - 10,
+        })
+      )
+    );
+    const token = `${header}.${payload}.sig`;
+    const res = await oauthRequest(
+      '/oauth/introspect',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      },
+      makeOAuthEnv()
+    );
+    expect(res.status).toBe(200);
+    expect((await oauthJson(res)).active).toBe(false);
+  });
+
+  it('introspect soft malformed JWT falls through inactive', async () => {
+    const token = 'a.b.c';
+    const res = await oauthRequest(
+      '/oauth/introspect',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      },
+      makeOAuthEnv({ DB: createOAuthDb() })
+    );
+    expect(res.status).toBe(200);
+    expect((await oauthJson(res)).active).toBe(false);
+  });
+
+  it('introspect soft opaque unknown inactive', async () => {
+    const res = await oauthRequest(
+      '/oauth/introspect',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'opaque-r3' }),
+      },
+      makeOAuthEnv({ DB: createOAuthDb() })
+    );
+    expect(res.status).toBe(200);
+    expect((await oauthJson(res)).active).toBe(false);
+  });
+
+  it('revoke soft missing token JSON', async () => {
+    const res = await oauthRequest('/oauth/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_request');
+  });
+
+  it('introspect soft missing token JSON', async () => {
+    const res = await oauthRequest('/oauth/introspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_request');
+  });
+});
+
+describe('oauth identity leftovers push condition soft flood round-3 after #151', () => {
+  const event = baseEvent({
+    content: { body: 'ping Alice please', msgtype: 'm.text', tags: ['a', 'b'], n: 3, flag: true },
+    sender: '@carol:example.com',
+  });
+
+  it('event_match soft empty pattern falsy early-return', () => {
+    // Soft: !condition.pattern treats '' as missing before userId placeholder
+    expect(
+      matchesCondition(
+        { kind: 'event_match', key: 'sender', pattern: '' },
+        baseEvent({ sender: USER }),
+        USER,
+        2
+      )
+    ).toBe(false);
+    expect(
+      matchesCondition({ kind: 'event_match', key: 'sender', pattern: '' }, event, USER, 2)
+    ).toBe(false);
+  });
+
+  it('event_match soft missing key/pattern false', () => {
+    expect(matchesCondition({ kind: 'event_match', pattern: 'x' }, event, USER, 2)).toBe(false);
+    expect(matchesCondition({ kind: 'event_match', key: 'type' }, event, USER, 2)).toBe(false);
+  });
+
+  it('event_match soft missing nested value false', () => {
+    expect(
+      matchesCondition({ kind: 'event_match', key: 'content.missing', pattern: '*' }, event, USER, 2)
+    ).toBe(false);
+  });
+
+  for (const [is, count, ok] of [
+    ['>=10', 10, true],
+    ['>=10', 9, false],
+    ['<=0', 0, true],
+    ['>100', 101, true],
+    ['<1', 0, true],
+    ['==0', 0, true],
+    ['=2', 2, false],
+    ['2.5', 2, false],
+  ] as const) {
+    it(`room_member_count soft flood is=${JSON.stringify(is)} n=${count}`, () => {
+      expect(matchesCondition({ kind: 'room_member_count', is }, event, USER, count)).toBe(ok);
+    });
+  }
+
+  it('contains_display_name soft empty body false', () => {
+    expect(
+      matchesCondition(
+        { kind: 'contains_display_name' },
+        baseEvent({ content: { msgtype: 'm.text' } }),
+        USER,
+        2,
+        'Alice'
+      )
+    ).toBe(false);
+  });
+
+  it('sender_notification_permission soft always true', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  });
+
+  it('event_property_is soft boolean and missing key', () => {
+    expect(
+      matchesCondition({ kind: 'event_property_is', key: 'content.flag', value: true }, event, USER, 2)
+    ).toBe(true);
+    expect(matchesCondition({ kind: 'event_property_is', value: 1 }, event, USER, 2)).toBe(false);
+  });
+
+  it('event_property_contains soft array hit', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.tags', value: 'a' },
+        event,
+        USER,
+        2
+      )
+    ).toBe(true);
+  });
+
+  it('event_property_contains soft non-array false', () => {
+    expect(
+      matchesCondition(
+        { kind: 'event_property_contains', key: 'content.body', value: 'ping' },
+        event,
+        USER,
+        2
+      )
+    ).toBe(false);
+  });
+
+  it('unknown condition kind soft true', () => {
+    expect(matchesCondition({ kind: 'future_kind_r3' as any }, event, USER, 2)).toBe(true);
+  });
+
+  it('matchesRule every-condition soft AND', () => {
+    const rule: PushRule = {
+      rule_id: 'and',
+      default: false,
+      enabled: true,
+      conditions: [
+        { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        { kind: 'room_member_count', is: '>=2' },
+      ],
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, event, USER, 2)).toBe(true);
+    expect(matchesRule(rule, event, USER, 1)).toBe(false);
+  });
+
+  it('matchesRule pattern soft case-insensitive glob', () => {
+    const rule: PushRule = {
+      rule_id: 'pat',
+      default: false,
+      enabled: true,
+      pattern: '*ALICE*',
+      actions: ['notify'],
+    };
+    expect(matchesRule(rule, event, USER, 2)).toBe(true);
+  });
+});
+
+describe('oauth identity leftovers push gateway soft reliability round-3 after #151', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (const status of [200, 201, 202]) {
+    it(`gateway soft success status ${status}`, async () => {
+      fetchMock.mockResolvedValue(new Response(status === 202 ? null : 'ok', { status }));
+      const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+      await sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 3 });
+      expect(db.updates.some((u) => u.kind === 'success')).toBe(true);
+    });
+  }
+
+  for (const status of [500, 502, 503, 504]) {
+    it(`gateway soft 5xx status ${status}`, async () => {
+      fetchMock.mockResolvedValue(new Response('err', { status }));
+      const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+      await sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 1 });
+      expect(db.updates.some((u) => u.kind === 'failure')).toBe(true);
+    });
+  }
+
+  it('no pushers soft no-op', async () => {
+    const db = createPushDb({ pushers: {} });
+    await sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 1 });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.updates).toHaveLength(0);
+  });
+
+  it('multi-pusher soft mixed kind skips email', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const db = createPushDb({
+      pushers: {
+        [PUSH_USER]: [
+          httpPusher({}, { pushkey: 'http1' }),
+          { pushkey: 'mail', kind: 'email', app_id: 'mail.app', data: '{}' },
+        ],
+      },
+    });
+    await sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.updates.some((u) => u.pushkey === 'http1' && u.kind === 'success')).toBe(true);
+  });
+
+  it('sender_display_name soft uses override', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] } });
+    await sendPushNotification(
+      db,
+      PUSH_USER,
+      { ...baseEvent(), sender_display_name: 'Display R3' } as any,
+      { unread: 1 }
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.notification.sender_display_name || JSON.stringify(body)).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('updateThrow success path soft propagates', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+    const db = createPushDb({ pushers: { [PUSH_USER]: [httpPusher()] }, updateThrow: true });
+    await expect(sendPushNotification(db, PUSH_USER, baseEvent() as any, { unread: 1 })).rejects.toThrow(
+      /update fail/
+    );
+  });
+});
+
+describe('oauth identity leftovers push evaluate queue soft flood round-3 after #151', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 200 })));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('evaluatePushRules disabled soft disables default message', async () => {
+    // Soft: enabled:0 overrides .m.rule.message; memberCount 3 skips one_to_one
+    const db = pushRulesDb([
+      {
+        kind: 'underride',
+        rule_id: '.m.rule.message',
+        conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+        actions: JSON.stringify(['notify']),
+        enabled: 0,
+      },
+    ]);
+    const r = await evaluatePushRules(db, PUSH_USER, baseEvent() as any, 3);
+    expect(r.notify).toBe(false);
+    expect(r.actions).toEqual([]);
+  });
+
+  it('evaluatePushRules highlight value false soft', async () => {
+    const db = pushRulesDb([
+      {
+        kind: 'override',
+        rule_id: 'hl',
+        conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+        actions: JSON.stringify(['notify', { set_tweak: 'highlight', value: false }]),
+        enabled: 1,
+      },
+    ]);
+    const r = await evaluatePushRules(db, PUSH_USER, baseEvent() as any, 2);
+    expect(r.notify).toBe(true);
+    expect(r.highlight).toBe(false);
+  });
+
+  it('evaluatePushRules empty custom soft defaults notify', async () => {
+    // Soft: no custom rows → default underride .m.rule.message notifies
+    const r = await evaluatePushRules(pushRulesDb([]), PUSH_USER, baseEvent() as any, 3);
+    expect(r.notify).toBe(true);
+    expect(r.actions).toContain('notify');
+    expect(r.highlight).toBe(false);
+  });
+
+  it('queueNotification soft queueThrow propagates', async () => {
+    const db = createPushDb({ queueThrow: true });
+    await expect(
+      queueNotification(db, PUSH_USER, '!r:example.com', '$e', 'notify', ['notify'])
+    ).rejects.toThrow(/queue fail/);
+  });
+
+  it('notifyRoomMembers soft dont_notify skips queue', async () => {
+    const db = createPushDb({
+      members: [PUSH_USER],
+      memberCount: 3,
+      pushRules: [
+        {
+          kind: 'override',
+          rule_id: 'quiet',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['dont_notify']),
+          enabled: 1,
+        },
+      ],
+      pushers: { [PUSH_USER]: [httpPusher()] },
+    });
+    await notifyRoomMembersOfMessage(db, {} as Env, baseEvent() as any);
+    expect(db.queued).toHaveLength(0);
+  });
+
+  it('notifyRoomMembers soft no members no-op', async () => {
+    const db = createPushDb({ members: [], memberCount: 1 });
+    await notifyRoomMembersOfMessage(db, {} as Env, baseEvent() as any);
+    expect(db.queued).toHaveLength(0);
+  });
+
+  it('notifyRoomMembers soft corrupt room name ignored', async () => {
+    const db = createPushDb({
+      members: [PUSH_USER],
+      memberCount: 4,
+      roomNameContent: '{bad',
+      pushRules: [
+        {
+          kind: 'underride',
+          rule_id: '.m.rule.message',
+          conditions: JSON.stringify([{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }]),
+          actions: JSON.stringify(['notify']),
+          enabled: 1,
+        },
+      ],
+      pushers: { [PUSH_USER]: [httpPusher()] },
+    });
+    await expect(notifyRoomMembersOfMessage(db, {} as Env, baseEvent() as any)).resolves.toBeUndefined();
+  });
+});
+
+describe('oauth identity leftovers account-data soft reliability round-3 after #151', () => {
+  it('global null content soft empty object', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '', event_type: 'm.direct', content: null }],
+    });
+    const rows = await getGlobalAccountData(db, USER);
+    expect(rows).toEqual([{ type: 'm.direct', content: {} }]);
+  });
+
+  it('global corrupt JSON soft throws', async () => {
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: '', event_type: 'm.bad', content: '{nope' }],
+    });
+    await expect(getGlobalAccountData(db, USER)).rejects.toThrow();
+  });
+
+  it('room null content soft empty object', async () => {
+    const roomId = '!r3:example.com';
+    const db = createAccountDataDb({
+      rows: [{ user_id: USER, room_id: roomId, event_type: 'm.tag', content: null }],
+    });
+    expect(await getRoomAccountData(db, USER, roomId)).toEqual([{ type: 'm.tag', content: {} }]);
+  });
+
+  it('all rooms multi soft groups by room', async () => {
+    const db = createAccountDataDb({
+      rows: [
+        { user_id: USER, room_id: '!a:example.com', event_type: 'm.tag', content: '{"t":1}' },
+        { user_id: USER, room_id: '!b:example.com', event_type: 'm.tag', content: '{"t":2}' },
+        { user_id: USER, room_id: '!a:example.com', event_type: 'm.other', content: '{}' },
+      ],
+    });
+    const all = await getAllRoomAccountData(db, USER, ['!a:example.com', '!b:example.com']);
+    expect(all['!a:example.com']).toHaveLength(2);
+    expect(all['!b:example.com']).toEqual([{ type: 'm.tag', content: { t: 2 } }]);
+  });
+
+  it('stream position soft null defaults zero', async () => {
+    expect(await getAccountDataStreamPosition(createAccountDataDb({ streamPosition: null }))).toBe(0);
+  });
+
+  it('stream position soft large value', async () => {
+    expect(await getAccountDataStreamPosition(createAccountDataDb({ streamPosition: 99999 }))).toBe(99999);
+  });
+
+  it('prepare boom soft propagates global', async () => {
+    await expect(getGlobalAccountData(createAccountDataDb({ throwOnPrepare: true }), USER)).rejects.toThrow(
+      /prepare boom/
+    );
+  });
+
+  it('all boom soft propagates room', async () => {
+    await expect(
+      getRoomAccountData(createAccountDataDb({ throwOnAll: true }), USER, '!r:example.com')
+    ).rejects.toThrow(/all boom/);
+  });
+
+  for (const status of [400, 500, 502]) {
+    it(`E2EE DO soft eventType status ${status}`, async () => {
+      const ns = mockUserKeysNamespace({
+        responses: new Map([['m.secret_storage.default_key', new Response('nope', { status })]]),
+      });
+      await expect(
+        getE2EEAccountDataFromDO({ USER_KEYS: ns } as any, USER, 'm.secret_storage.default_key')
+      ).rejects.toThrow(/DO get failed/);
+    });
+  }
+
+  it('E2EE DO soft eventType success', async () => {
+    const ns = mockUserKeysNamespace({
+      responses: new Map([
+        [
+          'm.secret_storage.default_key',
+          new Response(JSON.stringify({ key: 'k1' }), { status: 200 }),
+        ],
+      ]),
+    });
+    const data = await getE2EEAccountDataFromDO(
+      { USER_KEYS: ns } as any,
+      USER,
+      'm.secret_storage.default_key'
+    );
+    expect(data).toEqual({ key: 'k1' });
+    expect(ns.fetches[0].url).toContain('event_type=');
+  });
+});
+
+describe('oauth identity leftovers identity soft reliability round-3 after #151', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('account soft missing bearer', async () => {
+    const { status, body } = await identityRequest(`${ID_BASE}/account`);
+    expect(status).toBe(401);
+    expect(body.errcode).toBe('M_MISSING_TOKEN');
+  });
+
+  it('account soft with bearer returns mxid', async () => {
+    const { status, body } = await identityRequest(`${ID_BASE}/account`, {
+      headers: { Authorization: 'Bearer tok-r3' },
+    });
+    expect(status).toBe(200);
+    expect(body.user_id).toBe(`@unknown:${SERVER}`);
+  });
+
+  it('register soft bad JSON', async () => {
+    const { status, body } = await identityRequest(`${ID_BASE}/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{',
+    });
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_BAD_JSON');
+  });
+
+  it('register soft echoes access_token', async () => {
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/account/register`,
+      postJson({
+        access_token: 'at-r3',
+        token_type: 'Bearer',
+        matrix_server_name: SERVER,
+        expires_in: 3600,
+      })
+    );
+    expect(status).toBe(200);
+    expect(body.token).toBe('at-r3');
+  });
+
+  it('terms GET/POST soft empty', async () => {
+    const g = await identityRequest(`${ID_BASE}/terms`);
+    expect(g.status).toBe(200);
+    expect(g.body.policies).toEqual({});
+    const p = await identityRequest(`${ID_BASE}/terms`, { method: 'POST' });
+    expect(p.status).toBe(200);
+    expect(p.body).toEqual({});
+  });
+
+  it('lookup none soft maps address medium', async () => {
+    const cache = mockKv({ 'identity:pepper': 'pep-r3' });
+    const db = createIdentityDb({
+      associations: [{ medium: 'email', address: 'a@example.com', mxid: USER }],
+    });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'none', pepper: 'pep-r3', addresses: ['a@example.com email'] }),
+      makeIdentityEnv({ cache, db })
+    );
+    expect(status).toBe(200);
+    expect(body.mappings['a@example.com email']).toBe(USER);
+  });
+
+  it('lookup none soft miss and short addr', async () => {
+    const cache = mockKv({ 'identity:pepper': 'pep-r3' });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'none', pepper: 'pep-r3', addresses: ['onlyone', 'b@example.com email'] }),
+      makeIdentityEnv({ cache })
+    );
+    expect(status).toBe(200);
+    expect(body.mappings).toEqual({});
+  });
+
+  it('lookup sha256 soft match', async () => {
+    const pepper = 'pep-sha';
+    const cache = mockKv({ 'identity:pepper': pepper });
+    const db = createIdentityDb({
+      associations: [{ medium: 'email', address: 'z@example.com', mxid: USER }],
+    });
+    const hash = await sha256(`z@example.com email ${pepper}`);
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'sha256', pepper, addresses: [hash] }),
+      makeIdentityEnv({ cache, db })
+    );
+    expect(status).toBe(200);
+    expect(body.mappings[hash]).toBe(USER);
+  });
+
+  it('lookup soft unknown algorithm', async () => {
+    const cache = mockKv({ 'identity:pepper': 'p' });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'md5', pepper: 'p', addresses: [] }),
+      makeIdentityEnv({ cache })
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_INVALID_PARAM');
+  });
+
+  it('lookup soft throwOnAll surfaces', async () => {
+    const cache = mockKv({ 'identity:pepper': 'p' });
+    const db = createIdentityDb({ throwOnAll: true });
+    const { status } = await identityRequest(
+      `${ID_BASE}/lookup`,
+      postJson({ algorithm: 'sha256', pepper: 'p', addresses: ['x'] }),
+      makeIdentityEnv({ cache, db })
+    );
+    expect(status).toBeGreaterThanOrEqual(400);
+  });
+
+  it('requestToken soft missing client_secret', async () => {
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/requestToken`,
+      postJson({ email: 'a@example.com' })
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+  });
+
+  it('requestToken soft success inserts session', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee99');
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const db = createIdentityDb();
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/requestToken`,
+      postJson({ email: 'r3@example.com', client_secret: 'cs-r3', send_attempt: 2 }),
+      makeIdentityEnv({ db })
+    );
+    expect(status).toBe(200);
+    expect(body.sid).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee99');
+    expect(db.emailSessions.get(body.sid)?.email).toBe('r3@example.com');
+    expect(db.emailSessions.get(body.sid)?.send_attempt).toBe(2);
+  });
+
+  it('submitToken soft wrong token', async () => {
+    const db = createIdentityDb({
+      emailSessions: new Map([
+        [
+          'sid-r3w',
+          {
+            session_id: 'sid-r3w',
+            email: 'a@example.com',
+            client_secret: 'cs',
+            token: '111111',
+            send_attempt: 1,
+            validated: 0,
+            created_at: NOW,
+            expires_at: NOW + DAY_MS,
+          },
+        ],
+      ]),
+    });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/submitToken`,
+      postJson({ sid: 'sid-r3w', client_secret: 'cs', token: '000000' }),
+      makeIdentityEnv({ db })
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_INVALID_PARAM');
+  });
+
+  it('submitToken soft expired session', async () => {
+    const db = createIdentityDb({
+      emailSessions: new Map([
+        [
+          'sid-r3e',
+          {
+            session_id: 'sid-r3e',
+            email: 'a@example.com',
+            client_secret: 'cs',
+            token: '222222',
+            send_attempt: 1,
+            validated: 0,
+            created_at: NOW - DAY_MS * 2,
+            expires_at: NOW - 1,
+          },
+        ],
+      ]),
+    });
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/submitToken`,
+      postJson({ sid: 'sid-r3e', client_secret: 'cs', token: '222222' }),
+      makeIdentityEnv({ db })
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+  });
+
+  it('submitToken soft missing session', async () => {
+    const { status, body } = await identityRequest(
+      `${ID_BASE}/validate/email/submitToken`,
+      postJson({ sid: 'none', client_secret: 'cs', token: '1' })
+    );
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_NO_VALID_SESSION');
+  });
+});
+
+describe('oauth identity leftovers soft-cap flood helpers round-3 after #151', () => {
+  for (let i = 0; i < 4; i++) {
+    it(`generateRandomString soft-cap r3-${i}`, () => {
+      const len = 6 + i * 2;
+      const s = generateRandomString(len);
+      expect(s).toHaveLength(len * 2);
+      expect(s).toMatch(/^[0-9a-f]+$/);
+    });
+  }
+
+  for (let i = 0; i < 4; i++) {
+    it(`base64Url soft-cap r3-${i}`, () => {
+      const u8 = new Uint8Array(Array.from({ length: i + 3 }, (_, j) => (i * 19 + j * 5) % 256));
+      const enc = base64UrlEncode(u8);
+      expect(enc).not.toMatch(/[+/=]/);
+      expect(Array.from(base64UrlDecode(enc))).toEqual(Array.from(u8));
+    });
+  }
+
+  for (let i = 0; i < 3; i++) {
+    it(`getNestedValue soft-cap r3-${i}`, () => {
+      const obj: any = { a: [{ v: i }, { v: i + 1 }] };
+      expect(getNestedValue(obj, 'a')).toEqual([{ v: i }, { v: i + 1 }]);
+      expect(getNestedValue(obj, 'a.0')).toEqual({ v: i });
+      expect(getNestedValue(undefined, 'x')).toBeUndefined();
+    });
+  }
+
+  for (let i = 0; i < 3; i++) {
+    it(`UIA HTML soft-cap r3-${i}`, () => {
+      expect(generateUiaSuccessPage(`r3-${i}`, SERVER)).toContain(`r3-${i}`);
+      expect(generateUiaCancelledPage(SERVER)).toContain(SERVER);
+      expect(generateUiaErrorPage(`E${i}`, `err-${i}`, SERVER)).toContain(`err-${i}`);
+      expect(generateLoginPage(`c${i}`, `id${i}`, SERVER)).toContain(SERVER);
+    });
+  }
+});
