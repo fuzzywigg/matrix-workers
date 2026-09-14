@@ -732,8 +732,6 @@ describe('push POST /_matrix/client/v3/pushers/set', () => {
 
   it('stores null profile_tag when omitted on create', async () => {
     const db = createPushDb();
-    const { profile_tag: _omit, ...body } = { ...VALID_PUSHER_BODY, profile_tag: 'x' } as any;
-    void _omit;
     const res = await request(
       db,
       '/_matrix/client/v3/pushers/set',
