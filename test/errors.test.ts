@@ -859,13 +859,13 @@ describe('errors TOKENMAXX residual quaternary leftovers after #303', () => {
       Promise.resolve(jsonResponse({ ok: true })),
       Promise.resolve(jsonResponse({ ok: false }, 201)),
       Promise.resolve(emptyResponse()),
-      Promise.resolve(emptyResponse(204)),
+      Promise.resolve(emptyResponse(202)),
     ]);
     expect(new Set([jsonDef, jsonCustom, emptyDef, emptyCustom]).size).toBe(4);
     expect(jsonDef.status).toBe(200);
     expect(jsonCustom.status).toBe(201);
     expect(emptyDef.status).toBe(200);
-    expect(emptyCustom.status).toBe(204);
+    expect(emptyCustom.status).toBe(202);
     await expect(jsonDef.json()).resolves.toEqual({ ok: true });
     await expect(jsonCustom.json()).resolves.toEqual({ ok: false });
     await expect(emptyDef.json()).resolves.toEqual({});
