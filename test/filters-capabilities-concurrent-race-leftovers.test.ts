@@ -30,6 +30,12 @@
  * failGet mid∥capabilities; oversized nested body; cross-user wipe inject;
  * query access_token ignored (auth mocked); PUT collection soft.
  *
+ * Residual deepen after #241: case-mismatched userId ≠ auth; forbidden
+ * error-message bind; capabilities HEAD + exact 5-key set; empty/ws
+ * filterId → {}; null-root POST→GET round-trip; delayPut∥failGet
+ * isolation; putBarrier mint → getBarrier dual-GET; empty deviceId;
+ * TTL pin under failPutAfter 1; mutateAfterGets corrupt inject → {}.
+ *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -2211,6 +2217,331 @@ describe('race filter oversized nested + collection method soft after #232', () 
       expect(aliceGone.status).toBe(403);
       expect(bobGot.status).toBe(200);
       expect(bobGot.body).toEqual(sampleFilter(77));
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — case-mismatched userId + forbidden message bind
+// ---------------------------------------------------------------------------
+
+describe('race filter case-mismatched userId soft after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`@Alice vs @alice path ≠ auth soft flood-${i}`, async () => {
+      // Handler uses strict !== — Matrix localparts are case-sensitive here
+      const mixed = encodeURIComponent('@Alice:example.com');
+      const cache = mockCache();
+      const env = createEnv(cache);
+      authState.userId = USER;
+      const results = await Promise.all([
+        request(env, `/_matrix/client/v3/user/${mixed}/filter`, jsonInit('POST', sampleFilter(i))),
+        request(env, filterCollection(USER_ENC), jsonInit('POST', sampleFilter(i + 1))),
+        request(
+          env,
+          `/_matrix/client/v3/user/${mixed}/filter/fid${i}`,
+          authGet()
+        ),
+      ]);
+      expect(results[0].status).toBe(403);
+      expect(results[0].body).toMatchObject({
+        errcode: 'M_FORBIDDEN',
+        error: 'Cannot create filters for other users',
+      });
+      expect(results[1].status).toBe(200);
+      expect(results[2].status).toBe(403);
+      expect(results[2].body).toMatchObject({
+        errcode: 'M_FORBIDDEN',
+        error: 'Cannot read filters for other users',
+      });
+      expect(filterKeys(cache)).toHaveLength(1);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`forbidden message bind∥capabilities soft flood-${i}`, async () => {
+      const env = createEnv(mockCache());
+      authState.userId = USER;
+      const results = await Promise.all([
+        request(env, filterCollection(BOB_ENC), jsonInit('POST', sampleFilter(i))),
+        request(env, filterPath(`x${i}`, BOB_ENC), authGet()),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+        request(env, filterCollection(CAROL_ENC), jsonInit('POST', sampleFilter(i))),
+      ]);
+      expect(results[0].body).toEqual({
+        errcode: 'M_FORBIDDEN',
+        error: 'Cannot create filters for other users',
+      });
+      expect(results[1].body).toEqual({
+        errcode: 'M_FORBIDDEN',
+        error: 'Cannot read filters for other users',
+      });
+      expect(results[2].status).toBe(200);
+      expectCapabilitiesShape(results[2].body);
+      expect(results[3].status).toBe(403);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — capabilities HEAD + exact top-level key set
+// ---------------------------------------------------------------------------
+
+describe('race capabilities HEAD + key-set bind after #241', () => {
+  const CAP_KEYS = [
+    'm.change_password',
+    'm.room_versions',
+    'm.set_displayname',
+    'm.set_avatar_url',
+    'm.3pid_changes',
+  ].sort();
+
+  for (let i = 0; i < 12; i++) {
+    it(`capabilities HEAD∥GET∥filter soft flood-${i}`, async () => {
+      const cache = mockCache();
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, capabilitiesPath(), { method: 'HEAD' }),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i))),
+        request(env, capabilitiesPath(), authGet()),
+      ]);
+      // HEAD may be 200 with empty body or 404/405 depending on Hono — soft
+      expect([200, 404, 405]).toContain(results[0].status);
+      expect(results[1].status).toBe(200);
+      expect(results[2].status).toBe(200);
+      expect(results[3].status).toBe(200);
+      expect(results[1].body).toEqual(results[3].body);
+      const keys = Object.keys(
+        (results[1].body as CapabilitiesBody).capabilities
+      ).sort();
+      expect(keys).toEqual(CAP_KEYS);
+      expect(cache.puts).toHaveLength(1);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`exact 5 capability keys under Promise.all soft flood-${i}`, async () => {
+      const env = createEnv();
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () =>
+          request(env, capabilitiesPath(), {
+            method: 'GET',
+            headers: { Authorization: 'Bearer ignored', Accept: '*/*' },
+          })
+        )
+      );
+      for (const r of results) {
+        expect(r.status).toBe(200);
+        const caps = (r.body as CapabilitiesBody).capabilities;
+        expect(Object.keys(caps).sort()).toEqual(CAP_KEYS);
+        expectCapabilitiesShape(r.body);
+      }
+      expect(results.every((r) => JSON.stringify(r.body) === JSON.stringify(results[0].body))).toBe(
+        true
+      );
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — empty/ws filterId + null-root round-trip
+// ---------------------------------------------------------------------------
+
+describe('race filter empty-id + null-root round-trip after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`empty/ws filterId GET → {} soft flood-${i}`, async () => {
+      const ids = ['', ' ', '  ', '%20', '%09'];
+      const fid = ids[i % ids.length];
+      const cache = mockCache({
+        [`filter:${USER}:real${i}`]: JSON.stringify(sampleFilter(i)),
+      });
+      const env = createEnv(cache);
+      const path =
+        fid === ''
+          ? `${filterCollection()}/`
+          : `${filterCollection()}/${fid}`;
+      const results = await Promise.all([
+        request(env, path, authGet()),
+        request(env, filterPath(`real${i}`), authGet()),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+      ]);
+      // Empty segment may 404 (no route) or hit GET with empty id → {}
+      if (results[0].status === 200) {
+        expect(results[0].body).toEqual({});
+      } else {
+        expect(results[0].status).toBeGreaterThanOrEqual(400);
+      }
+      expect(results[1].status).toBe(200);
+      expect(results[1].body).toEqual(sampleFilter(i));
+      expect(results[2].status).toBe(200);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`null-root POST→GET round-trip soft flood-${i}`, async () => {
+      const cache = mockCache();
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, filterCollection(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...AUTH },
+          body: 'null',
+        }),
+        request(env, filterCollection(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...AUTH },
+          body: 'null',
+        }),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      const ids = results.map((r) => (r.body as { filter_id: string }).filter_id);
+      expect(new Set(ids).size).toBe(2);
+      const got = await Promise.all(ids.map((id) => request(env, filterPath(id), authGet())));
+      // Stored "null" → JSON.parse → null → c.json(null)
+      expect(got[0].body).toBeNull();
+      expect(got[1].body).toBeNull();
+      expect(cache.puts.every((p) => p.value === 'null')).toBe(true);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — delayPut∥failGet + putBarrier→getBarrier lifecycle
+// ---------------------------------------------------------------------------
+
+describe('race filter delayPut∥failGet + barrier lifecycle after #241', () => {
+  for (let i = 0; i < 12; i++) {
+    it(`delayMsOnPut∥failGetAfter isolation soft flood-${i}`, async () => {
+      const seeded = `dly${i}`;
+      const cache = mockCache(
+        { [`filter:${USER}:${seeded}`]: JSON.stringify(sampleFilter(i)) },
+        { delayMsOnPut: 2 + (i % 3), failGetAfter: 1 }
+      );
+      const env = createEnv(cache);
+      const firstGet = await request(env, filterPath(seeded), authGet());
+      expect(firstGet.status).toBe(200);
+      const results = await Promise.all([
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i + 10))),
+        request(env, filterPath(seeded), authGet()),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+      ]);
+      expect(results[0].status).toBe(200);
+      expect(results[1].status).toBeGreaterThanOrEqual(500);
+      expect(results[2].status).toBe(200);
+      expect(cache.puts).toHaveLength(1);
+      expect(cache.puts[0].options?.expirationTtl).toBe(30 * 24 * 60 * 60);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`putBarrier mint then getBarrier dual-GET soft flood-${i}`, async () => {
+      const cache = mockCache({
+        putBarrier: { count: 2, match: (key) => key.startsWith(`filter:${USER}:`) },
+      });
+      const env = createEnv(cache);
+      const minted = await Promise.all([
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i))),
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i + 50))),
+      ]);
+      expect(statusesOf(minted)).toEqual([200, 200]);
+      const ids = minted.map((r) => (r.body as { filter_id: string }).filter_id);
+      const cache2 = mockCache(
+        {
+          [`filter:${USER}:${ids[0]}`]: JSON.stringify(sampleFilter(i)),
+          [`filter:${USER}:${ids[1]}`]: JSON.stringify(sampleFilter(i + 50)),
+        },
+        {
+          getBarrier: {
+            count: 2,
+            match: (key) => key === `filter:${USER}:${ids[0]}` || key === `filter:${USER}:${ids[1]}`,
+          },
+        }
+      );
+      const env2 = createEnv(cache2);
+      const got = await Promise.all([
+        request(env2, filterPath(ids[0]), authGet()),
+        request(env2, filterPath(ids[1]), authGet()),
+      ]);
+      expect(statusesOf(got)).toEqual([200, 200]);
+      const bodies = got.map((r) => r.body).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+      expect(bodies).toEqual(
+        [sampleFilter(i), sampleFilter(i + 50)].sort((a, b) =>
+          JSON.stringify(a).localeCompare(JSON.stringify(b))
+        )
+      );
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`TTL pin under failPutAfter 1 soft flood-${i}`, async () => {
+      const cache = mockCache({}, { failPutAfter: 1 });
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i))),
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i + 1))),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+      ]);
+      const ok = results.filter((r) => r.status === 200 && (r.body as { filter_id?: string }).filter_id);
+      const fail = results.filter((r) => r.status >= 500);
+      expect(ok.length).toBe(1);
+      expect(fail.length).toBe(1);
+      expect(results[2].status).toBe(200);
+      expect(cache.puts).toHaveLength(1);
+      expect(cache.puts[0].options?.expirationTtl).toBe(2592000);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Residual deepen after #241 — empty deviceId + corrupt mutateAfterGets inject
+// ---------------------------------------------------------------------------
+
+describe('race filter empty deviceId + corrupt inject after #241', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`empty deviceId portfolio soft flood-${i}`, async () => {
+      authState.deviceId = '';
+      const cache = mockCache();
+      const env = createEnv(cache);
+      const results = await Promise.all([
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i))),
+        request(env, filterCollection(), jsonInit('POST', sampleFilter(i + 3))),
+        request(env, capabilitiesPath(), { method: 'GET' }),
+      ]);
+      expect(statusesOf(results.slice(0, 2))).toEqual([200, 200]);
+      expect(results[2].status).toBe(200);
+      // deviceId is auth context only — KV keys still keyed by userId
+      expect(filterKeys(cache)).toHaveLength(2);
+      expect(cache.puts.every((p) => p.key.startsWith(`filter:${USER}:`))).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 12; i++) {
+    it(`mutateAfterGets corrupt inject → {} soft flood-${i}`, async () => {
+      const fid = `crpt${i}`;
+      const cache = mockCache(
+        { [`filter:${USER}:${fid}`]: JSON.stringify(sampleFilter(i)) },
+        {
+          getBarrier: { count: 2, match: (key) => key === `filter:${USER}:${fid}` },
+          mutateAfterGets: {
+            after: 2,
+            next: { [`filter:${USER}:${fid}`]: '{not-json' },
+          },
+        }
+      );
+      const env = createEnv(cache);
+      const [a, b] = await Promise.all([
+        request(env, filterPath(fid), authGet()),
+        request(env, filterPath(fid), authGet()),
+      ]);
+      expect(a.body).toEqual(sampleFilter(i));
+      expect(b.body).toEqual(sampleFilter(i));
+      const after = await Promise.all([
+        request(env, filterPath(fid), authGet()),
+        request(env, filterPath(fid), authGet()),
+      ]);
+      // Corrupt KV → JSON.parse catch → {}
+      expect(after.every((r) => r.status === 200 && JSON.stringify(r.body) === '{}')).toBe(true);
+      expect(cache.events).toContain('mutate:after-get');
     });
   }
 });
