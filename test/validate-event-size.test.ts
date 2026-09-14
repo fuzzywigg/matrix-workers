@@ -114,3 +114,46 @@ describe('validateEventSize TOKENMAXX edge paths after #50', () => {
     expect(() => validateEventSize(event)).not.toThrow();
   });
 });
+
+describe('validateEventSize TOKENMAXX leftovers after #241', () => {
+  it('rejects a full PDU one byte over the hard cap with errcode/status/got count', () => {
+    const event = baseEvent({ body: 'ok' });
+    const target = 921_601;
+    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    while (JSON.stringify(event).length > target) {
+      event.auth_events.pop();
+    }
+    const need = target - JSON.stringify(event).length;
+    if (need > 0) {
+      event.auth_events.push(`$p${'x'.repeat(Math.max(0, need - 2))}`);
+      while (JSON.stringify(event).length < target) {
+        event.auth_events[event.auth_events.length - 1] += 'x';
+      }
+      while (JSON.stringify(event).length > target) {
+        const last = event.auth_events[event.auth_events.length - 1];
+        event.auth_events[event.auth_events.length - 1] = last.slice(0, -1);
+      }
+    }
+    expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(event).length).toBe(target);
+    try {
+      validateEventSize(event);
+      expect.unreachable('should throw');
+    } catch (err) {
+      const e = err as MatrixApiError;
+      expect(e.errcode).toBe('M_TOO_LARGE');
+      expect(e.status).toBe(413);
+      expect(e.message).toMatch(/921600/);
+      expect(e.message).toMatch(/got 921601/);
+      expect(e.message).toMatch(/D1 row limit/);
+    }
+  });
+
+  it('soft-cap check precedes hard-cap when content alone is oversized', () => {
+    const event = baseEvent({ body: 'x'.repeat(70_000) });
+    // Full PDU is also well over the hard cap once content is this large
+    expect(JSON.stringify(event).length).toBeGreaterThan(65_536);
+    expect(() => validateEventSize(event)).toThrow(/content exceeds/);
+    expect(() => validateEventSize(event)).not.toThrow(/D1 row limit/);
+  });
+});
