@@ -4,7 +4,7 @@
  * Tests-only — no product inventing.
  * Exercises MSC4143 transports, /livekit/get_token (+ /sfu/get), CORS OPTIONS, 405.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
 
 vi.mock('../src/middleware/auth', () => ({
