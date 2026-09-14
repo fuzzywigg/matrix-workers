@@ -379,7 +379,7 @@ describe('race rate-limit bucket isolation login∥register after #223', () => {
       expect(regRes).toBe('register');
       expect(new Set(ctl.names)).toEqual(new Set(['login', 'register']));
       expect(ctl.bodies).toHaveLength(2);
-      expect(ctl.bodies.map((b) => b.limit).sort()).toEqual([
+      expect(ctl.bodies.map((b) => b.limit).sort((a, b) => a - b)).toEqual([
         RATE_LIMITS.register.requests,
         RATE_LIMITS.login.requests,
       ]);
