@@ -1,8 +1,9 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
- * / residual after #265 — admin API soft/edge/reliability. Complements
- * admin-api-routes.test.ts and admin-api-concurrent-race leftovers
- * (#239/#248/#265). Tests-only — no product inventing. Fixtures use example.com only.
+ * / residual after #265 / second-wave residual after tip #271 (post-#270) —
+ * admin API soft/edge/reliability. Complements admin-api-routes.test.ts and
+ * admin-api-concurrent-race leftovers (#239/#248/#265/#270). Tests-only —
+ * no product inventing. Fixtures use example.com only.
  *
  * Deepen after #241: analytics period soft, synapse destinations/event_reports,
  * federation status/servers/test, sessions revoke, make/remove-admin edges,
@@ -19,6 +20,11 @@
  * server-notice; reports resolve/unresolve; synapse deactivate; reset_password
  * logout_devices:true; registration PUT success; bulk-delete deleted:1;
  * room/user detail GETs — one-shots unsaturated in leftovers soft floods.
+ *
+ * Second-wave residual after tip #271 (post-#270): IdP discovery-fail /
+ * No-changes / DELETE 404 / unlink message; server-notice devices_notified:0;
+ * unresolve 404; keys reason ladder soft; reset_password omit logout_devices;
+ * PUT deactivated:true; DELETE deactivate.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -4605,6 +4611,216 @@ describe('admin leftovers registration success / bulk-delete / detail soft flood
       expect(res.body.success).toBe(true);
       expect(db.updates.some((u) => String(u.sql).includes('UPDATE users SET'))).toBe(true);
       expect(db.audit.some((a) => a.action === 'user.update')).toBe(true);
+    });
+  }
+});
+
+// second-wave residual soft floods after tip #271 (post-#270 niches unsaturated)
+
+describe('admin second-wave IdP discovery / No-changes / DELETE / unlink soft after #271', () => {
+  const DISCOVERY_ERR =
+    'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.';
+
+  for (let i = 0; i < 10; i++) {
+    it(`idp POST discovery-fail soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/idp/providers',
+        jsonInit('POST', {
+          name: `BadIdP-${i}`,
+          issuer_url: `https://bad-issuer-${i}.example.com`,
+          client_id: `cid-${i}`,
+          client_secret: `sec-${i}`,
+        }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_INVALID_PARAM');
+      expect(res.body.error).toBe(DISCOVERY_ERR);
+      expect(db.idpProviders.some((p) => p.name === `BadIdP-${i}`)).toBe(false);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp PUT empty No changes soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/idp/providers/idp1',
+        jsonInit('PUT', {}),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, message: 'No changes' });
+      expect(db.updates.every((u) => !String(u.sql).includes('UPDATE idp_providers SET'))).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp PUT issuer discovery-fail soft-${i}`, async () => {
+      const res = await jsonReq(
+        '/admin/api/idp/providers/idp1',
+        jsonInit('PUT', { issuer_url: `https://bad-issuer-upd-${i}.example.com` })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_INVALID_PARAM');
+      expect(res.body.error).toBe(DISCOVERY_ERR);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp DELETE missing 404 soft-${i}`, async () => {
+      const db = createAdminDb({ idpProviders: [] });
+      const res = await jsonReq(
+        `/admin/api/idp/providers/missing-${i}`,
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`idp unlink message soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        '/admin/api/idp/providers/idp1/links/10',
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, message: 'User link removed' });
+      expect(db.deletes.some((d) => String(d.sql).includes('DELETE FROM idp_user_links'))).toBe(true);
+    });
+  }
+});
+
+describe('admin second-wave notice0 / unresolve404 / keys reasons / reset-omit soft after #271', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`server-notice zero devices soft-${i}`, async () => {
+      const db = createAdminDb({
+        devices: [
+          {
+            user_id: ADMIN,
+            device_id: 'ADMINDEVICE',
+            display_name: 'Admin Device',
+            last_seen_ts: 5_000,
+            last_seen_ip: '1.2.3.4',
+          },
+        ],
+      });
+      const res = await jsonReq(
+        '/admin/api/server-notice',
+        jsonInit('POST', { user_id: BOB, message: `zero-${i}` }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.devices_notified).toBe(0);
+      expect(db.inserts.some((ins) => String(ins.sql).includes('to_device_messages'))).toBe(false);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`reports unresolve 404 soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/reports/${900 + i}/unresolve`,
+        { method: 'POST', headers: AUTH }
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`keys No signature in DB soft-${i}`, async () => {
+      const db = createAdminDb({ crossSigningSigs: [] });
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/keys`,
+        {},
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.user_id).toBe(BOB);
+      expect(
+        (res.body.verification_status as Record<string, { verified: boolean; reason: string }>).BOBDEVICE
+      ).toEqual({ verified: false, reason: 'No signature in DB' });
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`keys Signature not in device key soft-${i}`, async () => {
+      const deviceKeys = mockKv({
+        [`device:${BOB}:BOBDEVICE`]: JSON.stringify({
+          algorithms: ['m.olm.v1.curve25519-aes-sha2'],
+          device_id: 'BOBDEVICE',
+          user_id: BOB,
+          keys: { 'ed25519:BOBDEVICE': 'DEVKEY' },
+          signatures: { [BOB]: { 'ed25519:other': `sig-${i}` } },
+        }),
+      });
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/keys`,
+        {},
+        createEnv({ deviceKeys })
+      );
+      expect(res.status).toBe(200);
+      expect(
+        (res.body.verification_status as Record<string, { verified: boolean; reason: string }>).BOBDEVICE
+      ).toEqual({ verified: false, reason: 'Signature not in device key object' });
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`reset_password omit logout_devices soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/_synapse/admin/v1/reset_password/${encodeURIComponent(BOB)}`,
+        jsonInit('POST', { new_password: `Omit${i}!` }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({});
+      expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(0);
+      expect(db.users.find((u) => u.user_id === BOB)?.password_hash).toBe(`hashed:Omit${i}!`);
+      const audit = db.audit.find((a) => a.action === 'user.reset_password');
+      expect(JSON.parse(String(audit?.details)).logout_devices).toBe(true);
+    });
+  }
+});
+
+describe('admin second-wave PUT deactivated / DELETE deactivate soft after #271', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`PUT users deactivated:true soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}`,
+        jsonInit('PUT', { deactivated: true }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      const upd = db.updates.find((u) => String(u.sql).includes('UPDATE users SET') && String(u.sql).includes('is_deactivated = ?'));
+      expect(upd).toBeTruthy();
+      expect(upd!.args[0]).toBe(1);
+      const audit = [...db.audit].reverse().find((a) => a.action === 'user.update');
+      expect(JSON.parse(String(audit?.details)).deactivated).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`DELETE users deactivate soft-${i}`, async () => {
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}`,
+        { method: 'DELETE', headers: AUTH },
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(db.users.find((u) => u.user_id === BOB)?.is_deactivated).toBe(1);
+      expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(0);
+      expect(db.audit.some((a) => a.action === 'user.deactivate')).toBe(true);
     });
   }
 });

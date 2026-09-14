@@ -1,8 +1,9 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
- * / residual after #265 — federation S2S soft/edge/reliability (non-catchup).
- * Complements federation-api-routes.test.ts and federation-api-concurrent-race
- * leftovers (#239/#248/#265). Tests-only — no product inventing. Fixtures use
+ * / residual after #265 / second-wave residual after tip #271 (post-#270) —
+ * federation S2S soft/edge/reliability (non-catchup). Complements
+ * federation-api-routes.test.ts and federation-api-concurrent-race leftovers
+ * (#239/#248/#265/#270). Tests-only — no product inventing. Fixtures use
  * example.com only. Skips FederationCatchupWorkflow (#249/#250).
  *
  * Deepen after #241: hierarchy, timestamp_to_event, event_auth, backfill,
@@ -19,6 +20,12 @@
  * missing-hash v10/unknown; auth-denied; previously-accepted reuse;
  * invalid PDU/sender strings; legacy v1 accept; m.typing EDU record;
  * media 404 + Cache-Control; thumbnail height-clamp + meta-sans-R2.
+ *
+ * Second-wave residual after tip #271 (post-#270, skip catchup): custom
+ * rejection_reason echo; missing-hash room_version=11; auth-denied fallback
+ * Event authorization failed / DB Auth failed; pdus.unknown; openid success
+ * sub+token-retained; missing federationOrigin 401; hierarchy suggested_only
+ * absent returns non-suggested children.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -3669,6 +3676,234 @@ describe('soft media 404 / Cache-Control / thumb height leftover flood after #26
       );
       expect(r.status).toBe(404);
       expect((r.body as { error: string }).error).toBe('Media not found');
+    });
+  }
+});
+
+// second-wave residual soft floods after tip #271 (post-#270, skip catchup)
+
+describe('soft second-wave send custom-reject / hash-v11 / auth-fallback / unknown soft after #271', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    verifyContentHash.mockReset();
+    verifyContentHash.mockResolvedValue(true);
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`previously-rejected custom reason soft-${i}`, async () => {
+      const eid = `$customrej${i}`;
+      const reason = `custom-reason-${i}`;
+      const db = createFedDb({
+        processedPdus: { [eid]: { accepted: 0, rejection_reason: reason } },
+      });
+      const { status, body } = await req('PUT', `/_matrix/federation/v1/send/txn-customrej-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+          },
+        ],
+      });
+      expect(status).toBe(200);
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(reason);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`missing-hash room_version=11 soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '11', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$nohash11_${i}`;
+      const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-nohash11-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      });
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
+        'Missing required hashes.sha256 (room_version=11)'
+      );
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`auth-denied fallback Event authorization failed soft-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(true);
+      verifyContentHash.mockResolvedValue(true);
+      checkEventAuth.mockReturnValue({ allowed: false });
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      });
+      const eid = `$authfb${i}`;
+      const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-authfb-${i}`, makeEnv(db), {
+        pdus: [
+          {
+            event_id: eid,
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            hashes: { sha256: 'ok' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      });
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
+        'Event authorization failed'
+      );
+      const pduInsert = db.inserts.find(
+        (ins) =>
+          String(ins.sql).includes('INSERT OR REPLACE INTO processed_pdus') &&
+          ins.args[0] === eid
+      );
+      expect(pduInsert).toBeTruthy();
+      expect(pduInsert!.args).toContain('Auth failed');
+      expect(String(pduInsert!.sql)).toContain('VALUES (?, ?, ?, ?, 0, ?)');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`invalid PDU no event_id → pdus.unknown soft-${i}`, async () => {
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      });
+      const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-unknown-${i}`, makeEnv(db), {
+        pdus: [{ room_id: ROOM, type: 'm.room.message', content: { body: 'x' } }],
+      });
+      expect((body as { pdus: Record<string, { error: string }> }).pdus.unknown.error).toBe(
+        'Invalid PDU structure'
+      );
+    });
+  }
+});
+
+describe('soft second-wave openid retained / missing-origin / hierarchy nonsuggested soft after #271', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`openid success sub + token retained soft-${i}`, async () => {
+      const tok = `retain_tok_${i}`;
+      const sessions = mockKv({
+        [`openid:${tok}`]: JSON.stringify({ user_id: LOCAL_USER, expires_at: Date.now() + 120_000 }),
+      });
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/openid/userinfo?access_token=${tok}`,
+        makeEnv(createFedDb(), { sessions })
+      );
+      expect(r.status).toBe(200);
+      expect(r.body).toEqual({ sub: LOCAL_USER });
+      expect(sessions.data[`openid:${tok}`]).toBeTruthy();
+      expect(Object.keys(sessions.data)).toContain(`openid:${tok}`);
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`send missing federationOrigin 401 soft-${i}`, async () => {
+      federationOrigin = undefined;
+      const db = createFedDb();
+      const r = await req('PUT', `/_matrix/federation/v1/send/txn-noorigin-${i}`, makeEnv(db), {
+        pdus: [],
+      });
+      expect(r.status).toBe(401);
+      expect((r.body as { errcode: string; error: string }).errcode).toBe('M_UNAUTHORIZED');
+      expect((r.body as { error: string }).error).toBe('Federation authentication required');
+    });
+  }
+
+  function seedMixedSpace() {
+    const suggestedChild = '!sug:example.com';
+    const plainChild = '!plain:example.com';
+    const sugEvt = makeEvent({
+      event_id: '$suglink',
+      event_type: 'm.space.child',
+      state_key: suggestedChild,
+      content: JSON.stringify({ via: [SERVER], suggested: true }),
+    });
+    const plainEvt = makeEvent({
+      event_id: '$plainlink',
+      event_type: 'm.space.child',
+      state_key: plainChild,
+      content: JSON.stringify({ via: [SERVER], suggested: false }),
+    });
+    const name = makeEvent({
+      event_id: '$spname2',
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'MixedSpace' }),
+    });
+    const sugName = makeEvent({
+      event_id: '$sugname',
+      room_id: suggestedChild,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Suggested' }),
+    });
+    const plainName = makeEvent({
+      event_id: '$plainname',
+      room_id: plainChild,
+      event_type: 'm.room.name',
+      content: JSON.stringify({ name: 'Plain' }),
+    });
+    return createFedDb({
+      rooms: [
+        { room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 },
+        { room_id: suggestedChild, room_version: '10', is_public: 1, created_at: 2 },
+        { room_id: plainChild, room_version: '10', is_public: 1, created_at: 3 },
+      ],
+      events: [sugEvt, plainEvt, name, sugName, plainName],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.space.child', suggestedChild), sugEvt.event_id],
+        [stateKey(ROOM, 'm.space.child', plainChild), plainEvt.event_id],
+        [stateKey(ROOM, 'm.room.name', ''), name.event_id],
+        [stateKey(suggestedChild, 'm.room.name', ''), sugName.event_id],
+        [stateKey(plainChild, 'm.room.name', ''), plainName.event_id],
+      ]),
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`hierarchy nonsuggested included when suggested_only absent soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?limit=20`,
+        makeEnv(seedMixedSpace())
+      );
+      expect(r.status).toBe(200);
+      const body = r.body as { room: { room_id: string } | null; children: Array<{ room_id: string }> };
+      expect(body.room?.room_id).toBe(ROOM);
+      const childIds = body.children.map((c) => c.room_id);
+      expect(childIds).toContain('!sug:example.com');
+      expect(childIds).toContain('!plain:example.com');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`hierarchy suggested_only excludes nonsuggested soft-${i}`, async () => {
+      const r = await req(
+        'GET',
+        `/_matrix/federation/v1/hierarchy/${encodeURIComponent(ROOM)}?suggested_only=true&limit=20`,
+        makeEnv(seedMixedSpace())
+      );
+      expect(r.status).toBe(200);
+      const body = r.body as { children: Array<{ room_id: string }> };
+      const childIds = body.children.map((c) => c.room_id);
+      expect(childIds).toContain('!sug:example.com');
+      expect(childIds).not.toContain('!plain:example.com');
     });
   }
 });
