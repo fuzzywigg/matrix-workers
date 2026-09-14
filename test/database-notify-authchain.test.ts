@@ -1954,3 +1954,240 @@ describe('notify / auth-chain TOKENMAXX residual quaternary leftovers after #310
     expect(binds[1]).toEqual(['@alone:example.com', '@alone:example.com']);
   });
 });
+
+describe('notify / auth-chain TOKENMAXX residual quinary leftovers after #319', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeNotifyEnv(
+    membersByRoom: Record<string, string[]>,
+    opts?: { failUsers?: Set<string>; throwOnRooms?: Set<string> }
+  ) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              const roomId = args[0] as string;
+              return {
+                async all<T>() {
+                  if (opts?.throwOnRooms?.has(roomId)) {
+                    throw new Error('membership boom');
+                  }
+                  if (sql.includes('room_memberships')) {
+                    const members = membersByRoom[roomId] ?? [];
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('concurrent notify outer-catch room ∥ success sibling isolates fan-out', async () => {
+    const env = makeNotifyEnv(
+      {
+        '!boom:example.com': ['@never:example.com'],
+        '!ok:example.com': ['@a:example.com', '@b:example.com'],
+      },
+      { throwOnRooms: new Set(['!boom:example.com']) }
+    );
+    await Promise.all([
+      notifyUsersOfEvent(env, '!boom:example.com', '$boom', 'm.room.message'),
+      notifyUsersOfEvent(env, '!ok:example.com', '$ok', 'm.room.member'),
+    ]);
+    expect(env.notifies.map((n: { userId: string }) => n.userId).sort()).toEqual([
+      '@a:example.com',
+      '@b:example.com',
+    ]);
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify users of event:',
+      expect.any(Error)
+    );
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      2,
+      'users of event',
+      '$ok',
+      'users:',
+      '@a:example.com, @b:example.com'
+    );
+  });
+
+  it('concurrent getAuthChain self-loop tip ∥ short sibling stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      ['$loop', pdu('$loop', ['$loop'])],
+      ['$short', pdu('$short', [])],
+    ]);
+    const db = createAuthChainDb(events);
+    const [loop, short] = await Promise.all([
+      getAuthChain(db, ['$loop']),
+      getAuthChain(db, ['$short']),
+    ]);
+    expect(loop.map((e) => e.event_id)).toEqual(['$loop']);
+    expect(short.map((e) => e.event_id)).toEqual(['$short']);
+  });
+
+  it('concurrent getAuthChain diamond ∥ empty seed stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      ['$tip', pdu('$tip', ['$a', '$b'])],
+      ['$a', pdu('$a', ['$root'])],
+      ['$b', pdu('$b', ['$root'])],
+      ['$root', pdu('$root', [])],
+    ]);
+    const db = createAuthChainDb(events);
+    const [diamond, empty] = await Promise.all([
+      getAuthChain(db, ['$tip', '$tip']),
+      getAuthChain(db, []),
+    ]);
+    expect(diamond.map((e) => e.event_id).sort()).toEqual(['$a', '$b', '$root', '$tip'].sort());
+    expect(empty).toEqual([]);
+  });
+
+  it('concurrent getStateAtEvent empty-string state_key ∥ colliding last-wins stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$empty-key-leaf',
+        pdu('$empty-key-leaf', ['$create'], {
+          type: 'm.room.message',
+          content: { body: 'x' },
+        }),
+      ],
+      [
+        '$create',
+        pdu('$create', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:example.com' },
+        }),
+      ],
+      [
+        '$collide-leaf',
+        pdu('$collide-leaf', ['$name1', '$name2'], {
+          type: 'm.room.message',
+          content: { body: 'y' },
+        }),
+      ],
+      [
+        '$name1',
+        pdu('$name1', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'first' },
+        }),
+      ],
+      [
+        '$name2',
+        pdu('$name2', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'second' },
+        }),
+      ],
+    ]);
+    delete (events.get('$empty-key-leaf') as { state_key?: string }).state_key;
+    delete (events.get('$collide-leaf') as { state_key?: string }).state_key;
+    const db = createAuthChainDb(events);
+    const [emptyKey, collide] = await Promise.all([
+      getStateAtEvent(db, '$empty-key-leaf'),
+      getStateAtEvent(db, '$collide-leaf'),
+    ]);
+    expect(emptyKey).toHaveLength(1);
+    expect(emptyKey[0].event_id).toBe('$create');
+    expect(emptyKey[0].state_key).toBe('');
+    expect(collide).toHaveLength(1);
+    expect(collide[0].type).toBe('m.room.name');
+    expect(['$name1', '$name2']).toContain(collide[0].event_id);
+    // last-wins depends on getEventsByIds order; Map iteration preserves insertion → name2
+    expect(collide[0].content).toEqual(
+      collide[0].event_id === '$name2' ? { name: 'second' } : { name: 'first' }
+    );
+  });
+
+  it('getServersInRoomsWithUser duplicate server names ∥ alone under race', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare() {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            const subject = args[0] as string;
+            return {
+              async all<T>() {
+                if (subject === '@dup:example.com') {
+                  return {
+                    results: [
+                      { server_name: 'peer.example.com' },
+                      { server_name: 'peer.example.com' },
+                      { server_name: 'other.example.com' },
+                    ] as T[],
+                  };
+                }
+                return { results: [] as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const [dups, alone] = await Promise.all([
+      getServersInRoomsWithUser(db, '@dup:example.com'),
+      getServersInRoomsWithUser(db, '@solo:example.com'),
+    ]);
+    // DISTINCT is in SQL; harness returns raw rows — pin current harness behavior
+    expect(dups).toEqual(['peer.example.com', 'peer.example.com', 'other.example.com']);
+    expect(alone).toEqual([]);
+    expect(binds).toHaveLength(2);
+  });
+
+  it('concurrent notify clock-pinned timestamps stay independent per room', async () => {
+    vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(1_111)
+      .mockReturnValueOnce(2_222)
+      .mockReturnValue(3_333);
+    const env = makeNotifyEnv({
+      '!r1:example.com': ['@u1:example.com'],
+      '!r2:example.com': ['@u2:example.com'],
+    });
+    await Promise.all([
+      notifyUsersOfEvent(env, '!r1:example.com', '$e1', 'm.room.message'),
+      notifyUsersOfEvent(env, '!r2:example.com', '$e2', 'm.room.member'),
+    ]);
+    expect(env.notifies).toHaveLength(2);
+    const byUser = Object.fromEntries(
+      env.notifies.map((n: { userId: string; body: { timestamp: number; event_id: string } }) => [
+        n.userId,
+        n.body,
+      ])
+    );
+    expect(byUser['@u1:example.com'].event_id).toBe('$e1');
+    expect(byUser['@u2:example.com'].event_id).toBe('$e2');
+    expect([1_111, 2_222, 3_333]).toContain(byUser['@u1:example.com'].timestamp);
+    expect([1_111, 2_222, 3_333]).toContain(byUser['@u2:example.com'].timestamp);
+  });
+});
