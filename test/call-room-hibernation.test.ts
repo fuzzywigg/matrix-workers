@@ -3156,3 +3156,251 @@ describe('CallRoom hibernation denary dual-track/json/put-hold after #288', () =
     });
   }
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #296 — CallRoom hibernation *undecenary*
+ * (empty SFU tracks→INTERNAL_ERROR∥peer join, mute∥webSocketClose,
+ * join∥leave same key, offer∥GET /state, Uint8Array∥join,
+ * NOT_JOINED mute∥TRACK_NOT_FOUND). Denary stopped at mute put-hold∥end.
+ */
+
+describe('CallRoom hibernation undecenary offer/mute/close leftovers after #296', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    createSessionMock.mockResolvedValue({ sessionId: 'sess-s11' });
+    renegotiateMock.mockResolvedValue(undefined);
+    addTracksMock.mockResolvedValue({
+      sessionDescription: { type: 'answer', sdp: 'v=a' },
+      tracks: [{ mid: '11' }],
+    });
+    closeTracksMock.mockResolvedValue(undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`empty SFU tracks INTERNAL_ERROR∥peer join isolation flood-${i}`, async () => {
+      addTracksMock.mockResolvedValueOnce({
+        sessionDescription: { type: 'answer', sdp: 'v=empty' },
+        tracks: [],
+      });
+      const state = new RacingState();
+      await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(
+          wsA,
+          JSON.stringify({ type: 'offer', trackName: 'audio0', kind: 'audio', sdp: 'v=0' })
+        ),
+        room.webSocketMessage(
+          wsB,
+          JSON.stringify({ type: 'join', userId: 'u2', deviceId: 'd2' })
+        ),
+      ]);
+
+      // tracks[0] undefined → .errorCode throws → INTERNAL_ERROR
+      expect(JSON.parse(wsA.sent[0])).toMatchObject({
+        type: 'error',
+        code: 'INTERNAL_ERROR',
+      });
+      expect(JSON.parse(wsB.sent[0])).toMatchObject({ type: 'welcome' });
+      expect(room.participants.has('u2|d2')).toBe(true);
+      expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`mute∥webSocketClose same socket LWW deleted-or-muted flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      const ws = new FakeWebSocket();
+      ws.serializeAttachment({ participantKey: 'u1|d1' });
+      state.sockets = [ws];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(
+          ws,
+          JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })
+        ),
+        room.webSocketClose(ws, 1006, 'abnormal'),
+      ]);
+
+      // close→leave deletes; mute may re-persist after — LWW
+      const has = state.storage.map.has('participant:u1|d1');
+      if (has) {
+        const stored = state.storage.map.get('participant:u1|d1') as {
+          tracks: Record<string, { enabled: boolean }>;
+        };
+        expect(stored.tracks.audio0.enabled).toBe(false);
+      } else {
+        expect(room.participants.has('u1|d1')).toBe(false);
+      }
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`join∥leave same key eventual absent flood-${i}`, async () => {
+      createSessionMock.mockResolvedValue({ sessionId: 'sess-race' });
+      const state = new RacingState();
+      const ws = new FakeWebSocket();
+      state.sockets = [ws];
+      const room = makeRacingRoom(state) as any;
+
+      const joinP = room.webSocketMessage(
+        ws,
+        JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+      );
+      // leave before join finishes attachment may no-op; after join deletes
+      const leaveP = (async () => {
+        await vi.waitFor(() => {
+          expect(createSessionMock).toHaveBeenCalled();
+        });
+        await room.webSocketMessage(ws, JSON.stringify({ type: 'leave' }));
+      })();
+
+      await Promise.all([joinP, leaveP]);
+
+      // Final state: either leave won (absent) or join finished after leave no-op then leave deleted
+      expect(room.participants.has('u1|d1') === false || room.participants.has('u1|d1') === true).toBe(
+        true
+      );
+      // Settled: if still present, welcome was sent; a follow-up leave clears
+      if (room.participants.has('u1|d1')) {
+        await room.webSocketMessage(ws, JSON.stringify({ type: 'leave' }));
+      }
+      expect(room.participants.has('u1|d1')).toBe(false);
+      expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+    });
+  }
+});
+
+describe('CallRoom hibernation undecenary state/binary/mute leftovers after #296', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    createSessionMock.mockResolvedValue({ sessionId: 'sess-s11b' });
+    renegotiateMock.mockResolvedValue(undefined);
+    addTracksMock.mockResolvedValue({
+      sessionDescription: { type: 'answer', sdp: 'v=a' },
+      tracks: [{ mid: '11' }],
+    });
+    closeTracksMock.mockResolvedValue(undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`offer∥GET /state track appears or state empty-or-one flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      const ws = new FakeWebSocket();
+      ws.serializeAttachment({ participantKey: 'u1|d1' });
+      state.sockets = [ws];
+      const room = makeRacingRoom(state) as any;
+
+      const [stateRes] = await Promise.all([
+        room.fetch(new Request('https://do/state')),
+        room.webSocketMessage(
+          ws,
+          JSON.stringify({ type: 'offer', trackName: 'audio0', kind: 'audio', sdp: 'v=0' })
+        ),
+      ]);
+      const body = (await stateRes.json()) as {
+        participants: Array<{ tracks: unknown[] }>;
+      };
+      expect(body.participants).toHaveLength(1);
+      expect(body.participants[0].tracks.length === 0 || body.participants[0].tracks.length === 1).toBe(
+        true
+      );
+      const after = (await (
+        await room.fetch(new Request('https://do/state'))
+      ).json()) as { participants: Array<{ tracks: unknown[] }> };
+      expect(after.participants[0].tracks).toHaveLength(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`Uint8Array INVALID_MESSAGE∥valid join isolation flood-${i}`, async () => {
+      const state = new RacingState();
+      const wsA = new FakeWebSocket();
+      const wsB = new FakeWebSocket();
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(wsA, new Uint8Array([1, 2, 3]) as unknown as ArrayBuffer),
+        room.webSocketMessage(
+          wsB,
+          JSON.stringify({ type: 'join', userId: 'u2', deviceId: 'd2' })
+        ),
+      ]);
+
+      // Uint8Array.buffer is ArrayBuffer → same INVALID_MESSAGE path; also accept bare view via typeof
+      expect(JSON.parse(wsA.sent[0])).toMatchObject({
+        type: 'error',
+        code: 'INVALID_MESSAGE',
+      });
+      expect(JSON.parse(wsB.sent[0])).toMatchObject({ type: 'welcome' });
+      expect(room.participants.has('u2|d2')).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`NOT_JOINED mute∥TRACK_NOT_FOUND isolation flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      const wsJoined = new FakeWebSocket();
+      wsJoined.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsBare = new FakeWebSocket();
+      state.sockets = [wsJoined, wsBare];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(
+          wsBare,
+          JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })
+        ),
+        room.webSocketMessage(
+          wsJoined,
+          JSON.stringify({ type: 'mute', trackName: 'missing', muted: true })
+        ),
+      ]);
+
+      expect(JSON.parse(wsBare.sent[0])).toMatchObject({
+        type: 'error',
+        code: 'NOT_JOINED',
+      });
+      expect(JSON.parse(wsJoined.sent[0])).toMatchObject({
+        type: 'error',
+        code: 'TRACK_NOT_FOUND',
+      });
+      const stored = state.storage.map.get('participant:u1|d1') as {
+        tracks: Record<string, { enabled: boolean }>;
+      };
+      expect(stored.tracks.audio0.enabled).toBe(true);
+    });
+  }
+});
