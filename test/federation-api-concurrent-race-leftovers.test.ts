@@ -1,11 +1,11 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
- * / residual after #252 — federation-api concurrent race / TOCTOU for leftover
- * S2S routes (non-catchup) that only had serial soft floods (#157 leftover).
- * Distinct from federation-keys-membership-account-data concurrent-race
- * (OTK / make_join) and federation-api-route-leftovers (serial floods).
- * Distinct from tip #241 and #239 (this file's prior deepen). Skip catchup
- * residual covered by #249/#250.
+ * / residual after #252 / residual after #265 — federation-api concurrent race /
+ * TOCTOU for leftover S2S routes (non-catchup) that only had serial soft floods
+ * (#157 leftover). Distinct from federation-keys-membership-account-data
+ * concurrent-race (OTK / make_join) and federation-api-route-leftovers (serial
+ * floods). Distinct from tip #241/#239/#265 prior deepens. Skip catchup residual
+ * covered by #249/#250.
  *
  * Residual after #241: hierarchy∥timestamp∥backfill triple; thumbnail∥download;
  * event_auth∥get_missing isolation; version∥publicRooms — soft-flooded in
@@ -14,6 +14,10 @@
  * Residual after #252 (post-#248): send hash-mismatch∥prev-rejected;
  * download disposition∥octet-stream; thumbnail clamp∥non-image;
  * openid expired∥invalid; presence EDU∥noop EDU.
+ *
+ * Residual after #265 (post-#252, skip catchup): third-party∥origin sig;
+ * missing-hash∥auth-denied; previously-accepted∥rejected; invalid PDU∥sender;
+ * typing∥presence EDU; download 404∥thumb height-clamp.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -2488,6 +2492,332 @@ describe('race residual media disposition∥openid∥edu after #252', () => {
       const results = await Promise.all([
         req('GET', `/_matrix/federation/v1/media/download/${MEDIA_DISP}`, env),
         req('GET', `/_matrix/federation/v1/openid/userinfo?access_token=ok${i}`, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+// residual concurrent races after #265 (non-catchup soft niches not raced post-#252)
+
+describe('race residual third-party∥origin / missing-hash∥auth-denied after #265', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    verifyContentHash.mockReset();
+    verifyContentHash.mockResolvedValue(true);
+  });
+
+  it('third-party sig∥origin-server sig isolation', async () => {
+    verifyRemoteSignature.mockResolvedValue(false);
+    const db = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+    });
+    const env = makeEnv(db);
+    const [third, origin] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-third', env, {
+        pdus: [
+          {
+            event_id: '$r265third',
+            room_id: ROOM,
+            sender: '@carol:other.example.com',
+            type: 'm.room.message',
+            content: { body: 'x' },
+            signatures: { 'other.example.com': { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-origin', env, {
+        pdus: [
+          {
+            event_id: '$r265origin',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'y' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'bad' } },
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf([third, origin])).toEqual([200, 200]);
+    expect((third.body as { pdus: Record<string, { error: string }> }).pdus['$r265third'].error).toBe(
+      'Third-party PDU without valid signature'
+    );
+    expect((origin.body as { pdus: Record<string, { error: string }> }).pdus['$r265origin'].error).toBe(
+      'PDU from origin server without valid signature'
+    );
+  });
+
+  it('missing-hash v10∥auth-denied isolation', async () => {
+    verifyRemoteSignature.mockResolvedValue(true);
+    verifyContentHash.mockResolvedValue(true);
+    checkEventAuth.mockReturnValue({ allowed: false, error: 'power levels' });
+    const db = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+    });
+    const env = makeEnv(db);
+    const [nohash, deny] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-nohash', env, {
+        pdus: [
+          {
+            event_id: '$r265nohash',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-deny', env, {
+        pdus: [
+          {
+            event_id: '$r265deny',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'y' },
+            hashes: { sha256: 'ok' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf([nohash, deny])).toEqual([200, 200]);
+    expect((nohash.body as { pdus: Record<string, { error: string }> }).pdus['$r265nohash'].error).toBe(
+      'Missing required hashes.sha256 (room_version=10)'
+    );
+    expect((deny.body as { pdus: Record<string, { error: string }> }).pdus['$r265deny'].error).toBe(
+      'power levels'
+    );
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`third/hash residual flood-${i}`, async () => {
+      verifyRemoteSignature.mockResolvedValue(false);
+      const db = createFedDb({
+        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      });
+      const env = makeEnv(db);
+      const results = await Promise.all([
+        req('PUT', `/_matrix/federation/v1/send/txn-r265-t-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$t265_${i}`,
+              room_id: ROOM,
+              sender: '@carol:other.example.com',
+              type: 'm.room.message',
+              content: { body: 'x' },
+              signatures: { 'other.example.com': { 'ed25519:1': 'sig' } },
+            },
+          ],
+        }),
+        req('PUT', `/_matrix/federation/v1/send/txn-r265-o-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$o265_${i}`,
+              room_id: ROOM,
+              sender: REMOTE_USER,
+              type: 'm.room.message',
+              content: { body: 'y' },
+              signatures: { [FED_ORIGIN]: { 'ed25519:1': 'bad' } },
+            },
+          ],
+        }),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual previously-accepted∥rejected / invalid PDU∥sender after #265', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+    verifyRemoteSignature.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+  });
+
+  it('previously-accepted∥previously-rejected isolation', async () => {
+    const db = createFedDb({
+      processedPdus: {
+        '$r265ok': { accepted: 1, rejection_reason: null },
+        '$r265no': { accepted: 0, rejection_reason: null },
+      },
+    });
+    const env = makeEnv(db);
+    const [ok, no] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-ok', env, {
+        pdus: [
+          {
+            event_id: '$r265ok',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'x' },
+          },
+        ],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-no', env, {
+        pdus: [
+          {
+            event_id: '$r265no',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'y' },
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf([ok, no])).toEqual([200, 200]);
+    expect((ok.body as { pdus: Record<string, unknown> }).pdus['$r265ok']).toEqual({});
+    expect((no.body as { pdus: Record<string, { error: string }> }).pdus['$r265no'].error).toBe(
+      'Previously rejected'
+    );
+  });
+
+  it('invalid PDU structure∥invalid sender dual', async () => {
+    const db = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+    });
+    const env = makeEnv(db);
+    const [struct, sender] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-struct', env, {
+        pdus: [{ event_id: '$r265struct', room_id: ROOM }],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-sender', env, {
+        pdus: [
+          {
+            event_id: '$r265sender',
+            room_id: ROOM,
+            sender: 'noserver',
+            type: 'm.room.message',
+            content: { body: 'x' },
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf([struct, sender])).toEqual([200, 200]);
+    expect((struct.body as { pdus: Record<string, { error: string }> }).pdus['$r265struct'].error).toBe(
+      'Invalid PDU structure'
+    );
+    expect((sender.body as { pdus: Record<string, { error: string }> }).pdus['$r265sender'].error).toBe(
+      'Invalid sender format'
+    );
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`prev/invalid residual flood-${i}`, async () => {
+      const db = createFedDb({
+        processedPdus: {
+          [`$ok265_${i}`]: { accepted: 1, rejection_reason: null },
+          [`$no265_${i}`]: { accepted: 0, rejection_reason: null },
+        },
+      });
+      const env = makeEnv(db);
+      const results = await Promise.all([
+        req('PUT', `/_matrix/federation/v1/send/txn-r265-ok-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$ok265_${i}`,
+              room_id: ROOM,
+              sender: REMOTE_USER,
+              type: 'm.room.message',
+              content: { body: 'x' },
+            },
+          ],
+        }),
+        req('PUT', `/_matrix/federation/v1/send/txn-r265-no-${i}`, env, {
+          pdus: [
+            {
+              event_id: `$no265_${i}`,
+              room_id: ROOM,
+              sender: REMOTE_USER,
+              type: 'm.room.message',
+              content: { body: 'y' },
+            },
+          ],
+        }),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual typing∥presence EDU / media 404∥thumb height after #265', () => {
+  beforeEach(() => {
+    federationOrigin = FED_ORIGIN;
+  });
+
+  it('typing EDU∥presence EDU dual record', async () => {
+    const db = createFedDb();
+    const env = makeEnv(db);
+    const [typing, presence] = await Promise.all([
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-typing', env, {
+        pdus: [],
+        edus: [{ edu_type: 'm.typing', content: { room_id: ROOM } }],
+      }),
+      req('PUT', '/_matrix/federation/v1/send/txn-r265-pres', env, {
+        pdus: [],
+        edus: [
+          {
+            edu_type: 'm.presence',
+            content: {
+              push: [{ user_id: `@p265:${FED_ORIGIN}`, presence: 'online', currently_active: true }],
+            },
+          },
+        ],
+      }),
+    ]);
+    expect(statusesOf([typing, presence])).toEqual([200, 200]);
+    expect(db.inserts.some((ins) => String(ins.sql).includes('INSERT INTO presence'))).toBe(true);
+    const eduRows = db.inserts.filter((ins) => String(ins.sql).includes('INSERT OR REPLACE INTO processed_edus'));
+    expect(eduRows.length).toBeGreaterThanOrEqual(2);
+    expect(eduRows.some((ins) => ins.args[1] === 'm.typing')).toBe(true);
+  });
+
+  it('download 404∥thumbnail height-clamp isolation', async () => {
+    const MEDIA = 'fed_media_r265';
+    const thumbKey = `thumb_${MEDIA}_64x1920_scale`;
+    const media = mockR2({
+      [MEDIA]: new Uint8Array([1, 2, 3]),
+      [thumbKey]: new Uint8Array([8, 8, 8]),
+    });
+    const db = createFedDb({
+      media: [{ media_id: MEDIA, content_type: 'image/png', filename: 'a.png' }],
+    });
+    const env = makeEnv(db, { media });
+    const [miss, clamp] = await Promise.all([
+      req('GET', '/_matrix/federation/v1/media/download/missing_r265', env),
+      req(
+        'GET',
+        `/_matrix/federation/v1/media/thumbnail/${MEDIA}?width=64&height=99999&method=scale`,
+        env
+      ),
+    ]);
+    expect(miss.status).toBe(404);
+    expect((miss.body as { error: string }).error).toBe('Media not found');
+    expect(clamp.status).toBe(200);
+    expect(clamp.headers.get('Content-Type')).toBe('image/jpeg');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`edu/media residual flood-${i}`, async () => {
+      const MEDIA = 'fed_media_r265';
+      const media = mockR2({ [MEDIA]: new Uint8Array([i, i + 1, i + 2]) });
+      const db = createFedDb({
+        media: [{ media_id: MEDIA, content_type: 'image/png', filename: `f${i}.png` }],
+      });
+      const env = makeEnv(db, { media });
+      const results = await Promise.all([
+        req('PUT', `/_matrix/federation/v1/send/txn-r265-ty-${i}`, env, {
+          pdus: [],
+          edus: [{ edu_type: 'm.typing', content: { room_id: ROOM } }],
+        }),
+        req('GET', `/_matrix/federation/v1/media/download/${MEDIA}`, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
     });

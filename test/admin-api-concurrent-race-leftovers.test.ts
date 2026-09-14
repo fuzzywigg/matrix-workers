@@ -1,9 +1,9 @@
 /**
  * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 / residual after #241
- * / residual after #252 — admin concurrent race / TOCTOU for leftover admin-api
- * routes that only had serial soft floods (#157 leftover) or mutate races (#189).
- * Distinct from admin-mutate-concurrent-race-leftovers (writes) and
- * admin-api-route-leftovers (serial GET floods).
+ * / residual after #252 / residual after #265 — admin concurrent race / TOCTOU
+ * for leftover admin-api routes that only had serial soft floods (#157 leftover)
+ * or mutate races (#189). Distinct from admin-mutate-concurrent-race-leftovers
+ * (writes) and admin-api-route-leftovers (serial GET floods).
  *
  * Distinct from tip #241 (devices+keybackups residual) and #239 (this file's
  * prior deepen). Residual after #241: sessions list∥revoke; login-token∥sessions;
@@ -14,6 +14,10 @@
  * Residual after #252 (post-#248): Synapse PUT∥detail; room DELETE∥events;
  * media DELETE∥list; reset_password(false)∥sessions; registration fail∥GET;
  * bulk-delete self∥empty PUT errcode.
+ *
+ * Residual after #265 (post-#252): cleanup∥stats; create∥users list;
+ * server-notice∥sessions; resolve∥reports list; deactivate∥sessions;
+ * reset(true)∥sessions; bulk-delete BOB∥detail.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -3210,6 +3214,157 @@ describe('race residual reset_password∥sessions / registration fail after #252
         jsonReq(
           `/_synapse/admin/v1/reset_password/${bobEnc}`,
           jsonInit('POST', { new_password: `Keep${i}!`, logout_devices: false }),
+          env
+        ),
+        jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+// residual concurrent races after #265 (route-leftover soft niches not raced post-#252)
+
+describe('race residual cleanup∥stats / create∥list after #265', () => {
+  it('cleanup∥stats dual', async () => {
+    const db = createAdminDb();
+    const media = mockR2();
+    const env = createEnv({ db, media });
+    const [cleanup, stats] = await Promise.all([
+      jsonReq('/admin/api/cleanup', jsonInit('POST', {}), env),
+      jsonReq('/admin/api/stats', {}, env),
+    ]);
+    expect(cleanup.status).toBe(200);
+    expect(stats.status).toBe(200);
+    expect(cleanup.body.users_deleted).toBe(1);
+    expect(db.users.find((u) => u.user_id === BOB)).toBeUndefined();
+    expect(db.users.every((u) => u.admin === 1)).toBe(true);
+  });
+
+  it('create∥users list isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [create, list] = await Promise.all([
+      jsonReq(
+        '/admin/api/users/create',
+        jsonInit('POST', { username: 'carolrace', password: 'Secret1!', display_name: 'Carol' }),
+        env
+      ),
+      jsonReq('/admin/api/users?limit=20&search=carol', {}, env),
+    ]);
+    expect(create.status).toBe(200);
+    expect(list.status).toBe(200);
+    expect(create.body.user_id).toBe('@carolrace:example.com');
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`cleanup/create residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const media = mockR2();
+      const env = createEnv({ db, media });
+      const results = await Promise.all([
+        jsonReq('/admin/api/cleanup', jsonInit('POST', {}), env),
+        jsonReq('/admin/api/stats', {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual server-notice∥sessions / resolve∥reports after #265', () => {
+  it('server-notice∥sessions dual', async () => {
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const [notice, sessions] = await Promise.all([
+      jsonReq('/admin/api/server-notice', jsonInit('POST', { user_id: BOB, message: 'hi' }), env),
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+    ]);
+    expect(notice.status).toBe(200);
+    expect(sessions.status).toBe(200);
+    expect(notice.body.devices_notified).toBe(1);
+  });
+
+  it('resolve∥reports list isolation', async () => {
+    const db = createAdminDb();
+    const env = createEnv({ db });
+    const [resolve, list] = await Promise.all([
+      jsonReq('/admin/api/reports/1/resolve', jsonInit('POST', { note: 'done' }), env),
+      jsonReq('/admin/api/reports?resolved=false&limit=10', {}, env),
+    ]);
+    expect(resolve.status).toBe(200);
+    expect(list.status).toBe(200);
+    expect(db.reports.find((r) => r.id === 1)?.resolved).toBe(1);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`notice/resolve residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const bobEnc = encodeURIComponent(BOB);
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq('/admin/api/server-notice', jsonInit('POST', { user_id: BOB, message: `n${i}` }), env),
+        jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+    });
+  }
+});
+
+describe('race residual deactivate∥sessions / reset-true∥sessions after #265', () => {
+  it('synapse deactivate∥sessions clears tokens', async () => {
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const [deact, sessions] = await Promise.all([
+      jsonReq(`/_synapse/admin/v1/deactivate/${bobEnc}`, jsonInit('POST', {}), env),
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+    ]);
+    expect(deact.status).toBe(200);
+    expect(sessions.status).toBe(200);
+    expect(deact.body.id_server_unbind_result).toBe('success');
+    expect(db.users.find((u) => u.user_id === BOB)?.is_deactivated).toBe(1);
+  });
+
+  it('reset_password logout true∥sessions clears tokens', async () => {
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const [reset, sessions] = await Promise.all([
+      jsonReq(
+        `/_synapse/admin/v1/reset_password/${bobEnc}`,
+        jsonInit('POST', { new_password: 'ClearTok1!', logout_devices: true }),
+        env
+      ),
+      jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
+    ]);
+    expect(reset.status).toBe(200);
+    expect(sessions.status).toBe(200);
+    expect(db.tokens.filter((t) => t.user_id === BOB).length).toBe(0);
+  });
+
+  it('bulk-delete BOB∥synapse detail race', async () => {
+    const db = createAdminDb();
+    const bobEnc = encodeURIComponent(BOB);
+    const env = createEnv({ db });
+    const [bulk, detail] = await Promise.all([
+      jsonReq('/admin/api/users/bulk-delete', jsonInit('POST', { user_ids: [BOB] }), env),
+      jsonReq(`/_synapse/admin/v2/users/${bobEnc}`, {}, env),
+    ]);
+    expect(bulk.status).toBe(200);
+    expect(bulk.body.deleted).toBe(1);
+    expect([200, 404]).toContain(detail.status);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`deactivate/reset residual flood-${i}`, async () => {
+      const db = createAdminDb();
+      const bobEnc = encodeURIComponent(BOB);
+      const env = createEnv({ db });
+      const results = await Promise.all([
+        jsonReq(
+          `/_synapse/admin/v1/reset_password/${bobEnc}`,
+          jsonInit('POST', { new_password: `Clear${i}!`, logout_devices: true }),
           env
         ),
         jsonReq(`/admin/api/users/${bobEnc}/sessions`, {}, env),
