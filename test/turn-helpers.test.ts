@@ -716,3 +716,179 @@ describe('TURN helpers TOKENMAXX after #77/#78 (clock-pinned edges)', () => {
     ).toEqual({ configured: true, keyId: 'abcdefgh...' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// TOKENMAXX HEAVY after #87 — TURN exact messages / TTL quirks / rate-limit put TTL
+// ---------------------------------------------------------------------------
+
+describe('TURN helpers TOKENMAXX HEAVY after #87 (exact messages + TTL quirks)', () => {
+  const NOW = 1_730_000_000_000;
+
+  function iceOk() {
+    return {
+      iceServers: [
+        { urls: ['stun:stun.cloudflare.com:3478'] },
+        {
+          urls: ['turn:turn.example.com:3478?transport=udp'],
+          username: 'u',
+          credential: 'p',
+        },
+      ],
+    };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('pins exact NOT_CONFIGURED message', async () => {
+    await expect(getMatrixTurnCredentials({ CACHE: mockKv() } as Env)).rejects.toMatchObject({
+      code: 'NOT_CONFIGURED',
+      message: 'TURN server not configured. Set TURN_KEY_ID and TURN_API_TOKEN.',
+    });
+  });
+
+  it('pins exact USER_RATE_LIMITED message including retryAfterMs', async () => {
+    const kv = mockKv();
+    const env = turnEnv(kv);
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(iceOk()), { status: 200 })
+    );
+    for (let i = 0; i < 5; i++) {
+      await getMatrixTurnCredentials(env, 3600, '@exact:ex.com');
+    }
+    try {
+      await getMatrixTurnCredentials(env, 3600, '@exact:ex.com');
+      expect.unreachable('expected USER_RATE_LIMITED');
+    } catch (err) {
+      expect(err).toBeInstanceOf(TurnError);
+      const te = err as TurnError;
+      expect(te.code).toBe('USER_RATE_LIMITED');
+      expect(te.statusCode).toBe(429);
+      expect(te.retryAfterMs).toBeGreaterThanOrEqual(1000);
+      expect(te.message).toBe(`Rate limited. Try again in ${te.retryAfterMs}ms.`);
+    }
+  });
+
+  it('pins exact connect-failure messages for Error and non-Error rejects', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('dns fail'));
+    await expect(getMatrixTurnCredentials(turnEnv(mockKv()), 3600)).rejects.toMatchObject({
+      code: 'API_ERROR',
+      message: 'Failed to connect to TURN API: dns fail',
+    });
+
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockRejectedValue('boom');
+    await expect(getMatrixTurnCredentials(turnEnv(mockKv()), 3600)).rejects.toMatchObject({
+      code: 'API_ERROR',
+      message: 'Failed to connect to TURN API: Unknown error',
+    });
+  });
+
+  it('includes Got: JSON.stringify(data) in INVALID_RESPONSE for missing iceServers', async () => {
+    const payload = { iceServers: null };
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(payload), { status: 200 })
+    );
+    await expect(getMatrixTurnCredentials(turnEnv(mockKv()), 3600)).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE',
+      message: `TURN API response missing iceServers array. Got: ${JSON.stringify(payload)}`,
+    });
+  });
+
+  it('includes Got: payload when no credentialed TURN server present', async () => {
+    const payload = { iceServers: [{ urls: ['stun:only'] }] };
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(payload), { status: 200 })
+    );
+    await expect(getMatrixTurnCredentials(turnEnv(mockKv()), 3600)).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE',
+      message: `TURN API response has no server with credentials. Got: ${JSON.stringify(payload)}`,
+    });
+  });
+
+  it('documents TTL NaN / -1 / Infinity clamp quirks', async () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockImplementation(
+      async () => new Response(JSON.stringify(iceOk()), { status: 200 })
+    );
+
+    await getMatrixTurnCredentials(turnEnv(mockKv()), -1);
+    expect(fetchMock.mock.calls[0][1].body).toBe(JSON.stringify({ ttl: 300 }));
+
+    fetchMock.mockClear();
+    await getMatrixTurnCredentials(turnEnv(mockKv()), Number.POSITIVE_INFINITY);
+    expect(fetchMock.mock.calls[0][1].body).toBe(JSON.stringify({ ttl: 86400 }));
+
+    fetchMock.mockClear();
+    await getMatrixTurnCredentials(turnEnv(mockKv()), Number.NaN);
+    // Math.max/min with NaN propagates NaN → JSON null
+    expect(fetchMock.mock.calls[0][1].body).toBe(JSON.stringify({ ttl: null }));
+  });
+
+  it('writes rate-limit KV with expirationTtl 70 and skips ratelimit when userId omitted', async () => {
+    const puts: Array<{ key: string; options?: { expirationTtl?: number } }> = [];
+    const data: Record<string, string> = {};
+    const kv = {
+      get: async (key: string, type?: string) => {
+        const raw = data[key];
+        if (raw == null) return null;
+        if (type === 'json') return JSON.parse(raw);
+        return raw;
+      },
+      put: async (key: string, value: string, options?: { expirationTtl?: number }) => {
+        puts.push({ key, options });
+        data[key] = value;
+      },
+      delete: async (key: string) => {
+        delete data[key];
+      },
+      list: async () => ({ keys: [], list_complete: true, cacheStatus: null }),
+      getWithMetadata: async () => ({ value: null, metadata: null, cacheStatus: null }),
+    } as unknown as KVNamespace;
+
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(iceOk()), { status: 200 })
+    );
+
+    await getMatrixTurnCredentials(turnEnv(kv), 3600, '@ttl70:ex.com');
+    const rlPut = puts.find((p) => p.key === 'turn_ratelimit:@ttl70:ex.com');
+    expect(rlPut?.options?.expirationTtl).toBe(70);
+
+    puts.length = 0;
+    await getMatrixTurnCredentials(turnEnv(kv), 3600); // no userId
+    expect(puts.every((p) => !String(p.key).startsWith('turn_ratelimit:'))).toBe(true);
+  });
+
+  it('treats cache delete throw on expiry as miss and refetches', async () => {
+    const kv = {
+      get: async () => ({
+        username: 'stale',
+        password: 'x',
+        uris: ['turn:old'],
+        ttl: 10,
+        expiresAt: NOW, // expired at exact now
+      }),
+      put: async () => undefined,
+      delete: async () => {
+        throw new Error('delete fail');
+      },
+      list: async () => ({ keys: [], list_complete: true, cacheStatus: null }),
+      getWithMetadata: async () => ({ value: null, metadata: null, cacheStatus: null }),
+    } as unknown as KVNamespace;
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(iceOk()), { status: 200 })
+    );
+    await expect(getMatrixTurnCredentials(turnEnv(kv), 3600)).resolves.toMatchObject({
+      username: 'u',
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
