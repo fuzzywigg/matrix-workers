@@ -545,3 +545,109 @@ describe('extractAccessToken TOKENMAXX HEAVY leftovers after #232', () => {
     expect(extractAccessToken(req)).toBe('%61');
   });
 });
+
+describe('extractAccessToken TOKENMAXX HEAVY leftovers after #241', () => {
+  it('treats bare access_token (no "=") as empty/falsy → null', () => {
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token'))
+    ).toBeNull();
+    expect(
+      extractAccessToken(new Request('https://matrix.example.com/?access_token&foo=1'))
+    ).toBeNull();
+  });
+
+  it('reads access_token from an IPv6-literal host URL', () => {
+    const req = new Request('https://[::1]:8448/_matrix/client/v3/sync?access_token=ipv6_tok');
+    expect(extractAccessToken(req)).toBe('ipv6_tok');
+  });
+
+  it('NEL (U+0085) is not JS \\s → Bearer miss; falls through to query', () => {
+    const headers = new Headers();
+    headers.set('Authorization', 'Bearer\x85nel_tok');
+    const withQuery = new Request('https://matrix.example.com/?access_token=from_q', {
+      headers,
+    });
+    expect(extractAccessToken(withQuery)).toBe('from_q');
+    const noQuery = new Request('https://matrix.example.com/', { headers });
+    expect(extractAccessToken(noQuery)).toBeNull();
+  });
+
+  it('decodes access_token=%2B as a literal "+" (not a space)', () => {
+    const req = new Request('https://matrix.example.com/?access_token=%2B');
+    expect(extractAccessToken(req)).toBe('+');
+  });
+
+  it('ignores Cookie headers that look like access_token', () => {
+    const req = new Request('https://matrix.example.com/', {
+      headers: { Cookie: 'access_token=cookie_tok' },
+    });
+    expect(extractAccessToken(req)).toBeNull();
+  });
+
+  it('ignores fragment text that looks like a query after "#"', () => {
+    const req = new Request('https://matrix.example.com/#frag?access_token=nope');
+    expect(extractAccessToken(req)).toBeNull();
+  });
+
+  it('accepts a Request built from a URL object', () => {
+    const req = new Request(new URL('https://matrix.example.com/?access_token=from_url_obj'));
+    expect(extractAccessToken(req)).toBe('from_url_obj');
+  });
+
+  it('does not treat access_token[] as access_token', () => {
+    const req = new Request('https://matrix.example.com/?access_token[]=x');
+    expect(extractAccessToken(req)).toBeNull();
+  });
+
+  it('duplicate access_token: empty first wins → falsy null; non-empty first wins', () => {
+    expect(
+      extractAccessToken(
+        new Request('https://matrix.example.com/?access_token=&access_token=second')
+      )
+    ).toBeNull();
+    expect(
+      extractAccessToken(
+        new Request('https://matrix.example.com/?access_token=first&access_token=')
+      )
+    ).toBe('first');
+  });
+
+  it('joined "Basic …, Bearer …" does not match ^Bearer; query wins', () => {
+    const headers = new Headers();
+    headers.append('Authorization', 'Basic abc');
+    headers.append('Authorization', 'Bearer second');
+    const req = new Request('https://matrix.example.com/?access_token=from_q', { headers });
+    expect(req.headers.get('Authorization')).toBe('Basic abc, Bearer second');
+    expect(extractAccessToken(req)).toBe('from_q');
+  });
+
+  it('joined "Basic …, Bearer …" with no query yields null', () => {
+    const headers = new Headers();
+    headers.append('Authorization', 'Basic abc');
+    headers.append('Authorization', 'Bearer second');
+    const req = new Request('https://matrix.example.com/', { headers });
+    expect(extractAccessToken(req)).toBeNull();
+  });
+
+  it('soft-floods IPv6∥bare-key∥%2B∥Cookie∥NEL isolation under Promise.all', async () => {
+    const nelHeaders = new Headers();
+    nelHeaders.set('Authorization', 'Bearer\x85nel');
+    const results = await Promise.all([
+      extractAccessToken(new Request('https://[::1]/?access_token=a')),
+      extractAccessToken(new Request('https://matrix.example.com/?access_token')),
+      extractAccessToken(new Request('https://matrix.example.com/?access_token=%2B')),
+      extractAccessToken(
+        new Request('https://matrix.example.com/', {
+          headers: { Cookie: 'access_token=c' },
+        })
+      ),
+      extractAccessToken(
+        new Request('https://matrix.example.com/?access_token=q', { headers: nelHeaders })
+      ),
+      extractAccessToken(
+        new Request('https://matrix.example.com/#x?access_token=frag')
+      ),
+    ]);
+    expect(results).toEqual(['a', null, '+', null, 'q', null]);
+  });
+});
