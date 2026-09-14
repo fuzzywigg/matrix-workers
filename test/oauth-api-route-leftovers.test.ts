@@ -2776,3 +2776,664 @@ describe('oauth leftovers authorize HTML structure after #130', () => {
     expect(html).toContain('window.close()');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Soft-cap deepen leftovers — partial forms, exact redirect, charset, JWT
+// claims, UIA XSS banner, sequential refresh, empty device scope, nonce
+// ---------------------------------------------------------------------------
+
+describe('oauth leftovers authorize POST partial forms after #130', () => {
+  it('missing only username field (password present) shows Missing username or password', async () => {
+    const env = makeEnv({ db: aliceDb() });
+    const res = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          password: 'secret',
+          auth_request_id: 'partial-user',
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Missing username or password');
+    expect(html).toContain('name="username"');
+    expect(html).toContain('name="password"');
+  });
+
+  it('missing only password field (username present) shows Missing username or password', async () => {
+    const env = makeEnv({ db: aliceDb() });
+    const res = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          auth_request_id: 'partial-pass',
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Missing username or password');
+  });
+
+  it('omitted auth_request_id with both credentials still Missing username or password', async () => {
+    // `!username || !password || !authRequestId` — credentials alone are insufficient
+    const env = makeEnv({ db: aliceDb() });
+    const res = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Missing username or password');
+  });
+});
+
+describe('oauth leftovers token matching redirect_uri exactly after #130', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('authorization_code succeeds when redirect_uri exactly matches stored code', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT, REDIRECT_ALT],
+      token_endpoint_auth_method: 'none',
+    });
+    await putAuthCode(env, 'redir-exact', {
+      client_id: String(client.client_id),
+      redirect_uri: REDIRECT,
+    });
+    const res = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: 'redir-exact',
+        redirect_uri: REDIRECT,
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.access_token).toBeTruthy();
+    expect(body.user_id).toBe(USER_ID);
+    expect(sessions.data['oauth_code:redir-exact']).toBeUndefined();
+  });
+
+  it('authorization_code succeeds with exact alt redirect_uri from multi-uri client', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT, REDIRECT_ALT],
+      token_endpoint_auth_method: 'none',
+    });
+    await putAuthCode(env, 'redir-alt-exact', {
+      client_id: String(client.client_id),
+      redirect_uri: REDIRECT_ALT,
+    });
+    const res = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: 'redir-alt-exact',
+        redirect_uri: REDIRECT_ALT,
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).access_token).toBeTruthy();
+  });
+
+  it('form-urlencoded matching redirect_uri also succeeds', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    await putAuthCode(env, 'redir-form-exact', {
+      client_id: String(client.client_id),
+      redirect_uri: REDIRECT,
+    });
+    const res = await request(
+      '/oauth/token',
+      formToken({
+        grant_type: 'authorization_code',
+        client_id: String(client.client_id),
+        code: 'redir-form-exact',
+        redirect_uri: REDIRECT,
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('oauth leftovers revoke JSON charset after #130', () => {
+  it('accepts application/json; charset=utf-8 for refresh revoke', async () => {
+    const sessions = mockKv({ 'oauth_refresh:rt-json-cs': '{"token_id":"t"}' });
+    const env = makeEnv({ sessions });
+    const res = await request(
+      '/oauth/revoke',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({
+          token: 'rt-json-cs',
+          token_type_hint: 'refresh_token',
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    expect(sessions.data['oauth_refresh:rt-json-cs']).toBeUndefined();
+    expect(sessions.deletes).toContain('oauth_refresh:rt-json-cs');
+  });
+
+  it('accepts application/json;charset=UTF-8 (no space) for access revoke', async () => {
+    const raw = 'at-json-cs';
+    const hash = await hashToken(raw);
+    const db = createOAuthDb({
+      tokensByHash: new Map([[hash, { user_id: USER_ID, device_id: 'D', created_at: NOW }]]),
+    });
+    const env = makeEnv({ sessions: mockKv(), db });
+    const res = await request(
+      '/oauth/revoke',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' },
+        body: JSON.stringify({ token: raw, token_type_hint: 'access_token' }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    expect(db.tokensByHash.has(hash)).toBe(false);
+    expect(db.deletes.some((d) => d.sql.includes('access_tokens'))).toBe(true);
+  });
+});
+
+describe('oauth leftovers introspect JWT sparse claims after #130', () => {
+  it('JWT without iat/scope/iss is still active with undefined claim fields', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      const token = fakeJwt({
+        sub: USER_ID,
+        client_id: 'sparse-client',
+        exp: Math.floor(NOW / 1000) + 600,
+      });
+      const res = await request('/oauth/introspect', jsonToken({ token }));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        active: true,
+        sub: USER_ID,
+        client_id: 'sparse-client',
+        token_type: 'Bearer',
+        exp: Math.floor(NOW / 1000) + 600,
+      });
+      expect(body.iat).toBeUndefined();
+      expect(body.scope).toBeUndefined();
+      expect(body.iss).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('JWT with only sub (no exp) is active; missing exp is not treated as expired', async () => {
+    const token = fakeJwt({ sub: BOB_ID });
+    const res = await request('/oauth/introspect', jsonToken({ token }));
+    expect(await res.json()).toMatchObject({
+      active: true,
+      sub: BOB_ID,
+      token_type: 'Bearer',
+    });
+  });
+
+  it('form-urlencoded sparse JWT also returns active without iat/scope/iss', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      const token = fakeJwt({
+        sub: USER_ID,
+        azp: 'via-azp',
+        exp: Math.floor(NOW / 1000) + 1,
+      });
+      const res = await request('/oauth/introspect', formToken({ token }));
+      const body = await res.json();
+      expect(body.active).toBe(true);
+      expect(body.client_id).toBe('via-azp');
+      expect(body.iat).toBeUndefined();
+      expect(body.scope).toBeUndefined();
+      expect(body.iss).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('oauth leftovers UIA POST XSS error banner after #130', () => {
+  it('escapes XSS in session user_id when POST re-renders approval with error banner', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache });
+    const evilUser = `@evil<script>alert(1)</script>:${SERVER}`;
+    const sid = `uia-xss"><img src=x onerror=alert(1)>`;
+    await env.CACHE.put(
+      `uia_session:${sid}`,
+      JSON.stringify({ user_id: evilUser, completed_stages: [] }),
+      { expirationTtl: 300 }
+    );
+    const res = await request(
+      '/oauth/authorize/uia',
+      {
+        method: 'POST',
+        body: formFields({
+          session: sid,
+          username: 'alice',
+          // omit password → triggers error banner path
+          action: 'approve',
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Username and password are required.');
+    expect(html).toContain('class="error"');
+    expect(html).toContain(escapeHtml(evilUser));
+    expect(html).toContain(escapeHtml(sid));
+    expect(html).not.toContain('<script>alert(1)</script>');
+    // attribute breakout neutralized: quotes/`<>` escaped inside value="..."
+    expect(html).toContain(`value="${escapeHtml(sid)}"`);
+    expect(html).not.toMatch(/value="[^"]*<img/);
+  });
+
+  it('wrong password path also escapes XSS user_id beside error banner', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache, db: aliceDb('right') });
+    const evilUser = `@x<svg/onload=alert(2)>:${SERVER}`;
+    await env.CACHE.put(
+      'uia_session:uia-xss-pw',
+      JSON.stringify({ user_id: evilUser, completed_stages: [] }),
+      { expirationTtl: 300 }
+    );
+    const res = await request(
+      '/oauth/authorize/uia',
+      {
+        method: 'POST',
+        body: formFields({
+          session: 'uia-xss-pw',
+          username: 'alice',
+          password: 'wrong',
+          action: 'approve',
+        }),
+      },
+      env
+    );
+    const html = await res.text();
+    expect(html).toContain('Invalid username or password.');
+    expect(html).toContain('class="error"');
+    expect(html).toContain(escapeHtml(evilUser));
+    expect(html).not.toContain('<svg/onload=alert(2)>');
+  });
+});
+
+describe('oauth leftovers multiple sequential refreshes after #130', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('rotates refresh token across three sequential refresh grants', async () => {
+    const sessions = mockKv();
+    const db = createOAuthDb();
+    const env = makeEnv({ sessions, db });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+
+    let refresh = 'rt-seq-0';
+    await sessions.put(
+      `oauth_refresh:${refresh}`,
+      JSON.stringify({
+        token_id: 'tid-0',
+        access_token_hash: 'ah-0',
+        refresh_token_hash: 'rh-0',
+        client_id: client.client_id,
+        user_id: USER_ID,
+        device_id: 'SEQDEV',
+        scope: 'openid urn:matrix:org.matrix.msc2967.client:device:SEQDEV',
+        created_at: NOW,
+        expires_at: NOW + 86400_000,
+      }),
+      { expirationTtl: 30 * 24 * 60 * 60 }
+    );
+
+    const seenRefresh = new Set<string>([refresh]);
+    const seenAccess = new Set<string>();
+
+    for (let i = 0; i < 3; i++) {
+      const res = await request(
+        '/oauth/token',
+        jsonToken({
+          grant_type: 'refresh_token',
+          client_id: client.client_id,
+          refresh_token: refresh,
+        }),
+        env
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.device_id).toBeUndefined(); // refresh response omits Matrix fields
+      expect(body.scope).toBe('openid urn:matrix:org.matrix.msc2967.client:device:SEQDEV');
+      expect(body.access_token).toBeTruthy();
+      expect(body.refresh_token).toBeTruthy();
+      expect(seenRefresh.has(String(body.refresh_token))).toBe(false);
+      expect(seenAccess.has(String(body.access_token))).toBe(false);
+      expect(sessions.data[`oauth_refresh:${refresh}`]).toBeUndefined();
+
+      seenRefresh.add(String(body.refresh_token));
+      seenAccess.add(String(body.access_token));
+      refresh = String(body.refresh_token);
+
+      const stored = JSON.parse(sessions.data[`oauth_refresh:${refresh}`]);
+      expect(stored.device_id).toBe('SEQDEV');
+      expect(stored.user_id).toBe(USER_ID);
+      expect(stored.client_id).toBe(client.client_id);
+    }
+
+    // oldest refresh remains invalid
+    const stale = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'refresh_token',
+        client_id: client.client_id,
+        refresh_token: 'rt-seq-0',
+      }),
+      env
+    );
+    expect(await stale.json()).toMatchObject({
+      error_description: 'Invalid refresh token',
+    });
+  });
+
+  it('second sequential refresh fails if first refresh token is reused mid-chain', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    const first = 'rt-reuse-a';
+    await sessions.put(
+      `oauth_refresh:${first}`,
+      JSON.stringify({
+        token_id: 't1',
+        access_token_hash: 'a1',
+        refresh_token_hash: 'r1',
+        client_id: client.client_id,
+        user_id: USER_ID,
+        device_id: 'D1',
+        scope: 'openid',
+        created_at: NOW,
+        expires_at: NOW + 86400_000,
+      })
+    );
+    const firstRes = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'refresh_token',
+        client_id: client.client_id,
+        refresh_token: first,
+      }),
+      env
+    );
+    const rotated = await firstRes.json();
+    const reuse = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'refresh_token',
+        client_id: client.client_id,
+        refresh_token: first,
+      }),
+      env
+    );
+    expect(reuse.status).toBe(400);
+    // chain tip still works
+    const tip = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'refresh_token',
+        client_id: client.client_id,
+        refresh_token: rotated.refresh_token,
+      }),
+      env
+    );
+    expect(tip.status).toBe(200);
+  });
+});
+
+describe('oauth leftovers empty MSC2967 device id generates after #130', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('device scope ending with colon (empty device id) generates a device id', async () => {
+    const sessions = mockKv();
+    const db = createOAuthDb();
+    const env = makeEnv({ sessions, db });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    const emptyDeviceScope = 'openid urn:matrix:org.matrix.msc2967.client:device:';
+    await putAuthCode(env, 'empty-dev', {
+      client_id: String(client.client_id),
+      scope: emptyDeviceScope,
+    });
+    const res = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: 'empty-dev',
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.device_id).toBeTruthy();
+    expect(String(body.device_id).length).toBeGreaterThan(0);
+    expect(body.device_id).not.toBe('');
+    expect(body.device_id).not.toBe('*');
+    expect(body.scope).toBe(emptyDeviceScope);
+    const deviceInsert = db.inserts.find((i) => i.sql.includes('INTO devices'));
+    expect(deviceInsert?.args[1]).toBe(body.device_id);
+  });
+
+  it('device:* wildcard also generates (same falsy/`*` branch)', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    await putAuthCode(env, 'star-dev', {
+      client_id: String(client.client_id),
+      scope: 'openid urn:matrix:org.matrix.msc2967.client:device:*',
+    });
+    const res = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: 'star-dev',
+      }),
+      env
+    );
+    const body = await res.json();
+    expect(body.device_id).toBeTruthy();
+    expect(body.device_id).not.toBe('*');
+  });
+
+  it('device scope with trailing garbage after empty colon segment still matches prefix and generates', async () => {
+    // Scope token is exact prefix + empty replace → ''; `!deviceId` triggers generateDeviceId.
+    // "Trailing garbage" here is a second non-device scope after the empty device entry.
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    const scope =
+      'openid urn:matrix:org.matrix.msc2967.client:device: urn:matrix:org.matrix.msc2967.client:api:*';
+    await putAuthCode(env, 'empty-dev-garbage', {
+      client_id: String(client.client_id),
+      scope,
+    });
+    const res = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: 'empty-dev-garbage',
+      }),
+      env
+    );
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.device_id).toBeTruthy();
+    expect(String(body.device_id).length).toBeGreaterThan(0);
+  });
+});
+
+describe('oauth leftovers authorize POST nonce into auth code after #130', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('preserves nonce from auth request into stored oauth_code on successful login', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: aliceDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      client_name: 'NonceClient',
+    });
+    const nonce = 'nonce-preserve-xyz';
+    const id = await seededAuth(env, {
+      client_id: client.client_id,
+      nonce,
+      state: 'st-nonce',
+      scope: 'openid',
+    });
+    const res = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: id,
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(302);
+    const loc = new URL(res.headers.get('Location')!);
+    const code = loc.searchParams.get('code')!;
+    expect(code).toBeTruthy();
+    const stored = JSON.parse(sessions.data[`oauth_code:${code}`]);
+    expect(stored.nonce).toBe(nonce);
+    expect(stored.client_id).toBe(client.client_id);
+    expect(stored.user_id).toBe(USER_ID);
+    expect(stored.redirect_uri).toBe(REDIRECT);
+    expect(sessions.data[`oauth_auth_request:${id}`]).toBeUndefined();
+  });
+
+  it('omitted nonce stays undefined on stored auth code', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: aliceDb() });
+    const { body: client } = await registerClient(env);
+    const id = await seededAuth(env, { client_id: client.client_id });
+    const res = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: id,
+        }),
+      },
+      env
+    );
+    const code = new URL(res.headers.get('Location')!).searchParams.get('code')!;
+    const stored = JSON.parse(sessions.data[`oauth_code:${code}`]);
+    expect(stored.nonce).toBeUndefined();
+  });
+
+  it('empty-string nonce from GET authorize is stored then copied into code', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: aliceDb() });
+    const { body: client } = await registerClient(env);
+    // GET with nonce= (empty) — query present but empty string
+    const getRes = await request(
+      `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&nonce=`,
+      {},
+      env
+    );
+    expect(getRes.status).toBe(200);
+    const authPut = sessions.puts.find((p) => p.key.startsWith('oauth_auth_request:'));
+    expect(authPut).toBeTruthy();
+    const authReq = JSON.parse(authPut!.value);
+    // empty query param is typically '' not undefined
+    expect(authReq.nonce === '' || authReq.nonce == null).toBe(true);
+
+    const authId = authPut!.key.replace('oauth_auth_request:', '');
+    const postRes = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: authId,
+        }),
+      },
+      env
+    );
+    expect(postRes.status).toBe(302);
+    const code = new URL(postRes.headers.get('Location')!).searchParams.get('code')!;
+    const stored = JSON.parse(sessions.data[`oauth_code:${code}`]);
+    expect(stored.nonce).toBe(authReq.nonce);
+  });
+});
