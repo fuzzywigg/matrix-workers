@@ -730,3 +730,119 @@ describe('federation signing TOKENMAXX leftovers after #241', () => {
     expect(await verifySignature(obj, 'ex.com', keyId, publicKey)).toBe(false);
   });
 });
+
+describe('crypto TOKENMAXX residual leftovers after #252', () => {
+  it('sorts object keys lexicographically (string "10" before "2")', () => {
+    expect(canonicalJson({ '10': 1, '2': 2, a: 3 })).toBe('{"10":1,"2":2,"a":3}');
+  });
+
+  it('encodes an empty-string object key', () => {
+    expect(canonicalJson({ '': 1, b: 2 })).toBe('{"":1,"b":2}');
+  });
+
+  it('encodes nested bigint object values as null', () => {
+    expect(canonicalJson({ a: 1n, b: [2n] })).toBe('{"a":null,"b":[null]}');
+  });
+
+  it('rejects unicode-letter-only passwords (ASCII [a-zA-Z] check)', () => {
+    // "é" is a letter in Unicode but does not match /[a-zA-Z]/
+    expect(validatePasswordStrength('ééééééé1')).toMatch(/letter/);
+    expect(validatePasswordStrength('abcdefg1')).toBeNull();
+  });
+
+  it('accepts digit-first / letter-last and letter-first / symbol-last at length 8', () => {
+    expect(validatePasswordStrength('1abcdefg')).toBeNull();
+    expect(validatePasswordStrength('abcdefg!')).toBeNull();
+  });
+
+  it('hashPassword emits exactly five $-separated parts with decodable salt/hash', async () => {
+    const hash = await hashPassword('format-check-1');
+    const parts = hash.split('$');
+    expect(parts).toHaveLength(5);
+    expect(parts[0]).toBe('');
+    expect(parts[1]).toBe('pbkdf2-sha256');
+    expect(parts[2]).toBe('100000');
+    expect(() => atob(parts[3])).not.toThrow();
+    expect(() => atob(parts[4])).not.toThrow();
+    expect(await verifyPassword('format-check-1', hash)).toBe(true);
+  });
+
+  it('hashes and verifies an empty-string password', async () => {
+    const hash = await hashPassword('');
+    expect(await verifyPassword('', hash)).toBe(true);
+    expect(await verifyPassword('x', hash)).toBe(false);
+  });
+
+  it('verifyContentHash rejects an empty expected hash string', async () => {
+    const content = { type: 'm.test', content: { n: 1 } };
+    expect(await verifyContentHash(content, '')).toBe(false);
+  });
+
+  it('generateRandomString keeps partial fills when some bytes are rejected', () => {
+    const orig = crypto.getRandomValues.bind(crypto);
+    let calls = 0;
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(((arr: Uint8Array) => {
+      calls += 1;
+      if (calls === 1) {
+        // Mix: 247 valid, 255 rejected — should keep one char then need another draw
+        arr[0] = 247;
+        for (let i = 1; i < arr.length; i++) arr[i] = 255;
+        return arr;
+      }
+      return orig(arr);
+    }) as typeof crypto.getRandomValues);
+    const s = generateRandomString(8);
+    expect(calls).toBeGreaterThan(1);
+    expect(s).toHaveLength(8);
+    expect(s).toMatch(/^[A-Za-z0-9]+$/);
+    // First kept byte 247 % 62 indexes the alphabet
+    expect(s[0]).toBe('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'[247 % 62]);
+    vi.restoreAllMocks();
+  });
+});
+
+describe('federation signing TOKENMAXX residual leftovers after #252', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('verifySignature returns false for a wrong but valid-length public key', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test', content: { n: 1 } }, 'ex.com', a.keyId, a.privateKeyJwk);
+    expect(await verifySignature(signed, 'ex.com', a.keyId, a.publicKey)).toBe(true);
+    expect(await verifySignature(signed, 'ex.com', a.keyId, b.publicKey)).toBe(false);
+  });
+
+  it('verifySignature returns false when signatures is null', async () => {
+    const { publicKey, keyId } = await generateSigningKeyPair();
+    const obj = { type: 'm.test', signatures: null as unknown as Record<string, Record<string, string>> };
+    expect(await verifySignature(obj, 'ex.com', keyId, publicKey)).toBe(false);
+  });
+
+  it('signJson throws when privateKeyJwk string is not valid JSON', async () => {
+    await expect(signJson({ type: 'm.test' }, 'ex.com', 'ed25519:deadbeef', '{not-json')).rejects.toThrow();
+  });
+
+  it('signJson preserves unrelated top-level fields alongside signatures', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const obj = {
+      type: 'm.test',
+      content: { body: 'hi' },
+      room_id: '!r:example.com',
+      sender: '@alice:example.com',
+      origin_server_ts: 1,
+    };
+    const signed = await signJson(obj, 'ex.com', keyId, privateKeyJwk);
+    expect(signed.room_id).toBe('!r:example.com');
+    expect(signed.sender).toBe('@alice:example.com');
+    expect(signed.origin_server_ts).toBe(1);
+    expect(await verifySignature(signed, 'ex.com', keyId, publicKey)).toBe(true);
+  });
+});

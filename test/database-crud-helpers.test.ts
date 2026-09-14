@@ -3080,3 +3080,245 @@ describe('database CRUD TOKENMAXX leftovers after #241', () => {
     });
   });
 });
+
+describe('database CRUD TOKENMAXX residual leftovers after #252', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('storeEvent soft-cap reject does not consume a stream position', async () => {
+    const db = createCrudDb({ streamPosition: 7 });
+    const event = pdu({
+      event_id: '$soft',
+      type: 'm.room.message',
+      content: { body: 'x'.repeat(70_000) },
+    });
+    await expect(storeEvent(db, event)).rejects.toMatchObject({
+      errcode: 'M_TOO_LARGE',
+      status: 413,
+    });
+    expect(db._state.events).toHaveLength(0);
+    expect(db._state.streamPosition).toBe(7);
+  });
+
+  it('storeEvent hard-cap reject also leaves stream position untouched', async () => {
+    const db = createCrudDb({ streamPosition: 3 });
+    const event = pdu({
+      event_id: '$hard2',
+      type: 'm.room.message',
+      content: { body: 'ok' },
+    });
+    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    await expect(storeEvent(db, event)).rejects.toMatchObject({ errcode: 'M_TOO_LARGE' });
+    expect(db._state.streamPosition).toBe(3);
+  });
+
+  it('getRoomEvents backwards fromToken with no matches returns end=fromToken', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$e1', type: 'm.room.message' }), 1)],
+    });
+    // Cursor below every stream_ordering → empty page; end falls back to fromToken
+    await expect(getRoomEvents(db, ROOM, 1, 10, 'b')).resolves.toEqual({
+      events: [],
+      end: 1,
+    });
+  });
+
+  it('getRoomEvents forwards fromToken past the tip returns end=fromToken', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$e1', type: 'm.room.message' }), 5)],
+    });
+    await expect(getRoomEvents(db, ROOM, 5, 10, 'f')).resolves.toEqual({
+      events: [],
+      end: 5,
+    });
+  });
+
+  it('storeEvent replaces room_state for the same type+state_key', async () => {
+    const db = createCrudDb();
+    await storeEvent(
+      db,
+      pdu({
+        event_id: '$name1',
+        type: 'm.room.name',
+        state_key: '',
+        content: { name: 'Old' },
+      })
+    );
+    await storeEvent(
+      db,
+      pdu({
+        event_id: '$name2',
+        type: 'm.room.name',
+        state_key: '',
+        content: { name: 'New' },
+      })
+    );
+    expect(db._state.roomState.get(`${ROOM}\0m.room.name\0`)).toBe('$name2');
+    const state = await getRoomState(db, ROOM);
+    expect(state).toHaveLength(1);
+    expect(state[0].event_id).toBe('$name2');
+    expect(state[0].content).toEqual({ name: 'New' });
+  });
+
+  it('getEvent round-trips hashes/signatures/unsigned after storeEvent', async () => {
+    const db = createCrudDb();
+    const event = pdu({
+      event_id: '$rt',
+      type: 'm.room.message',
+      content: { body: 'hi' },
+      unsigned: { age: 42 },
+      hashes: { sha256: 'abc' },
+      signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+    });
+    await storeEvent(db, event);
+    await expect(getEvent(db, '$rt')).resolves.toMatchObject({
+      event_id: '$rt',
+      content: { body: 'hi' },
+      unsigned: { age: 42 },
+      hashes: { sha256: 'abc' },
+      signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+    });
+  });
+
+  it('getEventsByIds with an all-missing page returns []', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$only', type: 'm.room.message' }), 1)],
+    });
+    await expect(getEventsByIds(db, ['$nope1', '$nope2'])).resolves.toEqual([]);
+  });
+
+  it('getEventsSince at the tip returns [] without touching earlier events', async () => {
+    const db = createCrudDb({
+      events: [
+        eventRowFromPdu(pdu({ event_id: '$a', type: 'm.room.message' }), 1),
+        eventRowFromPdu(pdu({ event_id: '$b', type: 'm.room.message' }), 2),
+      ],
+    });
+    await expect(getEventsSince(db, ROOM, 2)).resolves.toEqual([]);
+    await expect(getEventsSince(db, ROOM, 1)).resolves.toMatchObject([{ event_id: '$b' }]);
+  });
+
+  it('getRoomMembers without filter returns invite+join with undefined profile fields', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$1',
+          display_name: null,
+          avatar_url: null,
+        },
+        {
+          room_id: ROOM,
+          user_id: BOB,
+          membership: 'invite',
+          event_id: '$2',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    const members = await getRoomMembers(db, ROOM);
+    expect(members).toHaveLength(2);
+    expect(members.find((m) => m.userId === USER)).toEqual({
+      userId: USER,
+      membership: 'join',
+      displayName: undefined,
+      avatarUrl: undefined,
+    });
+    expect(members.find((m) => m.userId === BOB)?.membership).toBe('invite');
+  });
+
+  it('deleteDevice removes only the targeted device row', async () => {
+    const db = createCrudDb({
+      devices: [
+        {
+          user_id: USER,
+          device_id: 'A',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: NOW,
+        },
+        {
+          user_id: USER,
+          device_id: 'B',
+          display_name: null,
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: NOW,
+        },
+      ],
+    });
+    await deleteDevice(db, USER, 'A');
+    expect(db._state.devices.map((d) => d.device_id)).toEqual(['B']);
+    await expect(getDevice(db, USER, 'A')).resolves.toBeNull();
+    await expect(getDevice(db, USER, 'B')).resolves.toMatchObject({ device_id: 'B' });
+  });
+
+  it('createUser non-guest stores password_hash and is_guest=0', async () => {
+    const db = createCrudDb();
+    await createUser(db, USER, 'alice', 'pbkdf2-hash', false);
+    expect(db._state.users[0]).toMatchObject({
+      user_id: USER,
+      localpart: 'alice',
+      password_hash: 'pbkdf2-hash',
+      is_guest: 0,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    await expect(getPasswordHash(db, USER)).resolves.toBe('pbkdf2-hash');
+  });
+
+  it('storeEventIdempotent duplicate does not rewrite room_state for a state event', async () => {
+    const db = createCrudDb();
+    const event = pdu({
+      event_id: '$topic',
+      type: 'm.room.topic',
+      state_key: '',
+      content: { topic: 'hello' },
+    });
+    await expect(storeEventIdempotent(db, event)).resolves.toEqual({
+      inserted: true,
+      streamOrdering: 1,
+    });
+    expect(db._state.roomState.get(`${ROOM}\0m.room.topic\0`)).toBe('$topic');
+    // Corrupt room_state pointer; a duplicate insert must not REPLACE it
+    db._state.roomState.set(`${ROOM}\0m.room.topic\0`, '$stale');
+    await expect(storeEventIdempotent(db, event)).resolves.toEqual({
+      inserted: false,
+      streamOrdering: null,
+    });
+    expect(db._state.roomState.get(`${ROOM}\0m.room.topic\0`)).toBe('$stale');
+    expect(db._state.events.filter((e) => e.event_id === '$topic')).toHaveLength(1);
+  });
+
+  it('updateUserProfile can update display_name alone without touching avatar_url', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: 'Old',
+          avatar_url: 'mxc://example.com/keep',
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    await updateUserProfile(db, USER, 'New');
+    expect(db._state.users[0].display_name).toBe('New');
+    expect(db._state.users[0].avatar_url).toBe('mxc://example.com/keep');
+    expect(db._state.runs.filter((r) => r.sql.includes('display_name'))).toHaveLength(1);
+    expect(db._state.runs.filter((r) => r.sql.includes('avatar_url'))).toHaveLength(0);
+  });
+});
