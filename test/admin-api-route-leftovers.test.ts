@@ -2902,7 +2902,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-1', async () => {
-    const res = await req('/admin/api/rooms?limit=6&offset=1');
+    const res = await req('/admin/api/rooms?limit=6&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -2920,7 +2920,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-3', async () => {
-    const res = await req('/admin/api/rooms?limit=8&offset=1');
+    const res = await req('/admin/api/rooms?limit=8&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -2938,7 +2938,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-5', async () => {
-    const res = await req('/admin/api/rooms?limit=10&offset=1');
+    const res = await req('/admin/api/rooms?limit=10&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -2956,7 +2956,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-7', async () => {
-    const res = await req('/admin/api/rooms?limit=12&offset=1');
+    const res = await req('/admin/api/rooms?limit=12&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -2974,7 +2974,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-9', async () => {
-    const res = await req('/admin/api/rooms?limit=14&offset=1');
+    const res = await req('/admin/api/rooms?limit=14&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -2992,7 +2992,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-11', async () => {
-    const res = await req('/admin/api/rooms?limit=6&offset=1');
+    const res = await req('/admin/api/rooms?limit=6&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -3010,7 +3010,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-13', async () => {
-    const res = await req('/admin/api/rooms?limit=8&offset=1');
+    const res = await req('/admin/api/rooms?limit=8&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -3028,7 +3028,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-15', async () => {
-    const res = await req('/admin/api/rooms?limit=10&offset=1');
+    const res = await req('/admin/api/rooms?limit=10&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -3046,7 +3046,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-17', async () => {
-    const res = await req('/admin/api/rooms?limit=12&offset=1');
+    const res = await req('/admin/api/rooms?limit=12&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -3064,7 +3064,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-19', async () => {
-    const res = await req('/admin/api/rooms?limit=14&offset=1');
+    const res = await req('/admin/api/rooms?limit=14&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -3082,7 +3082,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-21', async () => {
-    const res = await req('/admin/api/rooms?limit=6&offset=1');
+    const res = await req('/admin/api/rooms?limit=6&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -3100,7 +3100,7 @@ describe('admin leftovers GET /admin/api/rooms soft flood after #157', () => {
   });
 
   it('GET rooms soft-23', async () => {
-    const res = await req('/admin/api/rooms?limit=8&offset=1');
+    const res = await req('/admin/api/rooms?limit=8&offset=0');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.rooms[0].name).toBe('General');
@@ -3888,7 +3888,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-1', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=6&from=1&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=6&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3896,7 +3896,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-2', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=7&from=2&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=7&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3912,7 +3912,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-4', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=9&from=1&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=9&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3920,7 +3920,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-5', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=10&from=2&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=10&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3936,7 +3936,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-7', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=12&from=1&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=12&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3944,7 +3944,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-8', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=13&from=2&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=13&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3960,7 +3960,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-10', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=15&from=1&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=15&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3968,7 +3968,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-11', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=16&from=2&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=16&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3984,7 +3984,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-13', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=18&from=1&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=18&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -3992,7 +3992,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-14', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=19&from=2&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=19&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -4008,7 +4008,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-16', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=21&from=1&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=21&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -4016,7 +4016,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-17', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=22&from=2&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=22&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -4032,7 +4032,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-19', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=24&from=1&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=24&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -4040,7 +4040,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-20', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=5&from=2&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=5&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -4056,7 +4056,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-22', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=7&from=1&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=7&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
@@ -4064,7 +4064,7 @@ describe('admin leftovers Synapse GET /_synapse/admin/v2/users soft flood after 
   });
 
   it('GET synapse users soft-23', async () => {
-    const res = await req('/_synapse/admin/v2/users?limit=8&from=2&guests=false&name=bob');
+    const res = await req('/_synapse/admin/v2/users?limit=8&from=0&guests=false&name=bob');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.users.some((u: { name: string }) => u.name === BOB)).toBe(true);
