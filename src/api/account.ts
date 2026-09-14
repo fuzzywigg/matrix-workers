@@ -552,10 +552,11 @@ app.post('/_matrix/client/v3/user/:userId/openid/request_token', requireAuth(), 
 
   // Store the OpenID token in KV for verification by third-party services
   // The token maps to the user ID so services can verify who the token belongs to
+  const now = Date.now();
   const tokenData = {
     user_id: requestingUserId,
-    created_at: Date.now(),
-    expires_at: Date.now() + (expiresIn * 1000),
+    created_at: now,
+    expires_at: now + (expiresIn * 1000),
   };
 
   await c.env.CACHE.put(
