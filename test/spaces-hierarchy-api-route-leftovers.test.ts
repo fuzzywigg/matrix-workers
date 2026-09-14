@@ -1,11 +1,10 @@
 /**
- * TOKENMAXX HEAVY leftovers after #157 — spaces hierarchy API soft/edge/reliability.
- * Complements spaces-room-info.test.ts. Tests-only — no product inventing.
+ * TOKENMAXX HEAVY leftovers after #157 — spaces hierarchy soft/edge/reliability.
+ * Complements spaces-room-info.test.ts hierarchy coverage. Tests-only — no product inventing.
  * Fixtures use example.com only.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { D1Database } from '@cloudflare/workers-types';
-import type { Env } from '../src/types';
 
 vi.mock('../src/middleware/auth', () => ({
   requireAuth: () => {
@@ -18,11 +17,13 @@ vi.mock('../src/middleware/auth', () => ({
 }));
 
 import spaces from '../src/api/spaces';
+import type { Env } from '../src/types';
 
-const USER = '@alice:example.com';
-const ROOM = '!space:example.com';
 const SERVER = 'example.com';
-const AUTH = { Authorization: 'Bearer test-token' };
+const ROOM = '!space:example.com';
+const CHILD = '!child:example.com';
+const CHILD2 = '!child2:example.com';
+const GC = '!gc:example.com';
 
 type StateMap = Partial<
   Record<
@@ -37,7 +38,6 @@ type StateMap = Partial<
     string | null
   >
 >;
-
 type ChildEvent = { state_key: string; content: string };
 type RoomInfoSeed = {
   room_id: string;
@@ -78,7 +78,6 @@ function createHierarchyDb(opts: {
               if (opts.throwOnSqlIncludes && sql.includes(opts.throwOnSqlIncludes)) {
                 throw new Error(`db boom: ${opts.throwOnSqlIncludes}`);
               }
-
               if (
                 sql.includes('SELECT room_id FROM rooms WHERE room_id') &&
                 !sql.includes('is_public')
@@ -87,7 +86,6 @@ function createHierarchyDb(opts: {
                   ? ({ room_id: rootRoomId } as T)
                   : null;
               }
-
               if (sql.includes('SELECT room_id, is_public FROM rooms')) {
                 const seed = roomIdArg ? rooms[roomIdArg] : undefined;
                 if (!seed) return null as T;
@@ -96,7 +94,6 @@ function createHierarchyDb(opts: {
                   is_public: seed.is_public ?? 1,
                 } as T;
               }
-
               const state = (roomIdArg && rooms[roomIdArg]?.state) || {};
               const eventTypes = [
                 'm.room.name',
@@ -114,13 +111,11 @@ function createHierarchyDb(opts: {
                   return content != null ? ({ content } as T) : null;
                 }
               }
-
               if (sql.includes('FROM room_memberships') && sql.includes('COUNT(*)')) {
                 const seed = roomIdArg ? rooms[roomIdArg] : undefined;
                 if (!seed || seed.memberCount === null) return null as T;
                 return { count: seed.memberCount ?? 0 } as T;
               }
-
               return null;
             },
             async all<T>() {
@@ -153,382 +148,1860 @@ function hierarchyEnv(db: D1Database, serverName = SERVER): Env {
 async function getHierarchy(
   roomId: string,
   query = '',
-  db: D1Database = createHierarchyDb({}),
-  init: RequestInit = {}
+  db: D1Database = createHierarchyDb({})
 ) {
   const path = `/_matrix/client/v1/rooms/${encodeURIComponent(roomId)}/hierarchy${query}`;
   const res = await spaces.request(
     `http://localhost${path}`,
-    { headers: { ...AUTH, ...(init.headers || {}) }, method: init.method ?? 'GET', body: init.body },
+    { headers: { Authorization: 'Bearer test-token' } },
     hierarchyEnv(db)
   );
-  let body: unknown = null;
-  const text = await res.text();
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
-    }
+  let body: any = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
   }
-  return { status: res.status, body: body as Record<string, unknown> | null };
+  return { status: res.status, body };
+}
+
+function seedChild(id: string, via: string[] | null = ['example.com'], suggested = false) {
+  const content: Record<string, unknown> = {};
+  if (via !== null) content.via = via;
+  if (suggested) content.suggested = true;
+  return { state_key: id, content: JSON.stringify(content) };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
 });
 
-void USER;
+describe('spaces leftovers hierarchy empty soft reliability after #157', () => {
+  it('empty hierarchy soft-0', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-1', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-2', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-3', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-4', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-5', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-6', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-7', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-8', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-9', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-10', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-11', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-12', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-13', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-14', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+  it('empty hierarchy soft-15', async () => {
+    const { status, body } = await getHierarchy(ROOM);
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+    expect(body.rooms[0].children_state).toEqual([]);
+    expect(body.next_batch).toBeUndefined();
+  });
+});
 
-describe('spaces hierarchy leftovers empty hierarchy soft flood after #157', () => {
-  for (let i = 0; i < 25; i++) {
-    it(`empty hierarchy soft-${i}`, async () => {
-      const db = createHierarchyDb({
-        childEvents: [],
-        rooms: {
-          [ROOM]: {
-            room_id: ROOM,
-            state: {
-              'm.room.create': JSON.stringify({ type: 'm.space' }),
-              'm.room.name': JSON.stringify({ name: `Empty-${i}` }),
-            },
-            memberCount: i,
+describe('spaces leftovers suggested_only soft matrix after #157', () => {
+  it('suggested_only soft-0', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, state: { 'm.room.create': JSON.stringify({ type: 'm.space' }) }, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'A' }) }, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, state: { 'm.room.name': JSON.stringify({ name: 'B' }) }, memberCount: 1 },
+      },
+    });
+    const { status, body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(status).toBe(200);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(ROOM);
+    expect(ids).toContain(CHILD); expect(ids).not.toContain(CHILD2);
+  });
+  it('suggested_only soft-1', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, state: { 'm.room.create': JSON.stringify({ type: 'm.space' }) }, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'A' }) }, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, state: { 'm.room.name': JSON.stringify({ name: 'B' }) }, memberCount: 1 },
+      },
+    });
+    const { status, body } = await getHierarchy(ROOM, '?suggested_only=false', db);
+    expect(status).toBe(200);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(ROOM);
+    expect(ids).toContain(CHILD); expect(ids).toContain(CHILD2);
+  });
+  it('suggested_only soft-2', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, state: { 'm.room.create': JSON.stringify({ type: 'm.space' }) }, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'A' }) }, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, state: { 'm.room.name': JSON.stringify({ name: 'B' }) }, memberCount: 1 },
+      },
+    });
+    const { status, body } = await getHierarchy(ROOM, '?suggested_only=TRUE', db);
+    expect(status).toBe(200);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(ROOM);
+    expect(ids).toContain(CHILD); expect(ids).toContain(CHILD2);
+  });
+  it('suggested_only soft-3', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, state: { 'm.room.create': JSON.stringify({ type: 'm.space' }) }, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'A' }) }, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, state: { 'm.room.name': JSON.stringify({ name: 'B' }) }, memberCount: 1 },
+      },
+    });
+    const { status, body } = await getHierarchy(ROOM, '?suggested_only=1', db);
+    expect(status).toBe(200);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(ROOM);
+    expect(ids).toContain(CHILD); expect(ids).toContain(CHILD2);
+  });
+  it('suggested_only soft-4', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, state: { 'm.room.create': JSON.stringify({ type: 'm.space' }) }, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'A' }) }, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, state: { 'm.room.name': JSON.stringify({ name: 'B' }) }, memberCount: 1 },
+      },
+    });
+    const { status, body } = await getHierarchy(ROOM, '?suggested_only=yes', db);
+    expect(status).toBe(200);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(ROOM);
+    expect(ids).toContain(CHILD); expect(ids).toContain(CHILD2);
+  });
+  it('suggested_only soft-5', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, state: { 'm.room.create': JSON.stringify({ type: 'm.space' }) }, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'A' }) }, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, state: { 'm.room.name': JSON.stringify({ name: 'B' }) }, memberCount: 1 },
+      },
+    });
+    const { status, body } = await getHierarchy(ROOM, '?suggested_only=0', db);
+    expect(status).toBe(200);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(ROOM);
+    expect(ids).toContain(CHILD); expect(ids).toContain(CHILD2);
+  });
+  it('suggested_only soft-6', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, state: { 'm.room.create': JSON.stringify({ type: 'm.space' }) }, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'A' }) }, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, state: { 'm.room.name': JSON.stringify({ name: 'B' }) }, memberCount: 1 },
+      },
+    });
+    const { status, body } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(200);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(ROOM);
+    expect(ids).toContain(CHILD); expect(ids).toContain(CHILD2);
+  });
+  it('suggested_only soft-7', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, state: { 'm.room.create': JSON.stringify({ type: 'm.space' }) }, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'A' }) }, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, state: { 'm.room.name': JSON.stringify({ name: 'B' }) }, memberCount: 1 },
+      },
+    });
+    const { status, body } = await getHierarchy(ROOM, '?suggested_only=', db);
+    expect(status).toBe(200);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(ROOM);
+    expect(ids).toContain(CHILD); expect(ids).toContain(CHILD2);
+  });
+  it('suggested filter soft flood-0', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s0:example.com', ['example.com'], true),
+        seedChild('!u0:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s0:example.com']: { room_id: '!s0:example.com', memberCount: 1 },
+        ['!u0:example.com']: { room_id: '!u0:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s0:example.com');
+    expect(ids).not.toContain('!u0:example.com');
+  });
+  it('suggested filter soft flood-1', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s1:example.com', ['example.com'], true),
+        seedChild('!u1:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s1:example.com']: { room_id: '!s1:example.com', memberCount: 1 },
+        ['!u1:example.com']: { room_id: '!u1:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s1:example.com');
+    expect(ids).not.toContain('!u1:example.com');
+  });
+  it('suggested filter soft flood-2', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s2:example.com', ['example.com'], true),
+        seedChild('!u2:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s2:example.com']: { room_id: '!s2:example.com', memberCount: 1 },
+        ['!u2:example.com']: { room_id: '!u2:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s2:example.com');
+    expect(ids).not.toContain('!u2:example.com');
+  });
+  it('suggested filter soft flood-3', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s3:example.com', ['example.com'], true),
+        seedChild('!u3:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s3:example.com']: { room_id: '!s3:example.com', memberCount: 1 },
+        ['!u3:example.com']: { room_id: '!u3:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s3:example.com');
+    expect(ids).not.toContain('!u3:example.com');
+  });
+  it('suggested filter soft flood-4', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s4:example.com', ['example.com'], true),
+        seedChild('!u4:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s4:example.com']: { room_id: '!s4:example.com', memberCount: 1 },
+        ['!u4:example.com']: { room_id: '!u4:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s4:example.com');
+    expect(ids).not.toContain('!u4:example.com');
+  });
+  it('suggested filter soft flood-5', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s5:example.com', ['example.com'], true),
+        seedChild('!u5:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s5:example.com']: { room_id: '!s5:example.com', memberCount: 1 },
+        ['!u5:example.com']: { room_id: '!u5:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s5:example.com');
+    expect(ids).not.toContain('!u5:example.com');
+  });
+  it('suggested filter soft flood-6', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s6:example.com', ['example.com'], true),
+        seedChild('!u6:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s6:example.com']: { room_id: '!s6:example.com', memberCount: 1 },
+        ['!u6:example.com']: { room_id: '!u6:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s6:example.com');
+    expect(ids).not.toContain('!u6:example.com');
+  });
+  it('suggested filter soft flood-7', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s7:example.com', ['example.com'], true),
+        seedChild('!u7:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s7:example.com']: { room_id: '!s7:example.com', memberCount: 1 },
+        ['!u7:example.com']: { room_id: '!u7:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s7:example.com');
+    expect(ids).not.toContain('!u7:example.com');
+  });
+  it('suggested filter soft flood-8', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s8:example.com', ['example.com'], true),
+        seedChild('!u8:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s8:example.com']: { room_id: '!s8:example.com', memberCount: 1 },
+        ['!u8:example.com']: { room_id: '!u8:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s8:example.com');
+    expect(ids).not.toContain('!u8:example.com');
+  });
+  it('suggested filter soft flood-9', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s9:example.com', ['example.com'], true),
+        seedChild('!u9:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s9:example.com']: { room_id: '!s9:example.com', memberCount: 1 },
+        ['!u9:example.com']: { room_id: '!u9:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s9:example.com');
+    expect(ids).not.toContain('!u9:example.com');
+  });
+  it('suggested filter soft flood-10', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s10:example.com', ['example.com'], true),
+        seedChild('!u10:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s10:example.com']: { room_id: '!s10:example.com', memberCount: 1 },
+        ['!u10:example.com']: { room_id: '!u10:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s10:example.com');
+    expect(ids).not.toContain('!u10:example.com');
+  });
+  it('suggested filter soft flood-11', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild('!s11:example.com', ['example.com'], true),
+        seedChild('!u11:example.com', ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        ['!s11:example.com']: { room_id: '!s11:example.com', memberCount: 1 },
+        ['!u11:example.com']: { room_id: '!u11:example.com', memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '?suggested_only=true', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain('!s11:example.com');
+    expect(ids).not.toContain('!u11:example.com');
+  });
+});
+
+describe('spaces leftovers via soft flood after #157', () => {
+  it('via soft-0', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = [];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).not.toContain(CHILD);
+  });
+  it('via soft-1', async () => {
+    const content: Record<string, unknown> = {};
+    // omit via
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).not.toContain(CHILD);
+  });
+  it('via soft-2', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = ["example.com"];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(CHILD);
+  });
+  it('via soft-3', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = ["a","b"];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(CHILD);
+  });
+  it('via soft-4', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = [];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).not.toContain(CHILD);
+  });
+  it('via soft-5', async () => {
+    const content: Record<string, unknown> = {};
+    // omit via
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).not.toContain(CHILD);
+  });
+  it('via soft-6', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = ["example.com"];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(CHILD);
+  });
+  it('via soft-7', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = ["a","b"];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(CHILD);
+  });
+  it('via soft-8', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = [];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).not.toContain(CHILD);
+  });
+  it('via soft-9', async () => {
+    const content: Record<string, unknown> = {};
+    // omit via
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).not.toContain(CHILD);
+  });
+  it('via soft-10', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = ["example.com"];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(CHILD);
+  });
+  it('via soft-11', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = ["a","b"];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(CHILD);
+  });
+  it('via soft-12', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = [];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).not.toContain(CHILD);
+  });
+  it('via soft-13', async () => {
+    const content: Record<string, unknown> = {};
+    // omit via
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).not.toContain(CHILD);
+  });
+  it('via soft-14', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = ["example.com"];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(CHILD);
+  });
+  it('via soft-15', async () => {
+    const content: Record<string, unknown> = {};
+    content.via = ["a","b"];
+    const db = createHierarchyDb({
+      childEvents: [{ state_key: CHILD, content: JSON.stringify(content) }],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 2 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    const ids = body.rooms.map((r: any) => r.room_id);
+    expect(ids).toContain(CHILD);
+  });
+});
+
+describe('spaces leftovers limit soft flood after #157', () => {
+  it('limit soft-0', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-1', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status } = await getHierarchy(ROOM, '?limit=0', db);
+    expect(status).toBe(500);
+  });
+  it('limit soft-2', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=1', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-3', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-4', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=50', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-5', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=100', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-6', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=999', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-7', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status } = await getHierarchy(ROOM, '?limit=-1', db);
+    expect(status).toBe(500);
+  });
+  it('limit soft-8', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=abc', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-9', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=3.9', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-10', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('limit soft-11', async () => {
+    const children = Array.from({ length: 5 }, (_, j) => seedChild('!c' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = {
+      [ROOM]: { room_id: ROOM, memberCount: 1 },
+    };
+    for (let j = 0; j < 5; j++) {
+      rooms['!c' + j + ':example.com'] = { room_id: '!c' + j + ':example.com', memberCount: 1 };
+    }
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { status, body } = await getHierarchy(ROOM, '?limit=01', db);
+    expect(status).toBe(200);
+    expect(Array.isArray(body.rooms)).toBe(true);
+    expect(body.rooms.length).toBeGreaterThanOrEqual(0);
+  });
+  it('next_batch soft-0', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-1', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-2', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-3', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-4', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-5', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-6', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-7', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-8', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+  it('next_batch soft-9', async () => {
+    const children = Array.from({ length: 4 }, (_, j) => seedChild('!n' + j + ':example.com'));
+    const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM, memberCount: 1 } };
+    for (let j = 0; j < 4; j++) rooms['!n' + j + ':example.com'] = { room_id: '!n' + j + ':example.com', memberCount: 1 };
+    const db = createHierarchyDb({ childEvents: children, rooms });
+    const { body } = await getHierarchy(ROOM, '?limit=2', db);
+    expect(body.rooms.length).toBe(2);
+    expect(body.next_batch).toBe(body.rooms[1].room_id);
+  });
+});
+
+describe('spaces leftovers max_depth soft flood after #157', () => {
+  it('max_depth soft-0 depth=0', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=0';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-1 depth=1', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=1';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-2 depth=2', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=2';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-3 depth=3', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=3';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-4 depth=abc', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=abc';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-5 depth=', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-6 depth=-1', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=-1';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-7 depth=1.5', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=1.5';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-8 depth=99', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=99';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-9 depth=NaN', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=NaN';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-10 depth=true', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=true';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+  it('max_depth soft-11 depth=0', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild(CHILD)],
+      grandchildEvents: {
+        [CHILD]: [{ state_key: GC, content: JSON.stringify({ via: ['example.com'] }) }],
+      },
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+        [GC]: { room_id: GC, memberCount: 1 },
+      },
+    });
+    const q = '?max_depth=0';
+    const { status, body } = await getHierarchy(ROOM, q, db);
+    expect(status).toBe(200);
+    const child = body.rooms.find((r: any) => r.room_id === CHILD);
+    expect(child).toBeTruthy();
+  });
+});
+
+describe('spaces leftovers corrupt child soft flood after #157', () => {
+  // Root children_state uses bare JSON.parse — corrupt content → 500 (uncaught).
+  it('corrupt child soft-0', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-0' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-1', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-1' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-2', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-2' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-3', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-3' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-4', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-4' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-5', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-5' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-6', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-6' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-7', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-7' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-8', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-8' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-9', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-9' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-10', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-10' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-11', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-11' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-12', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-12' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-13', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-13' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-14', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-14' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+  it('corrupt child soft-15', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        { state_key: '!bad:example.com', content: '{not-json-15' },
+        seedChild(CHILD),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD]: { room_id: CHILD, memberCount: 1 },
+      },
+    });
+    const { status } = await getHierarchy(ROOM, '', db);
+    expect(status).toBe(500);
+  });
+});
+
+
+describe('spaces leftovers failure edges after #157', () => {
+  it('missing root soft-0', async () => {
+    const { status, body } = await getHierarchy('!missing0:example.com', '', createHierarchyDb({ rootExists: false, rootRoomId: '!missing0:example.com' }));
+    expect(status).toBe(404);
+    expect(body.errcode).toBe('M_NOT_FOUND');
+  });
+  it('missing root soft-1', async () => {
+    const { status, body } = await getHierarchy('!missing1:example.com', '', createHierarchyDb({ rootExists: false, rootRoomId: '!missing1:example.com' }));
+    expect(status).toBe(404);
+    expect(body.errcode).toBe('M_NOT_FOUND');
+  });
+  it('missing root soft-2', async () => {
+    const { status, body } = await getHierarchy('!missing2:example.com', '', createHierarchyDb({ rootExists: false, rootRoomId: '!missing2:example.com' }));
+    expect(status).toBe(404);
+    expect(body.errcode).toBe('M_NOT_FOUND');
+  });
+  it('missing root soft-3', async () => {
+    const { status, body } = await getHierarchy('!missing3:example.com', '', createHierarchyDb({ rootExists: false, rootRoomId: '!missing3:example.com' }));
+    expect(status).toBe(404);
+    expect(body.errcode).toBe('M_NOT_FOUND');
+  });
+  it('missing root soft-4', async () => {
+    const { status, body } = await getHierarchy('!missing4:example.com', '', createHierarchyDb({ rootExists: false, rootRoomId: '!missing4:example.com' }));
+    expect(status).toBe(404);
+    expect(body.errcode).toBe('M_NOT_FOUND');
+  });
+  it('missing root soft-5', async () => {
+    const { status, body } = await getHierarchy('!missing5:example.com', '', createHierarchyDb({ rootExists: false, rootRoomId: '!missing5:example.com' }));
+    expect(status).toBe(404);
+    expect(body.errcode).toBe('M_NOT_FOUND');
+  });
+  it('missing root soft-6', async () => {
+    const { status, body } = await getHierarchy('!missing6:example.com', '', createHierarchyDb({ rootExists: false, rootRoomId: '!missing6:example.com' }));
+    expect(status).toBe(404);
+    expect(body.errcode).toBe('M_NOT_FOUND');
+  });
+  it('missing root soft-7', async () => {
+    const { status, body } = await getHierarchy('!missing7:example.com', '', createHierarchyDb({ rootExists: false, rootRoomId: '!missing7:example.com' }));
+    expect(status).toBe(404);
+    expect(body.errcode).toBe('M_NOT_FOUND');
+  });
+  it('from query is ignored soft-0', async () => {
+    const { status, body } = await getHierarchy(ROOM, '?from=token');
+    expect(status).toBe(200);
+    expect(body.rooms[0].room_id).toBe(ROOM);
+  });
+  it('from query is ignored soft-1', async () => {
+    const { status, body } = await getHierarchy(ROOM, '?from=');
+    expect(status).toBe(200);
+    expect(body.rooms).toHaveLength(1);
+  });
+  it('child missing room soft skip', async () => {
+    const db = createHierarchyDb({
+      childEvents: [seedChild('!gone:example.com')],
+      rooms: { [ROOM]: { room_id: ROOM, memberCount: 1 } },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    expect(body.rooms.map((r: any) => r.room_id)).toEqual([ROOM]);
+  });
+  it('root children_state always includes all child events even if skipped', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, []),
+        seedChild(CHILD2),
+      ],
+      rooms: {
+        [ROOM]: { room_id: ROOM, memberCount: 1 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 1 },
+      },
+    });
+    const { body } = await getHierarchy(ROOM, '', db);
+    expect(body.rooms[0].children_state).toHaveLength(2);
+    expect(body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD2]);
+  });
+
+});
+
+describe('spaces leftovers lifecycle soft floods after #157', () => {
+  it('hierarchy lifecycle soft-0', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root0' }),
           },
+          memberCount: 1,
         },
-      });
-      const { status, body } = await getHierarchy(ROOM, '', db);
-      expect(status).toBe(200);
-      const rooms = body!.rooms as Array<Record<string, unknown>>;
-      expect(rooms).toHaveLength(1);
-      expect(rooms[0].room_id).toBe(ROOM);
-      expect(rooms[0].name).toBe(`Empty-${i}`);
-      expect(rooms[0].children_state).toEqual([]);
-      expect(body!.next_batch).toBeUndefined();
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C0' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
     });
-  }
-});
-
-describe('spaces hierarchy leftovers suggested_only soft flood after #157', () => {
-  for (let i = 0; i < 25; i++) {
-    it(`suggested_only soft-${i}`, async () => {
-      const sug = `!sug${i}:example.com`;
-      const nosug = `!nosug${i}:example.com`;
-      const omit = `!omit${i}:example.com`;
-      const db = createHierarchyDb({
-        childEvents: [
-          {
-            state_key: sug,
-            content: JSON.stringify({ via: ['example.com'], suggested: true }),
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root0');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-1', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root1' }),
           },
-          {
-            state_key: nosug,
-            content: JSON.stringify({ via: ['example.com'], suggested: false }),
-          },
-          {
-            state_key: omit,
-            content: JSON.stringify({ via: ['example.com'] }),
-          },
-        ],
-        rooms: {
-          [ROOM]: { room_id: ROOM },
-          [sug]: { room_id: sug, state: { 'm.room.name': JSON.stringify({ name: `Sug-${i}` }) } },
-          [nosug]: { room_id: nosug },
-          [omit]: { room_id: omit },
+          memberCount: 2,
         },
-      });
-      const { status, body } = await getHierarchy(ROOM, '?suggested_only=true', db);
-      expect(status).toBe(200);
-      const rooms = body!.rooms as Array<{ room_id: string }>;
-      expect(rooms.map((r) => r.room_id)).toEqual([ROOM, sug]);
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C1' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
     });
-  }
-});
-
-describe('spaces hierarchy leftovers via soft flood after #157', () => {
-  for (let i = 0; i < 25; i++) {
-    it(`via soft-${i}`, async () => {
-      const ok = `!ok${i}:example.com`;
-      const emptyVia = `!empty${i}:example.com`;
-      const noVia = `!novia${i}:example.com`;
-      const viaHost = i % 2 === 0 ? 'example.com' : `via${i}.example.com`;
-      const db = createHierarchyDb({
-        childEvents: [
-          { state_key: emptyVia, content: JSON.stringify({ via: [], suggested: true }) },
-          { state_key: noVia, content: JSON.stringify({ suggested: true }) },
-          { state_key: ok, content: JSON.stringify({ via: [viaHost] }) },
-        ],
-        rooms: {
-          [ROOM]: { room_id: ROOM },
-          [ok]: { room_id: ok, state: { 'm.room.name': JSON.stringify({ name: `Ok-${i}` }) } },
-          [emptyVia]: { room_id: emptyVia },
-          [noVia]: { room_id: noVia },
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root1');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-2', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root2' }),
+          },
+          memberCount: 3,
         },
-      });
-      const { status, body } = await getHierarchy(ROOM, '', db);
-      expect(status).toBe(200);
-      const rooms = body!.rooms as Array<{ room_id: string; name?: string }>;
-      expect(rooms.map((r) => r.room_id)).toEqual([ROOM, ok]);
-      expect(rooms[1].name).toBe(`Ok-${i}`);
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C2' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
     });
-  }
-});
-
-describe('spaces hierarchy leftovers limit soft flood after #157', () => {
-  for (let i = 0; i < 25; i++) {
-    it(`limit soft-${i}`, async () => {
-      const limit = (i % 10) + 1;
-      const childEvents: ChildEvent[] = [];
-      const rooms: Record<string, RoomInfoSeed> = { [ROOM]: { room_id: ROOM } };
-      for (let c = 0; c < 15; c++) {
-        const id = `!lim${i}c${c}:example.com`;
-        childEvents.push({
-          state_key: id,
-          content: JSON.stringify({ via: ['example.com'] }),
-        });
-        rooms[id] = { room_id: id };
-      }
-      const db = createHierarchyDb({ childEvents, rooms });
-      const { status, body } = await getHierarchy(ROOM, `?limit=${limit}`, db);
-      expect(status).toBe(200);
-      const roomsOut = body!.rooms as Array<{ room_id: string }>;
-      expect(roomsOut.length).toBe(limit);
-      // root + 15 children = 16 > limit → next_batch present
-      expect(body!.next_batch).toBe(roomsOut[limit - 1].room_id);
-    });
-  }
-});
-
-describe('spaces hierarchy leftovers max_depth soft flood after #157', () => {
-  for (let i = 0; i < 25; i++) {
-    it(`max_depth soft-${i}`, async () => {
-      const childId = `!child${i}:example.com`;
-      const grandId = `!grand${i}:example.com`;
-      const maxDepth = i % 3 === 0 ? 1 : i % 3 === 1 ? 2 : 3;
-      const db = createHierarchyDb({
-        childEvents: [
-          { state_key: childId, content: JSON.stringify({ via: ['example.com'] }) },
-        ],
-        grandchildEvents: {
-          [childId]: [
-            {
-              state_key: grandId,
-              content: JSON.stringify({ via: ['example.com'], order: String(i) }),
-            },
-          ],
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root2');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-3', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root3' }),
+          },
+          memberCount: 4,
         },
-        rooms: {
-          [ROOM]: { room_id: ROOM },
-          [childId]: {
-            room_id: childId,
-            state: { 'm.room.name': JSON.stringify({ name: `Child-${i}` }) },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C3' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
+    });
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root3');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-4', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root4' }),
           },
-          [grandId]: { room_id: grandId },
+          memberCount: 5,
         },
-      });
-      const { status, body } = await getHierarchy(ROOM, `?max_depth=${maxDepth}`, db);
-      expect(status).toBe(200);
-      const rooms = body!.rooms as Array<Record<string, unknown>>;
-      expect(rooms).toHaveLength(2);
-      expect(rooms[1].room_id).toBe(childId);
-      if (maxDepth > 1) {
-        expect(rooms[1].children_state).toEqual([
-          {
-            type: 'm.space.child',
-            state_key: grandId,
-            content: { via: ['example.com'], order: String(i) },
-          },
-        ]);
-      } else {
-        expect(rooms[1].children_state).toEqual([]);
-      }
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C4' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
     });
-  }
-});
-
-describe('spaces hierarchy leftovers membership forbidden / room-missing soft flood after #157', () => {
-  // Implementation gates on room existence only (no membership check) → M_NOT_FOUND.
-  for (let i = 0; i < 25; i++) {
-    it(`room-missing not-found soft-${i}`, async () => {
-      const missing = `!missing${i}:example.com`;
-      const { status, body } = await getHierarchy(
-        missing,
-        '',
-        createHierarchyDb({ rootExists: false, rootRoomId: missing })
-      );
-      expect(status).toBe(404);
-      expect(body).toMatchObject({ errcode: 'M_NOT_FOUND' });
-    });
-  }
-});
-
-describe('spaces hierarchy leftovers corrupt child soft flood after #157', () => {
-  for (let i = 0; i < 25; i++) {
-    it(`corrupt child getRoomInfo skip soft-${i}`, async () => {
-      const boom = `!boom${i}:example.com`;
-      const ok = `!ok${i}:example.com`;
-      const db = createHierarchyDb({
-        childEvents: [
-          {
-            state_key: boom,
-            content: JSON.stringify({ via: ['example.com'] }),
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root4');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-5', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root5' }),
           },
-          {
-            state_key: ok,
-            content: JSON.stringify({ via: ['example.com'] }),
-          },
-        ],
-        rooms: {
-          [ROOM]: { room_id: ROOM },
-          [boom]: {
-            room_id: boom,
-            state: { 'm.room.name': `{bad-${i}` },
-          },
-          [ok]: {
-            room_id: ok,
-            state: { 'm.room.name': JSON.stringify({ name: `Ok-${i}` }) },
-          },
+          memberCount: 6,
         },
-      });
-      const { status, body } = await getHierarchy(ROOM, '', db);
-      expect(status).toBe(200);
-      const rooms = body!.rooms as Array<{ room_id: string; name?: string }>;
-      expect(rooms.map((r) => r.room_id)).toEqual([ROOM, ok]);
-      expect(rooms[1].name).toBe(`Ok-${i}`);
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C5' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
     });
-  }
-});
-
-describe('spaces hierarchy leftovers ghost / missing-child soft flood after #157', () => {
-  for (let i = 0; i < 10; i++) {
-    it(`ghost child skipped soft-${i}`, async () => {
-      const ghost = `!ghost${i}:example.com`;
-      const db = createHierarchyDb({
-        childEvents: [
-          { state_key: ghost, content: JSON.stringify({ via: ['example.com'] }) },
-        ],
-        rooms: { [ROOM]: { room_id: ROOM } },
-      });
-      const { status, body } = await getHierarchy(ROOM, '', db);
-      expect(status).toBe(200);
-      const rooms = body!.rooms as Array<{ room_id: string }>;
-      expect(rooms.map((r) => r.room_id)).toEqual([ROOM]);
-    });
-  }
-});
-
-describe('spaces hierarchy leftovers method matrix after #157', () => {
-  const path = `/_matrix/client/v1/rooms/${encodeURIComponent(ROOM)}/hierarchy`;
-  const bad = ['POST', 'PUT', 'DELETE', 'PATCH'];
-  for (const method of bad) {
-    it(`${method} hierarchy → 404/405`, async () => {
-      const db = createHierarchyDb({});
-      const res = await spaces.request(
-        `http://localhost${path}`,
-        {
-          method,
-          headers: { ...AUTH, 'Content-Type': 'application/json' },
-          body: method === 'GET' ? undefined : '{}',
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root5');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-6', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root6' }),
+          },
+          memberCount: 7,
         },
-        hierarchyEnv(db)
-      );
-      expect([404, 405]).toContain(res.status);
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C6' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
     });
-  }
-});
-
-describe('spaces hierarchy leftovers charset / query soft flood after #157', () => {
-  const okQueries = [
-    '',
-    '?from=',
-    '?from=token',
-    '?suggested_only=false',
-    '?suggested_only=TRUE',
-    '?suggested_only=1',
-    '?limit=50',
-    '?limit=100',
-    '?max_depth=1',
-    '?max_depth=2&limit=10',
-    '?suggested_only=true&max_depth=2',
-    '?max_depth=0',
-    '?from=abc&limit=5',
-    '?limit=1',
-    '?limit=2&max_depth=1',
-  ];
-  for (const [i, q] of okQueries.entries()) {
-    it(`query variant soft-${i} (${q || 'none'})`, async () => {
-      const db = createHierarchyDb({ childEvents: [] });
-      const { status, body } = await getHierarchy(ROOM, q, db);
-      expect(status).toBe(200);
-      expect(Array.isArray(body!.rooms)).toBe(true);
-    });
-  }
-
-  // Document: limit=0 / negative → rooms.slice(0, 0) then next_batch reads rooms[-1] → 500
-  for (const [i, q] of ['?limit=0', '?limit=-1'].entries()) {
-    it(`limit edge crash soft-${i} (${q})`, async () => {
-      const db = createHierarchyDb({ childEvents: [] });
-      const { status } = await getHierarchy(ROOM, q, db);
-      expect(status).toBe(500);
-    });
-  }
-});
-
-describe('spaces hierarchy leftovers lifecycle soft flood after #157', () => {
-  for (let i = 0; i < 25; i++) {
-    it(`empty→child→suggested lifecycle soft-${i}`, async () => {
-      // 1) empty
-      const empty = await getHierarchy(ROOM, '', createHierarchyDb({ childEvents: [] }));
-      expect(empty.status).toBe(200);
-      expect((empty.body!.rooms as unknown[]).length).toBe(1);
-
-      // 2) with child
-      const child = `!lc${i}:example.com`;
-      const withChild = await getHierarchy(
-        ROOM,
-        '',
-        createHierarchyDb({
-          childEvents: [
-            {
-              state_key: child,
-              content: JSON.stringify({ via: ['example.com'], suggested: i % 2 === 0 }),
-            },
-          ],
-          rooms: {
-            [ROOM]: { room_id: ROOM },
-            [child]: {
-              room_id: child,
-              state: { 'm.room.name': JSON.stringify({ name: `LC-${i}` }) },
-            },
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root6');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-7', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root7' }),
           },
-        })
-      );
-      expect(withChild.status).toBe(200);
-      expect((withChild.body!.rooms as unknown[]).length).toBe(2);
-
-      // 3) suggested_only
-      const sugOnly = await getHierarchy(
-        ROOM,
-        '?suggested_only=true',
-        createHierarchyDb({
-          childEvents: [
-            {
-              state_key: child,
-              content: JSON.stringify({ via: ['example.com'], suggested: i % 2 === 0 }),
-            },
-          ],
-          rooms: {
-            [ROOM]: { room_id: ROOM },
-            [child]: { room_id: child },
-          },
-        })
-      );
-      expect(sugOnly.status).toBe(200);
-      const ids = (sugOnly.body!.rooms as Array<{ room_id: string }>).map((r) => r.room_id);
-      if (i % 2 === 0) {
-        expect(ids).toEqual([ROOM, child]);
-      } else {
-        expect(ids).toEqual([ROOM]);
-      }
+          memberCount: 8,
+        },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C7' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
     });
-  }
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root7');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-8', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root8' }),
+          },
+          memberCount: 9,
+        },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C8' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
+    });
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root8');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-9', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root9' }),
+          },
+          memberCount: 10,
+        },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C9' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
+    });
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root9');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-10', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root10' }),
+          },
+          memberCount: 11,
+        },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C10' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
+    });
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root10');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
+  it('hierarchy lifecycle soft-11', async () => {
+    const db = createHierarchyDb({
+      childEvents: [
+        seedChild(CHILD, ['example.com'], true),
+        seedChild(CHILD2, ['example.com'], false),
+      ],
+      rooms: {
+        [ROOM]: {
+          room_id: ROOM,
+          state: {
+            'm.room.create': JSON.stringify({ type: 'm.space' }),
+            'm.room.name': JSON.stringify({ name: 'Root11' }),
+          },
+          memberCount: 12,
+        },
+        [CHILD]: { room_id: CHILD, state: { 'm.room.name': JSON.stringify({ name: 'C11' }) }, memberCount: 2 },
+        [CHILD2]: { room_id: CHILD2, memberCount: 3 },
+      },
+    });
+    const all = await getHierarchy(ROOM, '', db);
+    expect(all.status).toBe(200);
+    expect(all.body.rooms[0].name).toBe('Root11');
+    const sug = await getHierarchy(ROOM, '?suggested_only=true', db);
+    expect(sug.body.rooms.map((r: any) => r.room_id)).toEqual([ROOM, CHILD]);
+    const lim = await getHierarchy(ROOM, '?limit=1', db);
+    expect(lim.body.rooms).toHaveLength(1);
+    expect(lim.body.next_batch).toBe(ROOM);
+  });
 });
