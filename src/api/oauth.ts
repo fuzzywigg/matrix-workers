@@ -5,7 +5,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { requireAuth } from '../middleware/auth';
-import { hashToken, verifyPassword } from '../utils/crypto';
+import { hashToken, timingSafeEqual, verifyPassword } from '../utils/crypto';
 import { generateAccessToken, generateDeviceId, generateOpaqueId, formatUserId } from '../utils/ids';
 import { createDevice, createAccessToken, getUserById } from '../services/database';
 
@@ -52,34 +52,34 @@ interface OAuthToken {
 }
 
 // ============================================
-// Helper Functions
+// Helper Functions (exported for unit tests)
 // ============================================
 
-// Generate a cryptographically secure random string
-function generateRandomString(length: number = 32): string {
+/** Cryptographically secure hex string; length is byte count (output is 2× hex). Exported for unit tests. */
+export function generateRandomString(length: number = 32): string {
   const bytes = new Uint8Array(length);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Base64URL encode
-function base64UrlEncode(data: Uint8Array): string {
+/** Base64URL encode (no padding). Exported for unit tests. */
+export function base64UrlEncode(data: Uint8Array): string {
   return btoa(String.fromCharCode(...data))
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/, '');
 }
 
-// Base64URL decode (for future JWT parsing)
-function base64UrlDecode(str: string): Uint8Array {
+/** Base64URL decode (accepts unpadded input). Exported for unit tests. */
+export function base64UrlDecode(str: string): Uint8Array {
   const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
   const padded = base64 + '='.repeat((4 - base64.length % 4) % 4);
   const binary = atob(padded);
   return Uint8Array.from(binary, c => c.charCodeAt(0));
 }
 
-// Verify PKCE code challenge
-async function verifyCodeChallenge(
+/** Verify PKCE code challenge (`plain` / `S256`; unknown methods fail). Exported for unit tests. */
+export async function verifyCodeChallenge(
   codeVerifier: string,
   codeChallenge: string,
   method: string
@@ -96,8 +96,8 @@ async function verifyCodeChallenge(
   return false;
 }
 
-// Hash a client secret
-async function hashClientSecret(secret: string): Promise<string> {
+/** SHA-256 + base64url hash of a client secret. Exported for unit tests. */
+export async function hashClientSecret(secret: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(secret);
   const hash = await crypto.subtle.digest('SHA-256', data);
@@ -374,7 +374,6 @@ app.post('/oauth/token', async (c) => {
     }
     const secretHash = await hashClientSecret(effectiveClientSecret);
     // Use constant-time comparison to prevent timing attacks
-    const { timingSafeEqual } = await import('../utils/crypto');
     if (!timingSafeEqual(secretHash, client.client_secret_hash)) {
       return c.json({ error: 'invalid_client', error_description: 'Invalid client credentials' }, 401);
     }
@@ -684,7 +683,8 @@ app.post('/oauth/introspect', async (c) => {
 // Login Page HTML
 // ============================================
 
-function generateLoginPage(clientName: string, authRequestId: string, serverName: string, error?: string): string {
+/** OAuth authorize login HTML. Exported for unit tests. */
+export function generateLoginPage(clientName: string, authRequestId: string, serverName: string, error?: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -836,7 +836,8 @@ function generateLoginPage(clientName: string, authRequestId: string, serverName
 </html>`;
 }
 
-function escapeHtml(str: string): string {
+/** Escape text interpolated into OAuth HTML pages. Exported for unit tests. */
+export function escapeHtml(str: string): string {
   return str
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -1022,8 +1023,8 @@ app.post('/oauth/authorize/uia', async (c) => {
   return c.html(generateUiaSuccessPage(sessionId, serverName));
 });
 
-// Generate UIA approval page
-function generateUiaApprovalPage(
+/** UIA approval HTML. Exported for unit tests. */
+export function generateUiaApprovalPage(
   sessionId: string, 
   userId: string, 
   title: string, 
@@ -1182,8 +1183,8 @@ function generateUiaApprovalPage(
 </html>`;
 }
 
-// Generate UIA success page
-function generateUiaSuccessPage(sessionId: string, serverName: string): string {
+/** UIA success HTML. Exported for unit tests. */
+export function generateUiaSuccessPage(sessionId: string, serverName: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1250,8 +1251,8 @@ function generateUiaSuccessPage(sessionId: string, serverName: string): string {
 </html>`;
 }
 
-// Generate UIA cancelled page
-function generateUiaCancelledPage(serverName: string): string {
+/** UIA cancelled HTML. Exported for unit tests. */
+export function generateUiaCancelledPage(serverName: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1299,8 +1300,8 @@ function generateUiaCancelledPage(serverName: string): string {
 </html>`;
 }
 
-// Generate UIA error page
-function generateUiaErrorPage(title: string, message: string, serverName: string): string {
+/** UIA error HTML. Exported for unit tests. */
+export function generateUiaErrorPage(title: string, message: string, serverName: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
