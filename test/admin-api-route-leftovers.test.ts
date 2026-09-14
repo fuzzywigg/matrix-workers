@@ -1,9 +1,10 @@
 /**
  * TOKENMAXX HEAVY leftovers after #157 / deepen after #241 / residual after #252
  * / residual after #265 / second-wave residual after tip #271 (post-#270) /
- * tertiary residual after tip #275 (post-#275 second-wave) — admin API
+ * tertiary residual after tip #275 (post-#275 second-wave) / quaternary
+ * residual after tip #279 (post-#279 IdP+invite tertiary) — admin API
  * soft/edge/reliability. Complements admin-api-routes.test.ts and
- * admin-api-concurrent-race leftovers (#239/#248/#265/#270/#275). Tests-only —
+ * admin-api-concurrent-race leftovers (#239/#248/#265/#270/#275/#279). Tests-only —
  * no product inventing. Fixtures use example.com only.
  *
  * Deepen after #241: analytics period soft, synapse destinations/event_reports,
@@ -32,6 +33,12 @@
  * exact "Identity provider not found"; POST /test Connection successful +
  * discovery-fail success:false — success/test niches unsaturated after #275
  * failure/empty soft floods.
+ *
+ * Quaternary residual after tip #279 (post-#279 IdP+invite tertiary): keys
+ * reason ladder completes with "No self-signing key" + "Verified" (second-wave
+ * only soft-flooded No signature in DB / Signature not in device key object);
+ * exact self-demote / self-purge / whois / login-token deactivated /
+ * registration non-bool product strings (prior soft floods asserted errcode only).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -5059,6 +5066,113 @@ describe('admin tertiary IdP update / delete / 404 exact / test soft after #275'
       expect(res.status).toBe(400);
       expect(res.body.success).toBe(false);
       expect(String(res.body.error)).toContain('discovery failed');
+    });
+  }
+});
+
+// quaternary exact-string leftovers after tip #279 (IdP+invite tertiary)
+
+describe('admin quaternary keys Verified / No-self-signing soft flood after #279', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`keys Verified soft-${i}`, async () => {
+      const res = await jsonReq(`/admin/api/users/${encodeURIComponent(BOB)}/keys`);
+      expect(res.status).toBe(200);
+      expect(res.body.user_id).toBe(BOB);
+      expect(
+        (res.body.verification_status as Record<string, { verified: boolean; reason: string }>).BOBDEVICE
+      ).toEqual({ verified: true, reason: 'Verified' });
+      expect(
+        (res.body.cross_signing_keys as { self_signing: { key_id: string } }).self_signing.key_id
+      ).toBe('ed25519:ss');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`keys No self-signing key soft-${i}`, async () => {
+      const db = createAdminDb({
+        crossSigningKeys: [
+          {
+            user_id: BOB,
+            key_type: 'master',
+            key_id: `ed25519:master-q${i}`,
+            key_data: JSON.stringify({ keys: {} }),
+          },
+        ],
+        crossSigningSigs: [],
+      });
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/keys`,
+        {},
+        createEnv({ db })
+      );
+      expect(res.status).toBe(200);
+      expect(
+        (res.body.verification_status as Record<string, { verified: boolean; reason: string }>).BOBDEVICE
+      ).toEqual({ verified: false, reason: 'No self-signing key' });
+    });
+  }
+});
+
+describe('admin quaternary exact guard / whois / login-token / registration soft after #279', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`remove-admin self-demote exact soft-${i}`, async () => {
+      const res = await jsonReq('/admin/api/remove-admin', jsonInit('POST', { user_id: ADMIN }));
+      expect(res.status).toBe(403);
+      expect(res.body.errcode).toBe('M_FORBIDDEN');
+      expect(res.body.error).toBe('Cannot remove your own admin privileges');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`self-purge exact soft-${i}`, async () => {
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(ADMIN)}/purge`,
+        { method: 'DELETE', headers: AUTH }
+      );
+      expect(res.status).toBe(403);
+      expect(res.body.errcode).toBe('M_FORBIDDEN');
+      expect(res.body.error).toBe('Cannot delete your own account');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`whois non-admin other exact soft-${i}`, async () => {
+      authState.userId = BOB;
+      const db = createAdminDb();
+      const res = await jsonReq(
+        `/_matrix/client/v3/admin/whois/${encodeURIComponent(ADMIN)}`,
+        {},
+        createEnv({ db })
+      );
+      expect(res.status).toBe(403);
+      expect(res.body.errcode).toBe('M_FORBIDDEN');
+      expect(res.body.error).toBe('Admin privileges required to query other users');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`login-token deactivated exact soft-${i}`, async () => {
+      const db = createAdminDb({
+        users: [defaultAdmin(), { ...defaultBob(), is_deactivated: 1 }],
+      });
+      const res = await jsonReq(
+        `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+        jsonInit('POST', { ttl_minutes: 5 }),
+        createEnv({ db })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_USER_DEACTIVATED');
+      expect(res.body.error).toBe('User is deactivated');
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`registration PUT non-bool exact soft-${i}`, async () => {
+      const body = i % 2 === 0 ? { enabled: 'true' } : { enabled: 1 };
+      const res = await jsonReq('/admin/api/registration', jsonInit('PUT', body));
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+      expect(res.body.error).toBe('Missing required parameter: enabled (boolean) required');
     });
   }
 });
