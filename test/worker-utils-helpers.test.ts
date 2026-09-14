@@ -397,8 +397,12 @@ describe('ids generators TOKENMAXX after #75', () => {
     const before = Date.now();
     const txn = await generateTransactionId();
     const after = Date.now();
-    const [tsPart, randPart] = txn.split('_');
-    expect(randPart).toBeTruthy();
+    // Opaque is base64url and may itself contain '_'; do not use split('_')[1]
+    const sep = txn.indexOf('_');
+    expect(sep).toBeGreaterThan(0);
+    const tsPart = txn.slice(0, sep);
+    const randPart = txn.slice(sep + 1);
+    expect(randPart.length).toBeGreaterThan(0);
     const ts = parseInt(tsPart, 36);
     expect(ts).toBeGreaterThanOrEqual(before);
     expect(ts).toBeLessThanOrEqual(after);
