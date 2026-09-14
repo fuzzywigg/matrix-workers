@@ -66,6 +66,21 @@ jobs:
       - run: npm ci
       - run: npm run test:crypto-db
 
+  # Fail-fast canary for room-cache + CallRoom/RoomDurableObject hibernation
+  # tridecenary (#314) + tetradecenary leftovers. Isolates flake attribution
+  # before the full vitest suite.
+  room-cache-hibernation:
+    name: Room-cache/Hibernation Concurrent Canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:room-cache-hibernation
+
   test:
     name: Tests
     runs-on: ubuntu-latest

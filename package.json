@@ -15,6 +15,7 @@
     "test:watch": "vitest",
     "test:media-presence-soft-concurrent": "vitest run test/media-api-concurrent-race-leftovers.test.ts test/media-api-soft-residual-second-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-concurrent-soft-leftovers.test.ts test/presence-receipts-typing-soft-residual-second-wave-concurrent-race-leftovers.test.ts",
     "test:crypto-db": "vitest run test/crypto.test.ts test/database-crud-helpers.test.ts test/database-notify-authchain.test.ts test/validate-event-size.test.ts test/errors.test.ts",
+    "test:room-cache-hibernation": "vitest run test/room-cache-tridecenary-concurrent-race-leftovers.test.ts test/room-cache-tetradecenary-concurrent-race-leftovers.test.ts && vitest run test/call-room-hibernation.test.ts -t \"tridecenary|tetradecenary\" && vitest run test/room-durable-object.test.ts -t \"tridecenary|tetradecenary\"",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/ test/",
     "worker:check": "wrangler deploy --dry-run --outdir=.wrangler-dry-run"
