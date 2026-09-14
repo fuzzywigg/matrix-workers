@@ -1017,3 +1017,563 @@ describe('CallRoom SFU/end/send leftovers TOKENMAXX after #76', () => {
     expect(closeTracksMock).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #232 — CallRoom hibernation *concurrent
+ * race / TOCTOU* on existing CallRoomDurableObject. Sequential hibernation
+ * + signaling coverage lives above; concurrent coverage was zero (no
+ * Promise.all on join/leave/end/load/persist).
+ *
+ * Distinct from room-cache residual KV races in
+ * test/room-cache-residual-concurrent-race-leftovers.test.ts.
+ */
+
+class RacingStorage {
+  map = new Map<string, unknown>();
+  events: string[] = [];
+  putHold = new Set<string>();
+  putWaiters = new Map<string, Array<() => void>>();
+  listHold = false;
+  listWaiters: Array<() => void> = [];
+  listCalls = 0;
+
+  async get(key: string): Promise<unknown> {
+    return this.map.get(key);
+  }
+
+  async put(key: string, value: unknown): Promise<void> {
+    this.events.push(`put:${key}`);
+    if (this.putHold.has(key)) {
+      await new Promise<void>((resolve) => {
+        const arr = this.putWaiters.get(key) ?? [];
+        arr.push(resolve);
+        this.putWaiters.set(key, arr);
+      });
+    }
+    this.map.set(key, structuredClone(value));
+  }
+
+  releasePut(key: string): void {
+    this.putHold.delete(key);
+    const arr = this.putWaiters.get(key) ?? [];
+    this.putWaiters.delete(key);
+    for (const w of arr) w();
+  }
+
+  async delete(key: string): Promise<void> {
+    this.events.push(`delete:${key}`);
+    this.map.delete(key);
+  }
+
+  async deleteAll(): Promise<void> {
+    this.events.push('deleteAll');
+    this.map.clear();
+  }
+
+  async list<T>(options: { prefix: string }): Promise<Map<string, T>> {
+    this.listCalls += 1;
+    this.events.push(`list:${options.prefix}`);
+    if (this.listHold) {
+      await new Promise<void>((resolve) => {
+        this.listWaiters.push(resolve);
+      });
+    }
+    const out = new Map<string, T>();
+    for (const [k, v] of [...this.map.entries()].sort()) {
+      if (k.startsWith(options.prefix)) out.set(k, v as T);
+    }
+    return out;
+  }
+}
+
+class RacingState {
+  storage: RacingStorage;
+  sockets: FakeWebSocket[] = [];
+
+  constructor(storage = new RacingStorage()) {
+    this.storage = storage;
+  }
+
+  getWebSockets(): FakeWebSocket[] {
+    return this.sockets;
+  }
+
+  acceptWebSocket(ws: FakeWebSocket): void {
+    this.sockets.push(ws);
+  }
+
+  setWebSocketAutoResponse(): void {}
+
+  blockConcurrencyWhile(cb: () => Promise<void>): Promise<void> {
+    return cb();
+  }
+}
+
+function makeRacingRoom(state: RacingState): CallRoomDurableObject {
+  return new CallRoomDurableObject(state as unknown as DurableObjectState, {} as Env);
+}
+
+function barrierFn<T>(n: number, factory: (i: number) => T): () => Promise<T> {
+  const waiters: Array<() => void> = [];
+  let seq = 0;
+  return async () => {
+    const mine = seq++;
+    await new Promise<void>((resolve) => {
+      waiters.push(resolve);
+      if (waiters.length >= n) {
+        const all = [...waiters];
+        waiters.length = 0;
+        for (const w of all) w();
+      }
+    });
+    return factory(mine);
+  };
+}
+
+describe('CallRoom hibernation concurrent join TOCTOU leftovers after #232', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    createSessionMock.mockResolvedValue({ sessionId: 'sess-new' });
+    renegotiateMock.mockResolvedValue(undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 10; i++) {
+    it(`same-key dual join after createSession barrier last-writer map size 1 flood-${i}`, async () => {
+      createSessionMock.mockImplementation(barrierFn(2, (n) => ({ sessionId: `sess-${n}` })));
+      const state = new RacingState();
+      const wsA = new FakeWebSocket();
+      const wsB = new FakeWebSocket();
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(wsA, JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })),
+        room.webSocketMessage(wsB, JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })),
+      ]);
+
+      expect(createSessionMock).toHaveBeenCalledTimes(2);
+      expect(room.participants.size).toBe(1);
+      expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+      expect(wsA.attachment).toEqual({ participantKey: 'u1|d1' });
+      expect(wsB.attachment).toEqual({ participantKey: 'u1|d1' });
+    });
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`A∥B join isolation two participants flood-${i}`, async () => {
+      createSessionMock.mockImplementation(barrierFn(2, (n) => ({ sessionId: `sess-${n}` })));
+      const state = new RacingState();
+      const wsA = new FakeWebSocket();
+      const wsB = new FakeWebSocket();
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(wsA, JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })),
+        room.webSocketMessage(wsB, JSON.stringify({ type: 'join', userId: 'u2', deviceId: 'd2' })),
+      ]);
+
+      expect(room.participants.size).toBe(2);
+      expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+      expect(state.storage.map.has('participant:u2|d2')).toBe(true);
+      const welcomeA = JSON.parse(wsA.sent[0]);
+      const welcomeB = JSON.parse(wsB.sent[0]);
+      expect(welcomeA.type).toBe('welcome');
+      expect(welcomeB.type).toBe('welcome');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`join∥ALREADY_JOINED sequential sibling isolation flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      const wsNew = new FakeWebSocket();
+      const wsDup = new FakeWebSocket();
+      state.sockets = [wsNew, wsDup];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(wsNew, JSON.stringify({ type: 'join', userId: 'u2', deviceId: 'd2' })),
+        room.webSocketMessage(wsDup, JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })),
+      ]);
+
+      expect(JSON.parse(wsDup.sent[0])).toMatchObject({ type: 'error', code: 'ALREADY_JOINED' });
+      expect(JSON.parse(wsNew.sent[0])).toMatchObject({ type: 'welcome' });
+      expect(createSessionMock).toHaveBeenCalledOnce();
+      expect(room.participants.size).toBe(2);
+    });
+  }
+});
+
+describe('CallRoom hibernation concurrent leave/end leftovers after #232', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    closeTracksMock.mockResolvedValue(undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`leave∥leave same socket closeTracks barrier idempotent flood-${i}`, async () => {
+      closeTracksMock.mockImplementation(barrierFn(2, () => undefined));
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([room.handleLeave(wsA), room.handleLeave(wsA)]);
+
+      expect(closeTracksMock).toHaveBeenCalledTimes(2);
+      expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+      expect(state.storage.map.has('participant:u2|d2')).toBe(true);
+      expect(room.participants.size).toBe(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`leave∥webSocketClose∥webSocketError isolation flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.handleLeave(wsA),
+        room.webSocketClose(wsA, 1006, 'abnormal'),
+        room.webSocketError(wsB, new Error('peer')),
+      ]);
+
+      expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+      expect(state.storage.map.has('participant:u2|d2')).toBe(false);
+      expect(room.participants.size).toBe(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`A leave∥B leave isolation flood-${i}`, async () => {
+      closeTracksMock.mockImplementation(barrierFn(2, () => undefined));
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      await state.storage.put(
+        'participant:u2|d2',
+        storedParticipant('u2', 'd2', { audio0: TRACK })
+      );
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([room.handleLeave(wsA), room.handleLeave(wsB)]);
+
+      expect(room.participants.size).toBe(0);
+      expect(state.storage.map.size).toBe(0);
+      expect(closeTracksMock).toHaveBeenCalledTimes(2);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`end∥leave last-writer storage empty flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      const [endRes] = await Promise.all([room.handleEndCall(), room.handleLeave(wsA)]);
+      expect(endRes.status).toBe(200);
+      expect(state.storage.map.size).toBe(0);
+      expect(room.participants.size).toBe(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`dual end is idempotent empty storage flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      await state.storage.put('callId', 'call-1');
+      const ws = new FakeWebSocket();
+      ws.serializeAttachment({ participantKey: 'u1|d1' });
+      state.sockets = [ws];
+      const room = makeRacingRoom(state) as any;
+
+      const [a, b] = await Promise.all([room.handleEndCall(), room.handleEndCall()]);
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(200);
+      expect(state.storage.map.size).toBe(0);
+    });
+  }
+});
+
+describe('CallRoom hibernation persist TOCTOU mute/offer∥leave after #232', () => {
+  beforeEach(() => {
+    addTracksMock.mockReset();
+    closeTracksMock.mockReset();
+    createSessionMock.mockReset();
+    renegotiateMock.mockReset();
+    closeTracksMock.mockResolvedValue(undefined);
+    addTracksMock.mockResolvedValue({
+      sessionDescription: { type: 'answer', sdp: 'v=answer' },
+      tracks: [{ mid: '5' }],
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`mute persist put-hold vs leave delete last-writer flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+      state.storage.putHold.add('participant:u1|d1');
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      const muteP = room.webSocketMessage(
+        wsA,
+        JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })
+      );
+      await vi.waitFor(() => {
+        expect(state.storage.events.filter((e) => e.startsWith('put:participant:u1|d1')).length).toBeGreaterThan(0);
+      });
+      await room.handleLeave(wsA);
+      expect(state.storage.map.has('participant:u1|d1')).toBe(false);
+      state.storage.releasePut('participant:u1|d1');
+      await muteP;
+      // persist completes after delete: documented ghost-row TOCTOU.
+      expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+      expect(room.participants.has('u1|d1')).toBe(false);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`offer persist∥leave isolation peer remains flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(
+          wsA,
+          JSON.stringify({ type: 'offer', trackName: 'video0', kind: 'video', sdp: 'v=0' })
+        ),
+        room.handleLeave(wsB),
+      ]);
+
+      expect(state.storage.map.has('participant:u2|d2')).toBe(false);
+      expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+      const stored = state.storage.map.get('participant:u1|d1') as {
+        tracks: Record<string, { mid: string }>;
+      };
+      expect(stored.tracks.video0.mid).toBe('5');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`join persist put-hold vs end deleteAll last-writer flood-${i}`, async () => {
+      createSessionMock.mockResolvedValue({ sessionId: 'sess-hold' });
+      const state = new RacingState();
+      state.storage.putHold.add('participant:u1|d1');
+      const ws = new FakeWebSocket();
+      state.sockets = [ws];
+      const room = makeRacingRoom(state) as any;
+
+      const joinP = room.webSocketMessage(
+        ws,
+        JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })
+      );
+      await vi.waitFor(() => {
+        expect(state.storage.events.some((e) => e === 'put:participant:u1|d1')).toBe(true);
+      });
+      await room.handleEndCall();
+      expect(state.storage.map.size).toBe(0);
+      state.storage.releasePut('participant:u1|d1');
+      await joinP;
+      expect(state.storage.map.has('participant:u1|d1')).toBe(true);
+    });
+  }
+});
+
+describe('CallRoom hibernation loadParticipants concurrent leftovers after #232', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`dual loadParticipants list-hold still one map flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      await state.storage.put('participant:u2|d2', storedParticipant('u2', 'd2'));
+      state.storage.listHold = true;
+      const room = makeRacingRoom(state) as any;
+
+      const loads = Promise.all([room.loadParticipants(), room.loadParticipants()]);
+      await vi.waitFor(() => {
+        expect(state.storage.listWaiters.length).toBe(2);
+      });
+      const waiters = [...state.storage.listWaiters];
+      state.storage.listHold = false;
+      state.storage.listWaiters = [];
+      for (const w of waiters) w();
+      await loads;
+
+      expect(room.participants.size).toBe(2);
+      expect(room.participants.get('u1|d1').tracks instanceof Map).toBe(true);
+      expect(state.storage.listCalls).toBe(2);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`two revived instances over shared storage isolate memory flood-${i}`, async () => {
+      const storage = new RacingStorage();
+      const stateA = new RacingState(storage);
+      const stateB = new RacingState(storage);
+      await storage.put('participant:u1|d1', storedParticipant('u1', 'd1'));
+      const a = makeRacingRoom(stateA) as any;
+      const b = makeRacingRoom(stateB) as any;
+      await Promise.all([a.loadParticipants(), b.loadParticipants()]);
+      expect(a.participants.size).toBe(1);
+      expect(b.participants.size).toBe(1);
+      a.participants.delete('u1|d1');
+      expect(b.participants.has('u1|d1')).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`GET /state ∥ join sees eventual participant flood-${i}`, async () => {
+      createSessionMock.mockResolvedValue({ sessionId: 'sess-state' });
+      const state = new RacingState();
+      await state.storage.put('callId', 'call-9');
+      const ws = new FakeWebSocket();
+      state.sockets = [ws];
+      const room = makeRacingRoom(state) as any;
+
+      const [stateRes] = await Promise.all([
+        room.fetch(new Request('https://do/state')),
+        room.webSocketMessage(ws, JSON.stringify({ type: 'join', userId: 'u1', deviceId: 'd1' })),
+      ]);
+      const body = await stateRes.json();
+      const after = await (await room.fetch(new Request('https://do/state'))).json();
+      expect(after.participants).toHaveLength(1);
+      expect(body.participants.length === 0 || body.participants.length === 1).toBe(true);
+      expect(after.callId).toBe('call-9');
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`init∥state callId visible after both settle flood-${i}`, async () => {
+      const state = new RacingState();
+      const room = makeRacingRoom(state) as any;
+      const [initRes, stateRes] = await Promise.all([
+        room.fetch(
+          new Request('https://do/init', {
+            method: 'POST',
+            body: JSON.stringify({ roomId: '!r:example.com', callId: 'call-init' }),
+          })
+        ),
+        room.fetch(new Request('https://do/state')),
+      ]);
+      expect(initRes.status).toBe(200);
+      expect(stateRes.status).toBe(200);
+      const settled = await (await room.fetch(new Request('https://do/state'))).json();
+      expect(settled).toMatchObject({ callId: 'call-init', roomId: '!r:example.com' });
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`broadcast during A∥B mute isolation flood-${i}`, async () => {
+      const state = new RacingState();
+      await state.storage.put(
+        'participant:u1|d1',
+        storedParticipant('u1', 'd1', { audio0: TRACK })
+      );
+      await state.storage.put(
+        'participant:u2|d2',
+        storedParticipant('u2', 'd2', { audio0: TRACK })
+      );
+      const wsA = new FakeWebSocket();
+      wsA.serializeAttachment({ participantKey: 'u1|d1' });
+      const wsB = new FakeWebSocket();
+      wsB.serializeAttachment({ participantKey: 'u2|d2' });
+      state.sockets = [wsA, wsB];
+      const room = makeRacingRoom(state) as any;
+
+      await Promise.all([
+        room.webSocketMessage(wsA, JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })),
+        room.webSocketMessage(wsB, JSON.stringify({ type: 'mute', trackName: 'audio0', muted: true })),
+      ]);
+
+      const aTracks = state.storage.map.get('participant:u1|d1') as {
+        tracks: Record<string, { enabled: boolean }>;
+      };
+      const bTracks = state.storage.map.get('participant:u2|d2') as {
+        tracks: Record<string, { enabled: boolean }>;
+      };
+      expect(aTracks.tracks.audio0.enabled).toBe(false);
+      expect(bTracks.tracks.audio0.enabled).toBe(false);
+      expect(wsA.sent.some((s) => JSON.parse(s).type === 'mute_changed')).toBe(true);
+      expect(wsB.sent.some((s) => JSON.parse(s).type === 'mute_changed')).toBe(true);
+    });
+  }
+});
