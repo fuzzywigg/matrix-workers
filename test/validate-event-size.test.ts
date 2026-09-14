@@ -422,3 +422,73 @@ describe('validateEventSize TOKENMAXX residual second-wave leftovers after #282'
     expect('content' in missing).toBe(false);
   });
 });
+
+describe('validateEventSize TOKENMAXX residual tertiary leftovers after #290', () => {
+  it('null content (as {}) concurrent with hard-cap reject neither mutates', async () => {
+    const nullContent = baseEvent({ body: 'will-null' });
+    (nullContent as { content: unknown }).content = null;
+    expect(nullContent.content).toBeNull();
+
+    const hard = baseEvent({ body: 'ok' });
+    hard.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    expect(JSON.stringify(hard.content).length).toBeLessThanOrEqual(65_536);
+    expect(JSON.stringify(hard).length).toBeGreaterThan(921_600);
+
+    const beforeNull = JSON.stringify(nullContent);
+    const beforeHard = JSON.stringify(hard);
+    const [okResult, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(nullContent as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(hard);
+        return 'bad';
+      }),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      const e = badResult.reason as MatrixApiError;
+      expect(e.errcode).toBe('M_TOO_LARGE');
+      expect(e.message).toMatch(/D1 row limit/);
+    }
+    expect(JSON.stringify(nullContent)).toBe(beforeNull);
+    expect(JSON.stringify(hard)).toBe(beforeHard);
+    expect(nullContent.content).toBeNull();
+  });
+
+  it('array content concurrent with soft-reject neither mutates', async () => {
+    const arr = baseEvent({ body: 'x' });
+    (arr as { content: unknown }).content = ['a', 'b'];
+    expect(Array.isArray(arr.content)).toBe(true);
+
+    const overhead = JSON.stringify({ body: '' }).length;
+    const bad = baseEvent({ body: 'z'.repeat(65_536 - overhead + 1) });
+    expect(JSON.stringify(bad.content).length).toBe(65_537);
+
+    const beforeArr = JSON.stringify(arr);
+    const beforeBad = JSON.stringify(bad);
+    const contentLen = JSON.stringify(bad.content).length;
+    const [okResult, badResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(arr as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(bad);
+        return 'bad';
+      }),
+    ]);
+    expect(okResult.status).toBe('fulfilled');
+    expect(badResult.status).toBe('rejected');
+    if (badResult.status === 'rejected') {
+      const e = badResult.reason as MatrixApiError;
+      expect(e.message).toMatch(/content exceeds/);
+      expect(e.message).toMatch(new RegExp(String(contentLen)));
+    }
+    expect(JSON.stringify(arr)).toBe(beforeArr);
+    expect(JSON.stringify(bad)).toBe(beforeBad);
+    expect(arr.content).toEqual(['a', 'b']);
+  });
+});

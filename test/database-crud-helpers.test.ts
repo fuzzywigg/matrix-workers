@@ -3797,3 +3797,181 @@ describe('database CRUD TOKENMAXX residual second-wave leftovers after #282', ()
     expect(ids).not.toContain('$hard-store');
   });
 });
+
+describe('database CRUD TOKENMAXX residual tertiary leftovers after #290', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('deleteRoomAlias ∥ createRoomAlias same alias collapses to create-wins or empty', async () => {
+    const db = createCrudDb({
+      aliases: [
+        {
+          alias: '#race:example.com',
+          room_id: ROOM,
+          creator_id: USER,
+          created_at: NOW,
+        },
+      ],
+    });
+    await Promise.all([
+      deleteRoomAlias(db, '#race:example.com'),
+      createRoomAlias(db, '#race:example.com', ROOM, BOB),
+    ]);
+    // Interleaving: delete-then-create → one BOB row; create-then-delete → empty (delete removes both).
+    const remaining = db._state.aliases.filter((a) => a.alias === '#race:example.com');
+    expect(remaining.length).toBeLessThanOrEqual(1);
+    if (remaining.length === 1) {
+      expect(remaining[0]).toMatchObject({ room_id: ROOM, creator_id: BOB });
+    }
+    const looked = await getRoomByAlias(db, '#race:example.com');
+    expect(looked === null || looked === ROOM).toBe(true);
+  });
+
+  it('getUserRooms ∥ updateMembership: join filter sees old invite or new join only', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'invite',
+          event_id: '$inv',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    const [rooms] = await Promise.all([
+      getUserRooms(db, USER, 'join'),
+      updateMembership(db, ROOM, USER, 'join', '$join'),
+    ]);
+    expect(rooms.length).toBeLessThanOrEqual(1);
+    expect(rooms.every((r) => r === ROOM)).toBe(true);
+    await expect(getUserRooms(db, USER, 'join')).resolves.toEqual([ROOM]);
+    await expect(getMembership(db, ROOM, USER)).resolves.toEqual({
+      membership: 'join',
+      eventId: '$join',
+    });
+  });
+
+  it('getRoomMembers ∥ tryInsertJoinMembership: page sees invite or upgraded join', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'invite',
+          event_id: '$inv',
+          display_name: 'Alice',
+          avatar_url: null,
+        },
+      ],
+    });
+    const [members, upgrade] = await Promise.all([
+      getRoomMembers(db, ROOM),
+      tryInsertJoinMembership(db, ROOM, USER, '$join-up', 'Alice'),
+    ]);
+    expect(upgrade.inserted).toBe(true);
+    expect(upgrade.eventId).toBe('$join-up');
+    expect(members).toHaveLength(1);
+    expect(members[0].userId).toBe(USER);
+    expect(['invite', 'join']).toContain(members[0].membership);
+    const after = await getRoomMembers(db, ROOM, 'join');
+    expect(after).toEqual([
+      { userId: USER, membership: 'join', displayName: 'Alice', avatarUrl: undefined },
+    ]);
+  });
+
+  it('storeEventIdempotent soft-oversized inserts under race while storeEvent soft-rejects', async () => {
+    const db = createCrudDb({ streamPosition: 1 });
+    const soft = pdu({
+      event_id: '$soft-idem',
+      type: 'm.room.message',
+      content: { body: 'x'.repeat(70_000) },
+    });
+    expect(JSON.stringify(soft.content).length).toBeGreaterThan(65_536);
+    const ok = pdu({
+      event_id: '$ok-soft-race',
+      type: 'm.room.message',
+      content: { body: 'ok' },
+    });
+    const [idem, storeOk, storeSoft] = await Promise.allSettled([
+      storeEventIdempotent(db, soft),
+      storeEvent(db, ok),
+      storeEvent(db, { ...soft, event_id: '$soft-store' }),
+    ]);
+    expect(idem.status).toBe('fulfilled');
+    if (idem.status === 'fulfilled') {
+      expect(idem.value.inserted).toBe(true);
+      expect(idem.value.streamOrdering).not.toBeNull();
+    }
+    expect(storeOk.status).toBe('fulfilled');
+    expect(storeSoft.status).toBe('rejected');
+    if (storeSoft.status === 'rejected') {
+      expect(storeSoft.reason).toMatchObject({ errcode: 'M_TOO_LARGE' });
+      expect((storeSoft.reason as MatrixApiError).message).toMatch(/content exceeds/);
+    }
+    const ids = db._state.events.map((e) => e.event_id).sort();
+    expect(ids).toEqual(['$ok-soft-race', '$soft-idem'].sort());
+    expect(ids).not.toContain('$soft-store');
+  });
+
+  it('getDevice ∥ deleteDevice: read sees device or null; sibling device untouched', async () => {
+    const db = createCrudDb({
+      devices: [
+        {
+          user_id: USER,
+          device_id: 'DEV1',
+          display_name: 'Phone',
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: NOW,
+        },
+        {
+          user_id: USER,
+          device_id: 'DEV2',
+          display_name: 'Laptop',
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: NOW,
+        },
+      ],
+    });
+    const [got] = await Promise.all([getDevice(db, USER, 'DEV1'), deleteDevice(db, USER, 'DEV1')]);
+    expect(got === null || got?.device_id === 'DEV1').toBe(true);
+    await expect(getDevice(db, USER, 'DEV1')).resolves.toBeNull();
+    await expect(getDevice(db, USER, 'DEV2')).resolves.toMatchObject({
+      device_id: 'DEV2',
+      display_name: 'Laptop',
+    });
+  });
+
+  it('getPasswordHash ∥ createUser sibling: lookup stays isolated from insert', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'pbkdf2-existing',
+          display_name: null,
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    const [hash] = await Promise.all([
+      getPasswordHash(db, USER),
+      createUser(db, BOB, 'bob', 'pbkdf2-bob', false),
+    ]);
+    expect(hash).toBe('pbkdf2-existing');
+    await expect(getPasswordHash(db, BOB)).resolves.toBe('pbkdf2-bob');
+    await expect(getPasswordHash(db, USER)).resolves.toBe('pbkdf2-existing');
+  });
+});

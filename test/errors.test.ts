@@ -715,3 +715,79 @@ describe('errors TOKENMAXX residual second-wave leftovers after #282', () => {
     spy.mockRestore();
   });
 });
+
+describe('errors TOKENMAXX residual tertiary leftovers after #290', () => {
+  it('forbidden / unknownToken / invalidUsername / invalidParam stay isolated under race', async () => {
+    const [forb, tok, user, param, paramCustom] = await Promise.all([
+      Promise.resolve(Errors.forbidden('nope').toResponse()),
+      Promise.resolve(Errors.unknownToken('bad').toResponse()),
+      Promise.resolve(Errors.invalidUsername('badname').toResponse()),
+      Promise.resolve(Errors.invalidParam('limit').toResponse()),
+      Promise.resolve(Errors.invalidParam('user_id', 'must be MXID').toResponse()),
+    ]);
+    expect(new Set([forb, tok, user, param, paramCustom]).size).toBe(5);
+    expect(forb.status).toBe(403);
+    expect(tok.status).toBe(401);
+    expect(user.status).toBe(400);
+    expect(param.status).toBe(400);
+    expect(paramCustom.status).toBe(400);
+    await expect(forb.json()).resolves.toEqual({ errcode: 'M_FORBIDDEN', error: 'nope' });
+    await expect(tok.json()).resolves.toEqual({ errcode: 'M_UNKNOWN_TOKEN', error: 'bad' });
+    await expect(user.json()).resolves.toEqual({ errcode: 'M_INVALID_USERNAME', error: 'badname' });
+    await expect(param.json()).resolves.toEqual({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Invalid parameter: limit',
+    });
+    await expect(paramCustom.json()).resolves.toEqual({
+      errcode: 'M_INVALID_PARAM',
+      error: 'must be MXID',
+    });
+  });
+
+  it('withErrorHandler races forbidden + invalidParam + unknownToken', async () => {
+    const [a, b, c] = await Promise.all([
+      withErrorHandler(async () => {
+        throw Errors.forbidden('denied');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.invalidParam('device_id');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.unknownToken('gone');
+      }),
+    ]);
+    expect((a as Response).status).toBe(403);
+    expect((b as Response).status).toBe(400);
+    expect((c as Response).status).toBe(401);
+    await expect((a as Response).json()).resolves.toEqual({
+      errcode: 'M_FORBIDDEN',
+      error: 'denied',
+    });
+    await expect((b as Response).json()).resolves.toEqual({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Invalid parameter: device_id',
+    });
+    await expect((c as Response).json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN_TOKEN',
+      error: 'gone',
+    });
+  });
+
+  it('Errors.unknown default ∥ custom message produce distinct bodies under race', async () => {
+    const [def, custom] = await Promise.all([
+      Promise.resolve(Errors.unknown().toResponse()),
+      Promise.resolve(Errors.unknown('boom-tertiary').toResponse()),
+    ]);
+    expect(def).not.toBe(custom);
+    expect(def.status).toBe(500);
+    expect(custom.status).toBe(500);
+    await expect(def.json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN',
+      error: 'An unknown error occurred',
+    });
+    await expect(custom.json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN',
+      error: 'boom-tertiary',
+    });
+  });
+});

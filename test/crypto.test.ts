@@ -1149,3 +1149,132 @@ describe('federation signing TOKENMAXX residual second-wave leftovers after #282
     ).toBeUndefined();
   });
 });
+
+describe('federation signing TOKENMAXX residual tertiary leftovers after #290', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('concurrent foreign re-sign from local-server base preserves local sig', async () => {
+    const local = await generateSigningKeyPair();
+    const foreignA = await generateSigningKeyPair();
+    const foreignB = await generateSigningKeyPair();
+    const base = await signJson(
+      { type: 'm.test', content: { n: 2 }, unsigned: { age: 3 } },
+      'local.example.com',
+      local.keyId,
+      local.privateKeyJwk
+    );
+    const localSnap = {
+      ...(base.signatures as Record<string, Record<string, string>>)['local.example.com'],
+    };
+    const [signedA, signedB] = await Promise.all([
+      signJson(base, 'foreign.example.com', foreignA.keyId, foreignA.privateKeyJwk),
+      signJson(base, 'foreign.example.com', foreignB.keyId, foreignB.privateKeyJwk),
+    ]);
+    for (const signed of [signedA, signedB]) {
+      expect((signed.signatures as Record<string, Record<string, string>>)['local.example.com']).toEqual(
+        localSnap
+      );
+      expect(signed.unsigned).toEqual({ age: 3 });
+      expect(await verifySignature(signed, 'local.example.com', local.keyId, local.publicKey)).toBe(true);
+    }
+    expect(await verifySignature(signedA, 'foreign.example.com', foreignA.keyId, foreignA.publicKey)).toBe(
+      true
+    );
+    expect(await verifySignature(signedB, 'foreign.example.com', foreignB.keyId, foreignB.publicKey)).toBe(
+      true
+    );
+    // Sibling foreign keyIds are not merged across concurrent calls from the shared local base
+    expect(
+      (signedA.signatures as Record<string, Record<string, string>>)['foreign.example.com'][foreignB.keyId]
+    ).toBeUndefined();
+    expect(
+      (signedB.signatures as Record<string, Record<string, string>>)['foreign.example.com'][foreignA.keyId]
+    ).toBeUndefined();
+  });
+
+  it('concurrent verifySignature empty-server-map vs valid signature stay isolated', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson({ type: 'm.test', content: { ok: true } }, 'ex.com', keyId, privateKeyJwk);
+    const emptyServer = {
+      ...signed,
+      signatures: { 'ex.com': {} },
+    };
+    const [ok, empty, missing] = await Promise.all([
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(emptyServer, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'other.example.com', keyId, publicKey),
+    ]);
+    expect(ok).toBe(true);
+    expect(empty).toBe(false);
+    expect(missing).toBe(false);
+  });
+});
+
+describe('crypto TOKENMAXX residual tertiary leftovers after #290', () => {
+  it('hashToken / sha256 concurrent distinct tokens stay isolated and match', async () => {
+    const [ta, tb, sa, sb] = await Promise.all([
+      hashToken('syt_a_example'),
+      hashToken('syt_b_example'),
+      sha256('syt_a_example'),
+      sha256('syt_b_example'),
+    ]);
+    expect(ta).toBe(sa);
+    expect(tb).toBe(sb);
+    expect(ta).not.toBe(tb);
+    expect(ta).not.toMatch(/[+/=]/);
+    expect(tb).not.toMatch(/[+/=]/);
+  });
+
+  it('calculateContentHash concurrent strip leaves signatures while verifyContentHash races', async () => {
+    const a = {
+      type: 'm.test',
+      content: { side: 'a' },
+      signatures: { 'a.example.com': { 'ed25519:1': 'siga' } },
+      unsigned: { age: 1 },
+    };
+    const b = {
+      type: 'm.test',
+      content: { side: 'b' },
+      signatures: { 'b.example.com': { 'ed25519:2': 'sigb' } },
+      unsigned: { age: 2 },
+    };
+    const expectedA = await calculateContentHash({ type: 'm.test', content: { side: 'a' } });
+    const beforeA = JSON.stringify(a);
+    const beforeB = JSON.stringify(b);
+    const [hashA, hashB, okA, badB] = await Promise.all([
+      calculateContentHash(a),
+      calculateContentHash(b),
+      verifyContentHash(a, expectedA),
+      verifyContentHash(b, 'not-a-real-hash'),
+    ]);
+    expect(hashA).toBe(expectedA);
+    expect(hashA).not.toBe(hashB);
+    expect(okA).toBe(true);
+    expect(badB).toBe(false);
+    expect(JSON.stringify(a)).toBe(beforeA);
+    expect(JSON.stringify(b)).toBe(beforeB);
+    expect(a.signatures).toEqual({ 'a.example.com': { 'ed25519:1': 'siga' } });
+    expect(b.signatures).toEqual({ 'b.example.com': { 'ed25519:2': 'sigb' } });
+  });
+
+  it('validatePasswordStrength concurrent boundary lengths stay independent', async () => {
+    const [short, exact8, exact1000, over] = await Promise.all([
+      Promise.resolve(validatePasswordStrength('abcdef7')),
+      Promise.resolve(validatePasswordStrength('abcdefg1')),
+      Promise.resolve(validatePasswordStrength(`${'a'.repeat(999)}1`)),
+      Promise.resolve(validatePasswordStrength(`${'a'.repeat(1000)}1`)),
+    ]);
+    expect(short).toMatch(/at least 8/);
+    expect(exact8).toBeNull();
+    expect(exact1000).toBeNull();
+    expect(over).toMatch(/at most 1000/);
+  });
+});
