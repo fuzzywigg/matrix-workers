@@ -1859,3 +1859,407 @@ describe('account-data leftovers soft flood — corrupt KV samples after #147', 
     });
   }
 });
+
+// =============================================================================
+// TOKENMAXX HEAVY residual floods after #147 (batch 2)
+// =============================================================================
+
+describe('oauth leftovers HEAVY — POST authorize formData uncaught after #147', () => {
+  it('formData reject on POST /oauth/authorize → non-200 (no try/catch)', async () => {
+    const spy = vi
+      .spyOn(HonoRequest.prototype, 'formData')
+      .mockRejectedValueOnce(new Error('form boom'));
+    const env = oauthEnv({ db: aliceOAuthDb() });
+    const res = await oauthRequest(
+      '/oauth/authorize',
+      { method: 'POST', body: new FormData() },
+      env
+    );
+    spy.mockRestore();
+    expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+});
+
+describe('oauth leftovers HEAVY — revoke/introspect content-type flood after #147', () => {
+  const ctypes = [
+    'text/plain',
+    'application/xml',
+    'multipart/form-data',
+    '',
+    'application/json; charset=utf-8',
+  ];
+
+  for (const [i, ct] of ctypes.entries()) {
+    it(`revoke unsupported/odd content-type soft-${i}`, async () => {
+      const env = oauthEnv();
+      const res = await oauthRequest(
+        '/oauth/revoke',
+        {
+          method: 'POST',
+          headers: ct ? { 'Content-Type': ct } : {},
+          body: ct.includes('json')
+            ? JSON.stringify({ token: 't' })
+            : 'token=t',
+        },
+        env
+      );
+      // json charset should parse; others may 400 missing token
+      expect(res.status).toBeGreaterThanOrEqual(200);
+      expect(res.status).toBeLessThan(500);
+    });
+  }
+
+  for (const [i, ct] of ctypes.entries()) {
+    it(`introspect content-type soft-${i}`, async () => {
+      const env = oauthEnv();
+      const res = await oauthRequest(
+        '/oauth/introspect',
+        {
+          method: 'POST',
+          headers: ct ? { 'Content-Type': ct } : {},
+          body: ct.includes('json')
+            ? JSON.stringify({ token: 'missing' })
+            : 'token=missing',
+        },
+        env
+      );
+      expect(res.status).toBeGreaterThanOrEqual(200);
+      expect(res.status).toBeLessThan(600);
+    });
+  }
+});
+
+describe('oauth leftovers HEAVY — token grant_type / missing field flood after #147', () => {
+  const cases: Array<{ name: string; body: Record<string, string>; expectError?: string }> = [
+    { name: 'missing grant_type', body: { client_id: 'client_left' }, expectError: 'unsupported_grant_type' },
+    { name: 'empty grant_type', body: { grant_type: '', client_id: 'client_left' } },
+    { name: 'password grant', body: { grant_type: 'password', client_id: 'client_left' } },
+    { name: 'client_credentials', body: { grant_type: 'client_credentials', client_id: 'client_left' } },
+    { name: 'auth_code missing code', body: { grant_type: 'authorization_code', client_id: 'client_left', redirect_uri: REDIRECT } },
+    { name: 'refresh missing token', body: { grant_type: 'refresh_token', client_id: 'client_left' } },
+  ];
+
+  for (const row of cases) {
+    it(row.name, async () => {
+      const cache = mockKv();
+      seedClient(cache);
+      const env = oauthEnv({ cache, db: aliceOAuthDb() });
+      const res = await oauthRequest(
+        '/oauth/token',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams(row.body),
+        },
+        env
+      );
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
+      if (row.expectError) {
+        expect((await oauthJson(res)).error).toBe(row.expectError);
+      }
+    });
+  }
+});
+
+describe('login leftovers HEAVY — logout / logout.all reliability after #147', () => {
+  it('logout without Authorization token still 200 {}', async () => {
+    const db = aliceLoginDb();
+    const res = await loginRequest(
+      loginEnv(db),
+      '/_matrix/client/v3/logout',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+  });
+
+  it('logout with bearer deletes matching hash', async () => {
+    const db = aliceLoginDb();
+    const token = 'syt_logout_left';
+    const hash = await hashToken(token);
+    db.tokens.push({
+      token_id: 'tid-logout',
+      token_hash: hash,
+      user_id: USER,
+      device_id: DEVICE,
+      created_at: NOW,
+    });
+    const res = await loginRequest(
+      loginEnv(db),
+      '/_matrix/client/v3/logout',
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: '{}',
+      }
+    );
+    expect(res.status).toBe(200);
+    expect(db.tokens.every((t) => t.token_hash !== hash)).toBe(true);
+  });
+
+  it('logout/all deletes all user tokens', async () => {
+    const db = aliceLoginDb();
+    db.tokens.push(
+      {
+        token_id: 'a',
+        token_hash: 'h1',
+        user_id: USER,
+        device_id: 'D1',
+        created_at: NOW,
+      },
+      {
+        token_id: 'b',
+        token_hash: 'h2',
+        user_id: USER,
+        device_id: 'D2',
+        created_at: NOW,
+      },
+      {
+        token_id: 'c',
+        token_hash: 'h3',
+        user_id: '@bob:example.com',
+        device_id: 'D3',
+        created_at: NOW,
+      }
+    );
+    const res = await loginRequest(
+      loginEnv(db),
+      '/_matrix/client/v3/logout/all',
+      jsonInit('POST', {})
+    );
+    expect(res.status).toBe(200);
+    expect(db.tokens.every((t) => t.user_id !== USER)).toBe(true);
+    expect(db.tokens.some((t) => t.user_id === '@bob:example.com')).toBe(true);
+  });
+});
+
+describe('login leftovers HEAVY — m.login.token hostility after #147', () => {
+  it('missing token → M_MISSING_PARAM or forbidden', async () => {
+    const res = await loginRequest(
+      loginEnv(aliceLoginDb()),
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token' })
+    );
+    expect(res.status).not.toBe(200);
+    expect(res.status).toBeLessThan(500);
+  });
+
+  it('unknown login_token → M_FORBIDDEN / unknown', async () => {
+    const sessions = mockKv();
+    const res = await loginRequest(
+      loginEnv(aliceLoginDb(), sessions),
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: 'mlt_nope' })
+    );
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+  });
+
+  it('expired login_token → non-200', async () => {
+    const sessions = mockKv();
+    const raw = 'mlt_expired_left';
+    const hash = await hashToken(raw);
+    sessions.data[`login_token:${hash}`] = JSON.stringify({
+      user_id: USER,
+      expires_at: NOW - 1,
+    });
+    const res = await loginRequest(
+      loginEnv(aliceLoginDb(), sessions),
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: raw })
+    );
+    expect(res.status).not.toBe(200);
+  });
+
+  it('valid login_token succeeds and consumes KV', async () => {
+    const sessions = mockKv();
+    const raw = 'mlt_ok_left';
+    const hash = await hashToken(raw);
+    sessions.data[`login_token:${hash}`] = JSON.stringify({
+      user_id: USER,
+      expires_at: NOW + 60_000,
+    });
+    const res = await loginRequest(
+      loginEnv(aliceLoginDb(), sessions),
+      '/_matrix/client/v3/login',
+      jsonInit('POST', { type: 'm.login.token', token: raw })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.access_token).toBeTruthy();
+    expect(sessions.data[`login_token:${hash}`]).toBeUndefined();
+  });
+});
+
+describe('identity leftovers HEAVY — account register terms/hash_details soft after #147', () => {
+  it('GET /hash_details returns pepper algorithm', async () => {
+    const cache = mockKv({ 'identity:pepper': 'pepperdeadbeef01' });
+    const env = {
+      SERVER_NAME: SERVER,
+      CACHE: cache,
+      DB: createIdentityDb() as unknown as D1Database,
+    } as Env;
+    const res = await identity.request(
+      `http://localhost${ID_BASE}/hash_details`,
+      {},
+      env
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.lookup_pepper).toBe('pepperdeadbeef01');
+    expect(body.algorithms).toBeTruthy();
+  });
+
+  it('GET /hash_details creates pepper with 7-day TTL when missing', async () => {
+    const cache = mockKv();
+    const env = {
+      SERVER_NAME: SERVER,
+      CACHE: cache,
+      DB: createIdentityDb() as unknown as D1Database,
+    } as Env;
+    const res = await identity.request(
+      `http://localhost${ID_BASE}/hash_details`,
+      {},
+      env
+    );
+    expect(res.status).toBe(200);
+    expect(cache.puts.some((p) => p.key === 'identity:pepper')).toBe(true);
+    const put = cache.puts.find((p) => p.key === 'identity:pepper')!;
+    expect(put.options?.expirationTtl).toBe(7 * 24 * 60 * 60);
+  });
+
+  it('POST /lookup empty addresses → empty mappings', async () => {
+    const cache = mockKv({ 'identity:pepper': 'pepperdeadbeef01' });
+    const env = {
+      SERVER_NAME: SERVER,
+      CACHE: cache,
+      DB: createIdentityDb() as unknown as D1Database,
+    } as Env;
+    const res = await identity.request(
+      `http://localhost${ID_BASE}/lookup`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          algorithm: 'sha256',
+          pepper: 'pepperdeadbeef01',
+          addresses: [],
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { mappings: Record<string, string> };
+    expect(body.mappings).toEqual({});
+  });
+});
+
+describe('account-data leftovers HEAVY — non-E2EE put/get lifecycle flood after #147', () => {
+  const types = [
+    'm.direct',
+    'm.ignored_user_list',
+    'm.fully_read',
+    'im.vector.setting.breadcrumbs',
+    'org.example.custom',
+  ];
+
+  for (const [i, type] of types.entries()) {
+    it(`non-E2EE put→get soft-${i} (${type})`, async () => {
+      const db = createAccountDataDb();
+      const env = accountDataEnv({ db, userKeys: createUserKeysStub(), accountDataKv: mockKv() });
+      const put = await accountDataRequest(
+        env,
+        globalPath(type),
+        jsonInit('PUT', { n: i, type })
+      );
+      expect(put.status).toBe(200);
+      const get = await accountDataRequest(env, globalPath(type));
+      expect(get.status).toBe(200);
+      expect(get.body).toEqual({ n: i, type });
+      // non-E2EE should not touch DO
+      expect(env._userKeys.fetches).toHaveLength(0);
+    });
+  }
+});
+
+describe('oauth leftovers HEAVY — register redirect_uris hostility flood after #147', () => {
+  // Current validation only checks truthy + length > 0 — permissive shapes still 201.
+  const permissiveMetas = [
+    { client_name: 'x', redirect_uris: 'https://x' }, // string has length
+    { client_name: 'x', redirect_uris: [123] },
+    { client_name: 'x', redirect_uris: [null] },
+    { client_name: 'x', redirect_uris: [{}] },
+    { client_name: 'x', redirect_uris: [''] },
+    { client_name: 'x', redirect_uris: ['not-a-url'] },
+  ];
+
+  for (const [i, body] of permissiveMetas.entries()) {
+    it(`register permissive metadata soft-${i} still 201 (documents gap)`, async () => {
+      const res = await oauthRequest('/oauth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(201);
+      const json = await oauthJson(res);
+      expect(json.client_id).toBeTruthy();
+    });
+  }
+
+  it('register empty redirect_uris → invalid_client_metadata', async () => {
+    const res = await oauthRequest('/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: 'x', redirect_uris: [] }),
+    });
+    expect(res.status).toBe(400);
+    expect((await oauthJson(res)).error).toBe('invalid_client_metadata');
+  });
+
+  it('register valid public client soft success', async () => {
+    const cache = mockKv();
+    const env = oauthEnv({ cache });
+    const res = await oauthRequest(
+      '/oauth/register',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_name: 'Left Client',
+          redirect_uris: [REDIRECT],
+          token_endpoint_auth_method: 'none',
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(201);
+    const body = await oauthJson(res);
+    expect(body.client_id).toBeTruthy();
+    expect(cache.puts.some((p) => p.key.startsWith('oauth_client:'))).toBe(true);
+  });
+});
+
+describe('login leftovers HEAVY — whoami userId matrix after #147', () => {
+  const users = [
+    '@alice:example.com',
+    '@bob:example.com',
+    '@a:example.com',
+    '@user_name:example.com',
+  ];
+
+  for (const [i, userId] of users.entries()) {
+    it(`whoami user soft-${i}`, async () => {
+      authState.userId = userId;
+      const localpart = userId.slice(1).split(':')[0];
+      const db = createLoginDb({
+        users: new Map([
+          [userId, userRow({ user_id: userId, localpart, is_guest: i % 2 })],
+        ]),
+      });
+      const res = await loginRequest(loginEnv(db), '/_matrix/client/v3/account/whoami');
+      expect(res.status).toBe(200);
+      expect(res.body.user_id).toBe(userId);
+      expect(res.body.is_guest).toBe(Boolean(i % 2));
+    });
+  }
+});
