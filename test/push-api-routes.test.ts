@@ -1,7 +1,7 @@
 /**
- * TOKENMAXX HEAVY deepen after #100/#101/#102/#103 — different slice: push API routes.
- * Avoids devices/aliases/relations/tags/profile (#100), login/register (#101),
- * admin (#102), account (#103), keys (#99), key-backups, oauth, search.
+ * TOKENMAXX HEAVY deepen after #100/#101/#102/#103/#124 — different slice: push API routes.
+ * Avoids devices/federation/sliding-sync/sync/voip/rooms/oidc/media/relations.
+ * Login/account suites already thick; this file deepens leftover push client routes.
  * Tests-only — no product inventing.
  * Exercises pushers, pushrules CRUD/enabled/actions, and notifications via Hono app.request().
  * Helper evaluate/match coverage lives in push-rules.test.ts / push-delivery.test.ts.
@@ -1843,5 +1843,1852 @@ describe('push API TOKENMAXX integration leftovers after #100/#101', () => {
     );
     expect(sender.status).toBe(200);
     expect(sender.body.rule_id).toBe(BOB);
+  });
+});
+
+// =============================================================================
+// TOKENMAXX HEAVY leftovers after #124 — pushers/rules/notifications edge matrix
+// =============================================================================
+
+describe('pushers GET — falsy profile_tag + SQL bind + multi-row', () => {
+  it('omits empty-string profile_tag because "" is falsy under || undefined', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ profile_tag: '' })],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(res.status).toBe(200);
+    expect(res.body.pushers).toHaveLength(1);
+    expect('profile_tag' in res.body.pushers[0]).toBe(false);
+  });
+
+  it('binds authenticated userId into pushers SELECT', async () => {
+    const db = createPushDb({ pushers: [seedPusher()] });
+    await request(db, '/_matrix/client/v3/pushers', authGet());
+    const sel = db.selects.find((s) => s.sql.includes('FROM pushers'));
+    expect(sel?.args).toEqual([USER]);
+    expect(sel!.sql).toContain('enabled = 1');
+  });
+
+  it('returns many enabled pushers without collapsing by app_id', async () => {
+    const db = createPushDb({
+      pushers: Array.from({ length: 15 }, (_, i) =>
+        seedPusher({
+          pushkey: `pk-${i}`,
+          app_id: i % 2 === 0 ? 'im.vector.app' : `app.${i}`,
+          profile_tag: i % 3 === 0 ? null : `t${i}`,
+        })
+      ),
+    });
+    const res = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(res.body.pushers).toHaveLength(15);
+  });
+
+  it('unicode pushkey / display names round-trip on list', async () => {
+    const db = createPushDb({
+      pushers: [
+        seedPusher({
+          pushkey: '鍵🔑',
+          app_display_name: 'エレメント',
+          device_display_name: '東京スマホ',
+          lang: 'ja',
+          profile_tag: 'モバイル',
+        }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(res.body.pushers[0]).toMatchObject({
+      pushkey: '鍵🔑',
+      app_display_name: 'エレメント',
+      device_display_name: '東京スマホ',
+      lang: 'ja',
+      profile_tag: 'モバイル',
+    });
+  });
+
+  it('maps kind other than http (email / null-looking strings)', async () => {
+    const db = createPushDb({
+      pushers: [
+        seedPusher({ pushkey: 'a', kind: 'email' }),
+        seedPusher({ pushkey: 'b', app_id: 'x', kind: 'http' }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(res.body.pushers.map((p: { kind: string }) => p.kind).sort()).toEqual([
+      'email',
+      'http',
+    ]);
+  });
+});
+
+describe('pushers SET — falsy required fields + delete isolation + append matrix', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('rejects empty-string pushkey as missing', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, pushkey: '' })
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_MISSING_PARAM');
+  });
+
+  it.each([
+    ['app_id', { ...VALID_PUSHER_BODY, app_id: '' }],
+    ['app_display_name', { ...VALID_PUSHER_BODY, app_display_name: '' }],
+    ['device_display_name', { ...VALID_PUSHER_BODY, device_display_name: '' }],
+    ['lang', { ...VALID_PUSHER_BODY, lang: '' }],
+    ['data null', { ...VALID_PUSHER_BODY, data: null }],
+    ['data undefined omitted', { ...VALID_PUSHER_BODY, data: undefined }],
+  ])('rejects falsy create field: %s', async (_label, body) => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushers/set', jsonInit('POST', body));
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_MISSING_PARAM');
+  });
+
+  it('accepts empty-object data (truthy) and stringifies it', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, data: {} })
+    );
+    expect(res.status).toBe(200);
+    expect(db.pushers[0].data).toBe('{}');
+  });
+
+  it('stores empty-string profile_tag as null via || null', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, profile_tag: '' })
+    );
+    expect(db.pushers[0].profile_tag).toBeNull();
+  });
+
+  it('treats kind empty-string as create (not delete) because "" is not null/undefined', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, kind: '' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.pushers[0].kind).toBe('');
+  });
+
+  it('delete with mismatched app_id leaves the pusher in place', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: 'pk-keep', app_id: 'im.vector.app' })],
+    });
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { pushkey: 'pk-keep', kind: null, app_id: 'other.app' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.pushers).toHaveLength(1);
+    const del = db.deletes.find((d) => d.sql.includes('app_id = ?'));
+    expect(del?.args).toEqual([USER, 'pk-keep', 'other.app']);
+  });
+
+  it('delete binds empty app_id when omitted on kind:null', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: 'pk-x', app_id: '' })],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { pushkey: 'pk-x', kind: null })
+    );
+    expect(db.pushers).toHaveLength(0);
+    expect(db.deletes[0].args).toEqual([USER, 'pk-x', '']);
+  });
+
+  it('append:false deletes same pushkey across app_ids then inserts', async () => {
+    const db = createPushDb({
+      pushers: [
+        seedPusher({ pushkey: 'shared', app_id: 'a1' }),
+        seedPusher({ pushkey: 'shared', app_id: 'a2' }),
+        seedPusher({ pushkey: 'other', app_id: 'a1' }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', {
+        ...VALID_PUSHER_BODY,
+        pushkey: 'shared',
+        app_id: 'a3',
+        append: false,
+      })
+    );
+    expect(db.pushers.map((p) => `${p.pushkey}:${p.app_id}`).sort()).toEqual([
+      'other:a1',
+      'shared:a3',
+    ]);
+  });
+
+  it('append truthiness: append:0 still deletes same pushkey (falsy)', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: 'pk-new', app_id: 'old.app' })],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, append: 0 as unknown as boolean })
+    );
+    expect(db.pushers).toHaveLength(1);
+    expect(db.pushers[0].app_id).toBe(VALID_PUSHER_BODY.app_id);
+  });
+
+  it('append:true keeps different app_id same pushkey and adds another', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: 'pk-new', app_id: 'legacy.app' })],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, append: true })
+    );
+    expect(db.pushers).toHaveLength(2);
+  });
+
+  it('upsert ON CONFLICT updates fields for same user/pushkey/app_id', async () => {
+    const db = createPushDb({
+      pushers: [
+        seedPusher({
+          pushkey: VALID_PUSHER_BODY.pushkey,
+          app_id: VALID_PUSHER_BODY.app_id,
+          lang: 'en',
+          device_display_name: 'Old',
+        }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', {
+        ...VALID_PUSHER_BODY,
+        append: true,
+        lang: 'de',
+        device_display_name: 'Neu',
+        data: { url: 'https://de.example/notify' },
+      })
+    );
+    expect(db.pushers).toHaveLength(1);
+    expect(db.pushers[0]).toMatchObject({
+      lang: 'de',
+      device_display_name: 'Neu',
+      data: JSON.stringify({ url: 'https://de.example/notify' }),
+    });
+  });
+
+  it('INSERT bind order is user_id…data contract', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, profile_tag: 'pt' })
+    );
+    const ins = db.inserts.find((i) => i.sql.includes('INSERT INTO pushers'));
+    expect(ins?.args).toEqual([
+      USER,
+      VALID_PUSHER_BODY.pushkey,
+      VALID_PUSHER_BODY.kind,
+      VALID_PUSHER_BODY.app_id,
+      VALID_PUSHER_BODY.app_display_name,
+      VALID_PUSHER_BODY.device_display_name,
+      'pt',
+      VALID_PUSHER_BODY.lang,
+      JSON.stringify(VALID_PUSHER_BODY.data),
+    ]);
+  });
+
+  it('extra unknown body fields are ignored on create', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', {
+        ...VALID_PUSHER_BODY,
+        device_id: 'SHOULD_IGNORE',
+        enabled: false,
+        extra: { nested: 1 },
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(db.pushers[0].enabled).toBe(1);
+  });
+
+  it('array JSON body is not a valid pusher shape → missing pushkey', async () => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushers/set', jsonInit('POST', []));
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_MISSING_PARAM');
+  });
+});
+
+describe('pushrules defaults — personalization + condition shape leftovers', () => {
+  it('invite_for_me / is_user_mention / contains_user_name use auth localpart/userId', async () => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const invite = res.body.override.find(
+      (r: { rule_id: string }) => r.rule_id === '.m.rule.invite_for_me'
+    );
+    expect(invite.conditions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: 'state_key', pattern: USER }),
+        expect.objectContaining({ key: 'content.membership', pattern: 'invite' }),
+      ])
+    );
+
+    const mention = res.body.override.find(
+      (r: { rule_id: string }) => r.rule_id === '.m.rule.is_user_mention'
+    );
+    expect(mention.conditions[0]).toMatchObject({
+      kind: 'event_property_contains',
+      value: USER,
+    });
+
+    const content = res.body.content.find(
+      (r: { rule_id: string }) => r.rule_id === '.m.rule.contains_user_name'
+    );
+    expect(content.pattern).toBe('alice');
+    expect(content.default).toBe(true);
+  });
+
+  it('master default is disabled; reaction uses dont_notify; call uses ring', async () => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushrules', authGet());
+    const master = res.body.global.override.find(
+      (r: { rule_id: string }) => r.rule_id === '.m.rule.master'
+    );
+    expect(master.enabled).toBe(false);
+    expect(master.actions).toEqual(['dont_notify']);
+
+    const reaction = res.body.global.override.find(
+      (r: { rule_id: string }) => r.rule_id === '.m.rule.reaction'
+    );
+    expect(reaction.actions).toEqual(['dont_notify']);
+
+    const call = res.body.global.underride.find(
+      (r: { rule_id: string }) => r.rule_id === '.m.rule.call'
+    );
+    expect(call.actions).toEqual(
+      expect.arrayContaining(['notify', { set_tweak: 'sound', value: 'ring' }])
+    );
+  });
+
+  it('one-to-one underride rules include room_member_count is:2', async () => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    for (const id of ['.m.rule.room_one_to_one', '.m.rule.encrypted_room_one_to_one']) {
+      const rule = res.body.underride.find((r: { rule_id: string }) => r.rule_id === id);
+      expect(rule.conditions).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: 'room_member_count', is: '2' })])
+      );
+    }
+  });
+
+  it('GET /pushrules and /pushrules/ and /pushrules/global agree on override count', async () => {
+    const db = createPushDb();
+    const a = await request(db, '/_matrix/client/v3/pushrules', authGet());
+    const b = await request(db, '/_matrix/client/v3/pushrules/', authGet());
+    const c = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(a.body.global.override).toHaveLength(c.body.override.length);
+    expect(b.body.global.override).toHaveLength(c.body.override.length);
+    expect(a.body.global.content[0].pattern).toBe(c.body.content[0].pattern);
+  });
+
+  it('custom rules for other users never appear in alice list', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ user_id: BOB, rule_id: 'bob.only', kind: 'override' }),
+        seedRule({ user_id: USER, rule_id: 'alice.only', kind: 'override' }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules', authGet());
+    const custom = res.body.global.override.filter((r: { default: boolean }) => !r.default);
+    expect(custom.map((r: { rule_id: string }) => r.rule_id)).toEqual(['alice.only']);
+  });
+
+  it('disabled custom rule still listed with enabled:false', async () => {
+    const db = createPushDb({
+      rules: [seedRule({ rule_id: 'quiet', enabled: 0 })],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const quiet = res.body.override.find((r: { rule_id: string }) => r.rule_id === 'quiet');
+    expect(quiet.enabled).toBe(false);
+    expect(quiet.default).toBe(false);
+  });
+
+  it('custom rule whose id starts with .m.rule. is marked default:true on merge', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          rule_id: '.m.rule.master',
+          enabled: 0,
+          actions: JSON.stringify(['notify']),
+          conditions: null,
+        }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const master = res.body.override.find(
+      (r: { rule_id: string }) => r.rule_id === '.m.rule.master'
+    );
+    expect(master.default).toBe(true);
+    expect(master.enabled).toBe(false);
+    expect(master.actions).toEqual(['notify']);
+  });
+});
+
+describe('pushrules GET :scope/:kind/:ruleId — kind vocab + decode leftovers', () => {
+  it.each(['device', 'DEVICE', 'Global', 'GLOBAL', 'room'])(
+    'rejects non-global scope %j',
+    async (scope) => {
+      const db = createPushDb();
+      const res = await request(
+        db,
+        `/_matrix/client/v3/pushrules/${scope}/override/x`,
+        authGet()
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_INVALID_PARAM');
+    }
+  );
+
+  it.each(['override', 'content', 'room', 'sender', 'underride'])(
+    'accepts kind %s and 404s missing rule',
+    async (kind) => {
+      const db = createPushDb();
+      const res = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/no.such.rule`,
+        authGet()
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.errcode).toBe('M_NOT_FOUND');
+    }
+  );
+
+  it('rejects kind not in global map', async () => {
+    const db = createPushDb();
+    for (const kind of ['unknown', 'device', 'org.custom', 'OVERRIDE']) {
+      const res = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/x`,
+        authGet()
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_INVALID_PARAM');
+      expect(res.body.error).toContain(kind);
+    }
+  });
+
+  it('returns every default override by id', async () => {
+    const db = createPushDb();
+    const ids = [
+      '.m.rule.master',
+      '.m.rule.suppress_notices',
+      '.m.rule.invite_for_me',
+      '.m.rule.member_event',
+      '.m.rule.is_user_mention',
+      '.m.rule.contains_display_name',
+      '.m.rule.is_room_mention',
+      '.m.rule.tombstone',
+      '.m.rule.room.server_acl',
+      '.m.rule.reaction',
+    ];
+    for (const id of ids) {
+      const res = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+        authGet()
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.rule_id).toBe(id);
+      expect(res.body.default).toBe(true);
+    }
+  });
+
+  it('decodes double-encoded-looking rule ids once via decodeURIComponent', async () => {
+    const id = 'rule with spaces';
+    const db = createPushDb({
+      rules: [seedRule({ rule_id: id, kind: 'override' })],
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+      authGet()
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.rule_id).toBe(id);
+  });
+
+  it('GET underride default .m.rule.message', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/underride/.m.rule.message',
+      authGet()
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.actions).toEqual(['notify']);
+  });
+});
+
+describe('pushrules PUT create — kinds / pattern / conditions / priority leftovers', () => {
+  it('rejects content kind with empty-string pattern as missing', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/content/kw',
+      jsonInit('PUT', { actions: ['notify'], pattern: '' })
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_MISSING_PARAM');
+  });
+
+  it('creates underride custom rule with conditions', async () => {
+    const db = createPushDb();
+    const conditions = [{ kind: 'event_match', key: 'type', pattern: 'm.room.encrypted' }];
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/underride/custom.enc',
+      jsonInit('PUT', { actions: ['notify'], conditions })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rules[0]).toMatchObject({
+      kind: 'underride',
+      rule_id: 'custom.enc',
+      conditions: JSON.stringify(conditions),
+      actions: JSON.stringify(['notify']),
+      priority: 0,
+    });
+  });
+
+  it('creates room and sender rules with MXID/room id as rule_id', async () => {
+    const db = createPushDb();
+    const roomId = '!Quiet:example.com';
+    const sender = '@spammer:example.com';
+    expect(
+      (
+        await request(
+          db,
+          `/_matrix/client/v3/pushrules/global/room/${encodeURIComponent(roomId)}`,
+          jsonInit('PUT', { actions: ['dont_notify'] })
+        )
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await request(
+          db,
+          `/_matrix/client/v3/pushrules/global/sender/${encodeURIComponent(sender)}`,
+          jsonInit('PUT', { actions: ['dont_notify'] })
+        )
+      ).status
+    ).toBe(200);
+    expect(db.rules.map((r) => r.rule_id).sort()).toEqual([roomId, sender].sort());
+  });
+
+  it('persists empty conditions array as JSON "[]"', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/empty.cond',
+      jsonInit('PUT', { actions: ['notify'], conditions: [] })
+    );
+    expect(db.rules[0].conditions).toBe('[]');
+  });
+
+  it('persists complex set_tweak action objects', async () => {
+    const db = createPushDb();
+    const actions = [
+      'notify',
+      { set_tweak: 'sound', value: 'default' },
+      { set_tweak: 'highlight', value: true },
+    ];
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/tweaks',
+      jsonInit('PUT', { actions })
+    );
+    expect(JSON.parse(db.rules[0].actions)).toEqual(actions);
+  });
+
+  it('cannot overwrite default even when URL-encoded', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent('.m.rule.master')}`,
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_CANNOT_OVERWRITE_DEFAULT');
+  });
+
+  it('before=x alone and after=y alone both set priority to Date.now()', async () => {
+    const db = createPushDb();
+    const t0 = Date.now();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/p1?before=other',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/p2?after=other',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    const t1 = Date.now();
+    expect(db.rules.find((r) => r.rule_id === 'p1')!.priority).toBeGreaterThanOrEqual(t0);
+    expect(db.rules.find((r) => r.rule_id === 'p2')!.priority).toBeLessThanOrEqual(t1);
+  });
+
+  it('empty before=/after= query values are falsy → priority stays 0', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/empty.q?before=&after=',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(db.rules[0].priority).toBe(0);
+  });
+
+  it('without before/after query, priority stays 0', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/plain',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(db.rules[0].priority).toBe(0);
+  });
+
+  it('ON CONFLICT updates conditions/actions/priority and keeps enabled', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          rule_id: 'upd',
+          enabled: 0,
+          priority: 5,
+          actions: JSON.stringify(['dont_notify']),
+        }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/upd?before=x',
+      jsonInit('PUT', {
+        actions: ['notify'],
+        conditions: [{ kind: 'contains_display_name' }],
+      })
+    );
+    const row = db.rules.find((r) => r.rule_id === 'upd')!;
+    expect(row.enabled).toBe(0); // UPDATE SET does not touch enabled
+    expect(JSON.parse(row.actions)).toEqual(['notify']);
+    expect(JSON.parse(row.conditions!)).toEqual([{ kind: 'contains_display_name' }]);
+    expect(row.priority).toBeGreaterThan(5);
+  });
+
+  it('PUT bind contract includes userId/kind/ruleId/conditions/actions/priority', async () => {
+    const db = createPushDb();
+    const conditions = [{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }];
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/bind.me',
+      jsonInit('PUT', { actions: ['notify'], conditions })
+    );
+    const ins = db.inserts.find((i) => i.sql.includes('INSERT INTO push_rules'));
+    expect(ins?.args[0]).toBe(USER);
+    expect(ins?.args[1]).toBe('override');
+    expect(ins?.args[2]).toBe('bind.me');
+    expect(ins?.args[3]).toBe(JSON.stringify(conditions));
+    expect(ins?.args[4]).toBe(JSON.stringify(['notify']));
+    expect(ins?.args[5]).toBe(0);
+  });
+
+  it('content rule stores conditions null even when pattern provided', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/content/keyword',
+      jsonInit('PUT', { actions: ['notify'], pattern: 'hello*' })
+    );
+    expect(db.rules[0].conditions).toBeNull();
+    // pattern is not a DB column — only validated then dropped from SQL
+    const get = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/content/keyword',
+      authGet()
+    );
+    // merged rule from DB has no pattern field unless conditions encode it
+    expect(get.body.pattern).toBeUndefined();
+    expect(get.body.actions).toEqual(['notify']);
+  });
+
+  it('rejects actions:null / actions:0 / actions:false as missing', async () => {
+    const db = createPushDb();
+    for (const actions of [null, 0, false, '']) {
+      const res = await request(
+        db,
+        '/_matrix/client/v3/pushrules/global/override/a',
+        jsonInit('PUT', { actions })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    }
+  });
+
+  it('accepts empty actions array on create (truthy array)', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/silent',
+      jsonInit('PUT', { actions: [] })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rules[0].actions).toBe('[]');
+  });
+});
+
+describe('pushrules DELETE — kind matrix + isolation leftovers', () => {
+  it('cannot delete URL-encoded default rule', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent('.m.rule.reaction')}`,
+      { method: 'DELETE', headers: { Authorization: 'Bearer t' } }
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_CANNOT_DELETE_DEFAULT');
+  });
+
+  it.each(['override', 'content', 'room', 'sender', 'underride'] as const)(
+    'deletes custom %s rule and binds [userId, kind, ruleId]',
+    async (kind) => {
+      const id = kind === 'room' ? ROOM : kind === 'sender' ? BOB : `del.${kind}`;
+      const db = createPushDb({
+        rules: [seedRule({ kind, rule_id: id, conditions: null })],
+      });
+      const res = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/${encodeURIComponent(id)}`,
+        { method: 'DELETE', headers: { Authorization: 'Bearer t' } }
+      );
+      expect(res.status).toBe(200);
+      expect(db.rules).toHaveLength(0);
+      expect(db.deletes[0].args).toEqual([USER, kind, id]);
+    }
+  );
+
+  it('404 when rule exists only for another user', async () => {
+    const db = createPushDb({
+      rules: [seedRule({ user_id: BOB, rule_id: 'shared.name' })],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules/global/override/shared.name', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(404);
+    expect(db.rules).toHaveLength(1);
+  });
+
+  it('rejects non-global scope on DELETE', async () => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushrules/device/override/x', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_INVALID_PARAM');
+  });
+});
+
+describe('pushrules enabled — custom missing + default kinds leftovers', () => {
+  it('enabling missing custom rule still returns {} (UPDATE changes=0)', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/ghost/enabled',
+      jsonInit('PUT', { enabled: true })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+    expect(db.updates).toHaveLength(1);
+    expect(db.updates[0].args).toEqual([1, USER, 'override', 'ghost']);
+    expect(db.rules).toHaveLength(0);
+  });
+
+  it('rejects enabled as string/number/null', async () => {
+    const db = createPushDb();
+    for (const enabled of ['true', 'false', 1, 0, null, 'yes']) {
+      const res = await request(
+        db,
+        '/_matrix/client/v3/pushrules/global/override/.m.rule.master/enabled',
+        jsonInit('PUT', { enabled })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    }
+  });
+
+  it('can toggle default rules across override/content/underride kinds', async () => {
+    const db = createPushDb();
+    const cases = [
+      ['override', '.m.rule.master'],
+      ['content', '.m.rule.contains_user_name'],
+      ['underride', '.m.rule.call'],
+    ] as const;
+    for (const [kind, id] of cases) {
+      const res = await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/${kind}/${encodeURIComponent(id)}/enabled`,
+        jsonInit('PUT', { enabled: false })
+      );
+      expect(res.status).toBe(200);
+    }
+    expect(db.rules).toHaveLength(3);
+    expect(db.rules.every((r) => r.enabled === 0)).toBe(true);
+  });
+
+  it('404 when default rule id unknown for kind', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.not_a_real_default/enabled',
+      jsonInit('PUT', { enabled: true })
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('re-enable default after disable uses ON CONFLICT enabled update', async () => {
+    const db = createPushDb();
+    const path =
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.suppress_notices/enabled';
+    await request(db, path, jsonInit('PUT', { enabled: false }));
+    await request(db, path, jsonInit('PUT', { enabled: true }));
+    const row = db.rules.find((r) => r.rule_id === '.m.rule.suppress_notices')!;
+    expect(row.enabled).toBe(1);
+    expect(db.rules.filter((r) => r.rule_id === '.m.rule.suppress_notices')).toHaveLength(1);
+  });
+
+  it('custom rule enabled toggle binds [enabled, userId, kind, ruleId]', async () => {
+    const db = createPushDb({ rules: [seedRule({ rule_id: 'c1' })] });
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/c1/enabled',
+      jsonInit('PUT', { enabled: false })
+    );
+    expect(db.updates[0].args).toEqual([0, USER, 'override', 'c1']);
+    expect(db.rules[0].enabled).toBe(0);
+  });
+
+  it('scope param is ignored on enabled endpoint (device scope still works)', async () => {
+    const db = createPushDb({ rules: [seedRule({ rule_id: 'c2' })] });
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/device/override/c2/enabled',
+      jsonInit('PUT', { enabled: false })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rules[0].enabled).toBe(0);
+  });
+});
+
+describe('pushrules actions — upsert edges leftovers', () => {
+  it('sets actions on default underride and preserves default conditions', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/underride/.m.rule.message/actions',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    expect(res.status).toBe(200);
+    const row = db.rules[0];
+    expect(JSON.parse(row.actions)).toEqual(['dont_notify']);
+    expect(JSON.parse(row.conditions!)).toEqual([
+      { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+    ]);
+  });
+
+  it('404 for unknown default on actions', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.nope/actions',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('404 for missing custom non-default on actions', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/room/!missing:example.com/actions',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('ON CONFLICT actions-only upsert does not change priority', async () => {
+    const db = createPushDb({
+      rules: [seedRule({ rule_id: 'prio', priority: 99, actions: JSON.stringify(['notify']) })],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/prio/actions',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    expect(db.rules[0].priority).toBe(99);
+    expect(JSON.parse(db.rules[0].actions)).toEqual(['dont_notify']);
+  });
+
+  it('accepts nested set_tweak objects and empty array', async () => {
+    const db = createPushDb({ rules: [seedRule({ rule_id: 'nest' })] });
+    const actions = [{ set_tweak: 'sound', value: 'custom' }, { set_tweak: 'highlight' }];
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/nest/actions',
+      jsonInit('PUT', { actions })
+    );
+    expect(JSON.parse(db.rules[0].actions)).toEqual(actions);
+
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/nest/actions',
+      jsonInit('PUT', { actions: [] })
+    );
+    expect(db.rules[0].actions).toBe('[]');
+  });
+
+  it('scope ignored on actions endpoint like enabled', async () => {
+    const db = createPushDb({ rules: [seedRule({ rule_id: 's' })] });
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/device/override/s/actions',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('actions bind preserves prior conditions JSON from custom rule', async () => {
+    const conditions = [{ kind: 'event_match', key: 'content.body', pattern: 'x' }];
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          rule_id: 'keep.cond',
+          conditions: JSON.stringify(conditions),
+        }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/keep.cond/actions',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    const ins = db.inserts.find((i) =>
+      i.sql.includes('actions = excluded.actions')
+    );
+    expect(ins?.args[3]).toBe(JSON.stringify(conditions));
+  });
+});
+
+describe('notifications GET — limit/from/only/shape leftovers', () => {
+  it('limit=0 yields empty list but still may omit next_token', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 1 })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications?limit=0', authGet());
+    expect(res.status).toBe(200);
+    expect(res.body.notifications).toEqual([]);
+    expect(res.body.next_token).toBeUndefined();
+  });
+
+  it('negative limit is passed through Math.min and may yield empty', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 1 }), seedNotification({ id: 2, event_id: '$e2' })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications?limit=-5', authGet());
+    expect(res.status).toBe(200);
+    // Math.min(-5, 100) === -5; Array#slice(0, -5) drops from end → empty for short arrays
+    expect(res.body.notifications).toEqual([]);
+  });
+
+  it('NaN limit from limit=abc uses Math.min(NaN,100)=NaN → slice yields []', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 1 })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications?limit=abc', authGet());
+    expect(res.status).toBe(200);
+    expect(res.body.notifications).toEqual([]);
+  });
+
+  it('from cursor with no matching ids returns empty without next_token', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 5 })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications?from=99', authGet());
+    expect(res.body.notifications).toEqual([]);
+    expect(res.body.next_token).toBeUndefined();
+  });
+
+  it('single notification sets next_token to its id string', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 42 })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    expect(res.body.next_token).toBe('42');
+  });
+
+  it('null content becomes {} and read:0 → false', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({
+          id: 3,
+          content: null,
+          read: 0,
+          actions: JSON.stringify(['notify']),
+        }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    expect(res.body.notifications[0].event.content).toEqual({});
+    expect(res.body.notifications[0].read).toBe(false);
+  });
+
+  it('orders by created_at DESC independent of id order', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 10, created_at: 100, event_id: '$old' }),
+        seedNotification({ id: 11, created_at: 300, event_id: '$new' }),
+        seedNotification({ id: 12, created_at: 200, event_id: '$mid' }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    expect(res.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
+      ['$new', '$mid', '$old']
+    );
+    // next_token is last in result order → oldest among page
+    expect(res.body.next_token).toBe('10');
+  });
+
+  it('binds userId and limit into notification SELECT', async () => {
+    const db = createPushDb();
+    await request(db, '/_matrix/client/v3/notifications?limit=7', authGet());
+    const sel = db.selects.find((s) => s.sql.includes('notification_queue'));
+    expect(sel?.args[0]).toBe(USER);
+    expect(sel?.args[sel.args.length - 1]).toBe(7);
+  });
+
+  it('from + only=highlight bind both filters', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 1, notification_type: 'highlight', created_at: 1 }),
+        seedNotification({
+          id: 2,
+          notification_type: 'highlight',
+          created_at: 2,
+          event_id: '$h2',
+        }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/notifications?from=1&only=highlight&limit=10',
+      authGet()
+    );
+    const sel = db.selects.find((s) => s.sql.includes('notification_queue'));
+    expect(sel!.sql).toContain('nq.id > ?');
+    expect(sel!.sql).toContain("notification_type = 'highlight'");
+    expect(sel?.args).toEqual([USER, 1, 10]);
+  });
+
+  it('limit exactly 100 is not capped further', async () => {
+    const many = Array.from({ length: 100 }, (_, i) =>
+      seedNotification({ id: i + 1, created_at: i, event_id: `$e${i}` })
+    );
+    const db = createPushDb({ notifications: many });
+    const res = await request(db, '/_matrix/client/v3/notifications?limit=100', authGet());
+    expect(res.body.notifications).toHaveLength(100);
+  });
+
+  it('event fields may be null when LEFT JOIN misses', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({
+          id: 1,
+          event_type: null,
+          sender: null,
+          content: null,
+        }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    expect(res.body.notifications[0].event).toMatchObject({
+      event_id: EVENT,
+      type: null,
+      sender: null,
+      content: {},
+      room_id: ROOM,
+    });
+  });
+});
+
+describe('push API TOKENMAXX lifecycles — room/sender/content/underride', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('room mute lifecycle: put → get → actions → enabled → delete', async () => {
+    const db = createPushDb();
+    const path = `/_matrix/client/v3/pushrules/global/room/${encodeURIComponent(ROOM)}`;
+    expect((await request(db, path, jsonInit('PUT', { actions: ['dont_notify'] }))).status).toBe(
+      200
+    );
+    expect((await request(db, path, authGet())).body.actions).toEqual(['dont_notify']);
+    expect(
+      (await request(db, `${path}/actions`, jsonInit('PUT', { actions: ['notify'] }))).status
+    ).toBe(200);
+    expect((await request(db, path, authGet())).body.actions).toEqual(['notify']);
+    expect(
+      (await request(db, `${path}/enabled`, jsonInit('PUT', { enabled: false }))).status
+    ).toBe(200);
+    expect((await request(db, path, authGet())).body.enabled).toBe(false);
+    expect(
+      (await request(db, path, { method: 'DELETE', headers: { Authorization: 'Bearer t' } }))
+        .status
+    ).toBe(200);
+    expect((await request(db, path, authGet())).status).toBe(404);
+  });
+
+  it('sender mute lifecycle mirrors room', async () => {
+    const db = createPushDb();
+    const path = `/_matrix/client/v3/pushrules/global/sender/${encodeURIComponent(BOB)}`;
+    await request(db, path, jsonInit('PUT', { actions: ['dont_notify'] }));
+    await request(db, `${path}/enabled`, jsonInit('PUT', { enabled: false }));
+    const get = await request(db, path, authGet());
+    expect(get.body).toMatchObject({ rule_id: BOB, enabled: false, default: false });
+    await request(db, path, { method: 'DELETE', headers: { Authorization: 'Bearer t' } });
+    expect(db.rules).toHaveLength(0);
+  });
+
+  it('content keyword create → list prepend → delete', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/content/kw.alert',
+      jsonInit('PUT', { actions: ['notify'], pattern: 'urgent' })
+    );
+    const list = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(list.body.content[0].rule_id).toBe('kw.alert');
+    expect(list.body.content.some((r: { rule_id: string }) => r.rule_id === '.m.rule.contains_user_name')).toBe(
+      true
+    );
+    await request(db, '/_matrix/client/v3/pushrules/global/content/kw.alert', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer t' },
+    });
+    const list2 = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(list2.body.content).toHaveLength(1);
+    expect(list2.body.content[0].rule_id).toBe('.m.rule.contains_user_name');
+  });
+
+  it('dense custom override stress under merge (unshift order)', async () => {
+    const db = createPushDb();
+    for (let i = 0; i < 20; i++) {
+      await request(
+        db,
+        `/_matrix/client/v3/pushrules/global/override/bulk.${i}`,
+        jsonInit('PUT', {
+          actions: ['notify'],
+          conditions: [{ kind: 'event_match', key: 'content.body', pattern: `p${i}` }],
+        })
+      );
+    }
+    expect(db.rules).toHaveLength(20);
+    const list = await request(db, '/_matrix/client/v3/pushrules', authGet());
+    const customs = list.body.global.override.filter((r: { default: boolean }) => !r.default);
+    expect(customs).toHaveLength(20);
+    // priority all 0; ASC order then unshift → last processed ends near front
+    expect(customs[0].rule_id).toBe('bulk.19');
+  });
+
+  it('pusher register → upsert lang → list → delete wrong app no-op → delete correct', async () => {
+    const db = createPushDb();
+    await request(db, '/_matrix/client/v3/pushers/set', jsonInit('POST', VALID_PUSHER_BODY));
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, append: true, lang: 'es' })
+    );
+    expect(db.pushers[0].lang).toBe('es');
+    const list = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(list.body.pushers).toHaveLength(1);
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', {
+        pushkey: VALID_PUSHER_BODY.pushkey,
+        kind: null,
+        app_id: 'wrong',
+      })
+    );
+    expect(db.pushers).toHaveLength(1);
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', {
+        pushkey: VALID_PUSHER_BODY.pushkey,
+        kind: null,
+        app_id: VALID_PUSHER_BODY.app_id,
+      })
+    );
+    expect(db.pushers).toHaveLength(0);
+  });
+
+  it('default disable → list reflects → actions override → get merged', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.reaction/enabled',
+      jsonInit('PUT', { enabled: false })
+    );
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.reaction/actions',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    const get = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.reaction',
+      authGet()
+    );
+    expect(get.body.enabled).toBe(false);
+    expect(get.body.actions).toEqual(['notify']);
+    expect(get.body.default).toBe(true);
+  });
+
+  it('errcode vocabulary across push routes', async () => {
+    const db = createPushDb();
+    const cases: Array<{ path: string; init: RequestInit; code: string }> = [
+      {
+        path: '/_matrix/client/v3/pushers/set',
+        init: {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+          body: '{',
+        },
+        code: 'M_BAD_JSON',
+      },
+      {
+        path: '/_matrix/client/v3/pushers/set',
+        init: jsonInit('POST', { kind: 'http' }),
+        code: 'M_MISSING_PARAM',
+      },
+      {
+        path: '/_matrix/client/v3/pushrules/device/override/x',
+        init: authGet(),
+        code: 'M_INVALID_PARAM',
+      },
+      {
+        path: '/_matrix/client/v3/pushrules/global/override/.m.rule.master',
+        init: jsonInit('PUT', { actions: ['notify'] }),
+        code: 'M_CANNOT_OVERWRITE_DEFAULT',
+      },
+      {
+        path: '/_matrix/client/v3/pushrules/global/override/.m.rule.master',
+        init: { method: 'DELETE', headers: { Authorization: 'Bearer t' } },
+        code: 'M_CANNOT_DELETE_DEFAULT',
+      },
+      {
+        path: '/_matrix/client/v3/pushrules/global/override/missing',
+        init: authGet(),
+        code: 'M_NOT_FOUND',
+      },
+    ];
+    for (const c of cases) {
+      const res = await request(db, c.path, c.init);
+      expect(res.body.errcode).toBe(c.code);
+    }
+  });
+});
+
+// =============================================================================
+// TOKENMAXX HEAVY leftovers flood — SQL contracts + response shape + multi-kind
+// =============================================================================
+
+describe('pushers response shape — field completeness leftovers', () => {
+  it('lists all Matrix pusher fields for a full row', async () => {
+    const db = createPushDb({
+      pushers: [
+        seedPusher({
+          pushkey: 'full-key',
+          kind: 'http',
+          app_id: 'im.vector.app',
+          app_display_name: 'Element',
+          device_display_name: 'iPhone',
+          profile_tag: 'tag',
+          lang: 'en-US',
+          data: JSON.stringify({
+            url: 'https://push.example.com/_matrix/push/v1/notify',
+            format: 'event_id_only',
+          }),
+        }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(Object.keys(res.body.pushers[0]).sort()).toEqual(
+      [
+        'app_display_name',
+        'app_id',
+        'data',
+        'device_display_name',
+        'kind',
+        'lang',
+        'profile_tag',
+        'pushkey',
+      ].sort()
+    );
+  });
+
+  it('does not leak enabled column or user_id into list response', async () => {
+    const db = createPushDb({ pushers: [seedPusher()] });
+    const res = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(res.body.pushers[0].enabled).toBeUndefined();
+    expect(res.body.pushers[0].user_id).toBeUndefined();
+  });
+});
+
+describe('pushers SET — kind null vs undefined vs missing vocabulary', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('kind:undefined via JSON omit deletes (undefined after destructure)', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: 'k1', app_id: 'app.a' })],
+    });
+    // JSON.stringify omits undefined → body has no kind → undefined → delete path
+    const body = { pushkey: 'k1', app_id: 'app.a' };
+    const res = await request(db, '/_matrix/client/v3/pushers/set', jsonInit('POST', body));
+    expect(res.status).toBe(200);
+    expect(db.pushers).toHaveLength(0);
+  });
+
+  it('kind:null explicitly deletes', async () => {
+    const db = createPushDb({
+      pushers: [seedPusher({ pushkey: 'k2', app_id: 'app.a' })],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { pushkey: 'k2', kind: null, app_id: 'app.a' })
+    );
+    expect(db.pushers).toHaveLength(0);
+  });
+
+  it('rejects pushkey:null / pushkey:0 / pushkey:false', async () => {
+    const db = createPushDb();
+    for (const pushkey of [null, 0, false]) {
+      const res = await request(
+        db,
+        '/_matrix/client/v3/pushers/set',
+        jsonInit('POST', { ...VALID_PUSHER_BODY, pushkey })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    }
+  });
+
+  it('accepts numeric-looking string pushkey', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, pushkey: '0' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.pushers[0].pushkey).toBe('0');
+  });
+
+  it('data as nested array/object stringifies stably', async () => {
+    const db = createPushDb();
+    const data = { url: 'https://x', format: 'event_id_only', tags: ['a', 'b'], meta: { n: 1 } };
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, data })
+    );
+    expect(JSON.parse(db.pushers[0].data)).toEqual(data);
+    const list = await request(db, '/_matrix/client/v3/pushers', authGet());
+    expect(list.body.pushers[0].data).toEqual(data);
+  });
+
+  it('long pushkey and display names are stored verbatim', async () => {
+    const db = createPushDb();
+    const pushkey = `pk-${'x'.repeat(500)}`;
+    const app_display_name = `App-${'名'.repeat(100)}`;
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { ...VALID_PUSHER_BODY, pushkey, app_display_name })
+    );
+    expect(db.pushers[0].pushkey).toBe(pushkey);
+    expect(db.pushers[0].app_display_name).toBe(app_display_name);
+  });
+});
+
+describe('pushrules merge — priority ASC unshift + kind buckets leftovers', () => {
+  it('same priority customs: ASC stable then unshift reverses processing order at front', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ rule_id: 'a', priority: 0 }),
+        seedRule({ rule_id: 'b', priority: 0 }),
+        seedRule({ rule_id: 'c', priority: 0 }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const customs = res.body.override
+      .filter((r: { default: boolean }) => !r.default)
+      .map((r: { rule_id: string }) => r.rule_id);
+    // processed a,b,c in ASC (stable insert order) with unshift → c,b,a at front
+    expect(customs).toEqual(['c', 'b', 'a']);
+  });
+
+  it('lower priority number processed first → ends further back after later unshifts', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ rule_id: 'first', priority: 1 }),
+        seedRule({ rule_id: 'second', priority: 2 }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules', authGet());
+    const customs = res.body.global.override
+      .filter((r: { default: boolean }) => !r.default)
+      .map((r: { rule_id: string }) => r.rule_id);
+    expect(customs).toEqual(['second', 'first']);
+  });
+
+  it('unknown kind in DB is ignored (kindRules falsy)', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ kind: 'not_a_kind', rule_id: 'ghost' }),
+        seedRule({ kind: 'override', rule_id: 'real' }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const allIds = [
+      ...res.body.override,
+      ...res.body.content,
+      ...res.body.room,
+      ...res.body.sender,
+      ...res.body.underride,
+    ].map((r: { rule_id: string }) => r.rule_id);
+    expect(allIds).toContain('real');
+    expect(allIds).not.toContain('ghost');
+  });
+
+  it('malformed actions JSON becomes [] on merge; malformed conditions become undefined', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          rule_id: 'bad.json',
+          actions: '{nope',
+          conditions: 'also-bad',
+        }),
+      ],
+    });
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/bad.json',
+      authGet()
+    );
+    expect(res.body.actions).toEqual([]);
+    expect(res.body.conditions).toBeUndefined();
+  });
+
+  it('content custom prepends ahead of default contains_user_name', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          kind: 'content',
+          rule_id: 'custom.kw',
+          conditions: null,
+          actions: JSON.stringify(['notify']),
+        }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(res.body.content[0].rule_id).toBe('custom.kw');
+    expect(res.body.content[1].rule_id).toBe('.m.rule.contains_user_name');
+  });
+
+  it('room/sender buckets start empty and only hold customs', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ kind: 'room', rule_id: ROOM, conditions: null }),
+        seedRule({ kind: 'sender', rule_id: BOB, conditions: null }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(res.body.room).toHaveLength(1);
+    expect(res.body.sender).toHaveLength(1);
+    expect(res.body.room[0].default).toBe(false);
+    expect(res.body.sender[0].default).toBe(false);
+  });
+});
+
+describe('pushrules PUT/DELETE — percent-encoding + dot-prefix edges', () => {
+  it('rule ids with slash encoded are stored decoded', async () => {
+    const id = 'a/b';
+    const db = createPushDb();
+    await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(db.rules[0].rule_id).toBe('a/b');
+    const get = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+      authGet()
+    );
+    expect(get.body.rule_id).toBe('a/b');
+  });
+
+  it('rule id starting with dot but not .m.rule. can be created and deleted', async () => {
+    const db = createPushDb();
+    const id = '.custom.not.default';
+    expect(
+      (
+        await request(
+          db,
+          `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+          jsonInit('PUT', { actions: ['notify'] })
+        )
+      ).status
+    ).toBe(200);
+    const get = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+      authGet()
+    );
+    expect(get.body.default).toBe(false);
+    const del = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+      { method: 'DELETE', headers: { Authorization: 'Bearer t' } }
+    );
+    expect(del.status).toBe(200);
+  });
+
+  it('id .m.rule.evil can neither be PUT nor DELETE (prefix guard)', async () => {
+    const db = createPushDb();
+    const id = '.m.rule.evil';
+    const put = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(put.body.errcode).toBe('M_CANNOT_OVERWRITE_DEFAULT');
+    const del = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}`,
+      { method: 'DELETE', headers: { Authorization: 'Bearer t' } }
+    );
+    expect(del.body.errcode).toBe('M_CANNOT_DELETE_DEFAULT');
+  });
+
+  it('content kind without pattern rejected; with pattern accepted for unicode keyword', async () => {
+    const db = createPushDb();
+    const miss = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/content/日本語',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(miss.status).toBe(400);
+    const ok = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/content/${encodeURIComponent('日本語')}`,
+      jsonInit('PUT', { actions: ['notify'], pattern: '緊急' })
+    );
+    expect(ok.status).toBe(200);
+    expect(db.rules[0].rule_id).toBe('日本語');
+  });
+});
+
+describe('pushrules enabled/actions — default condition snapshot leftovers', () => {
+  it('disabling invite_for_me stores personalized state_key condition', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.invite_for_me/enabled',
+      jsonInit('PUT', { enabled: false })
+    );
+    const conditions = JSON.parse(db.rules[0].conditions!);
+    expect(conditions.find((c: { key?: string }) => c.key === 'state_key').pattern).toBe(USER);
+  });
+
+  it('actions on contains_user_name stores null conditions (default has pattern not conditions)', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/content/.m.rule.contains_user_name/actions',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    expect(db.rules[0].conditions).toBeNull();
+    expect(JSON.parse(db.rules[0].actions)).toEqual(['dont_notify']);
+  });
+
+  it('actions on is_user_mention preserves event_property_contains condition with userId', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.is_user_mention/actions',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    const conditions = JSON.parse(db.rules[0].conditions!);
+    expect(conditions[0]).toMatchObject({
+      kind: 'event_property_contains',
+      value: USER,
+    });
+  });
+
+  it('enabled true on already-enabled custom is idempotent', async () => {
+    const db = createPushDb({ rules: [seedRule({ rule_id: 'on', enabled: 1 })] });
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/on/enabled',
+      jsonInit('PUT', { enabled: true })
+    );
+    expect(db.rules[0].enabled).toBe(1);
+  });
+
+  it('URL-decodes rule id on enabled and actions paths', async () => {
+    const id = 'rule space';
+    const db = createPushDb({ rules: [seedRule({ rule_id: id })] });
+    await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}/enabled`,
+      jsonInit('PUT', { enabled: false })
+    );
+    expect(db.updates[0].args[3]).toBe(id);
+    await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${encodeURIComponent(id)}/actions`,
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    expect(db.rules[0].rule_id).toBe(id);
+    expect(JSON.parse(db.rules[0].actions)).toEqual(['dont_notify']);
+  });
+});
+
+describe('notifications — pagination chain leftovers', () => {
+  it('pages with next_token as from for subsequent request', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 1, created_at: 10, event_id: '$a' }),
+        seedNotification({ id: 2, created_at: 20, event_id: '$b' }),
+        seedNotification({ id: 3, created_at: 30, event_id: '$c' }),
+        seedNotification({ id: 4, created_at: 40, event_id: '$d' }),
+      ],
+    });
+    const page1 = await request(db, '/_matrix/client/v3/notifications?limit=2', authGet());
+    expect(page1.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
+      ['$d', '$c']
+    );
+    // last in page is id 3
+    expect(page1.body.next_token).toBe('3');
+
+    // from=3 means id > 3 → only id 4, but order DESC → $d only (already seen)
+    // Spec-wise clients use opaque tokens; this server interprets as id cursor
+    const page2 = await request(
+      db,
+      `/_matrix/client/v3/notifications?limit=2&from=${page1.body.next_token}`,
+      authGet()
+    );
+    expect(page2.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
+      ['$d']
+    );
+  });
+
+  it('only=highlight with empty highlight set returns []', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 1, notification_type: 'notify' }),
+        seedNotification({ id: 2, notification_type: 'notify', event_id: '$2' }),
+      ],
+    });
+    const res = await request(
+      db,
+      '/_matrix/client/v3/notifications?only=highlight',
+      authGet()
+    );
+    expect(res.body.notifications).toEqual([]);
+    expect(res.body.next_token).toBeUndefined();
+  });
+
+  it('default limit 20 when limit omitted', async () => {
+    const many = Array.from({ length: 25 }, (_, i) =>
+      seedNotification({ id: i + 1, created_at: i, event_id: `$e${i}` })
+    );
+    const db = createPushDb({ notifications: many });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    expect(res.body.notifications).toHaveLength(20);
+  });
+
+  it('ts and origin_server_ts both equal created_at', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 9, created_at: 1_234_567_890 })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    expect(res.body.notifications[0].ts).toBe(1_234_567_890);
+    expect(res.body.notifications[0].event.origin_server_ts).toBe(1_234_567_890);
+  });
+
+  it('actions empty string parses to [] via catch', async () => {
+    const db = createPushDb({
+      notifications: [seedNotification({ id: 1, actions: '' })],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    // JSON.parse('') throws → []
+    expect(res.body.notifications[0].actions).toEqual([]);
+  });
+
+  it('cross-room notifications all returned for user', async () => {
+    const db = createPushDb({
+      notifications: [
+        seedNotification({ id: 1, room_id: '!a:example.com', event_id: '$1' }),
+        seedNotification({ id: 2, room_id: '!b:example.com', event_id: '$2' }),
+        seedNotification({ id: 3, room_id: '!c:example.com', event_id: '$3' }),
+      ],
+    });
+    const res = await request(db, '/_matrix/client/v3/notifications', authGet());
+    expect(new Set(res.body.notifications.map((n: { room_id: string }) => n.room_id)).size).toBe(
+      3
+    );
+  });
+});
+
+describe('push TOKENMAXX errcode + auth surface leftovers', () => {
+  it('all mutating pushers/set success responses are empty objects', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const db = createPushDb();
+    const create = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', VALID_PUSHER_BODY)
+    );
+    expect(create.body).toEqual({});
+    const del = await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', {
+        pushkey: VALID_PUSHER_BODY.pushkey,
+        kind: null,
+        app_id: VALID_PUSHER_BODY.app_id,
+      })
+    );
+    expect(del.body).toEqual({});
+    vi.restoreAllMocks();
+  });
+
+  it('PUT/DELETE/enabled/actions success bodies are empty objects', async () => {
+    const db = createPushDb();
+    const base = '/_matrix/client/v3/pushrules/global/override/empty.body';
+    expect((await request(db, base, jsonInit('PUT', { actions: ['notify'] }))).body).toEqual({});
+    expect(
+      (await request(db, `${base}/enabled`, jsonInit('PUT', { enabled: false }))).body
+    ).toEqual({});
+    expect(
+      (await request(db, `${base}/actions`, jsonInit('PUT', { actions: [] }))).body
+    ).toEqual({});
+    expect(
+      (
+        await request(db, base, {
+          method: 'DELETE',
+          headers: { Authorization: 'Bearer t' },
+        })
+      ).body
+    ).toEqual({});
+  });
+
+  it('GET pushrules always wraps under global key; /global unwraps', async () => {
+    const db = createPushDb();
+    const wrapped = await request(db, '/_matrix/client/v3/pushrules', authGet());
+    expect(Object.keys(wrapped.body)).toEqual(['global']);
+    expect(Object.keys(wrapped.body.global).sort()).toEqual(
+      ['content', 'override', 'room', 'sender', 'underride'].sort()
+    );
+    const bare = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(bare.body.global).toBeUndefined();
+    expect(Object.keys(bare.body).sort()).toEqual(
+      ['content', 'override', 'room', 'sender', 'underride'].sort()
+    );
+  });
+
+  it('multi-app_id append then selective delete by app_id', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const db = createPushDb();
+    const pk = 'multi';
+    for (const app_id of ['app.one', 'app.two', 'app.three']) {
+      await request(
+        db,
+        '/_matrix/client/v3/pushers/set',
+        jsonInit('POST', { ...VALID_PUSHER_BODY, pushkey: pk, app_id, append: true })
+      );
+    }
+    expect(db.pushers).toHaveLength(3);
+    await request(
+      db,
+      '/_matrix/client/v3/pushers/set',
+      jsonInit('POST', { pushkey: pk, kind: null, app_id: 'app.two' })
+    );
+    expect(db.pushers.map((p) => p.app_id).sort()).toEqual(['app.one', 'app.three']);
+    vi.restoreAllMocks();
+  });
+
+  it('override default .m.rule.contains_display_name has contains_display_name condition', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.contains_display_name',
+      authGet()
+    );
+    expect(res.body.conditions).toEqual([{ kind: 'contains_display_name' }]);
+  });
+
+  it('is_room_mention conditions include sender_notification_permission', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.is_room_mention',
+      authGet()
+    );
+    expect(res.body.conditions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'sender_notification_permission', key: 'room' }),
+        expect.objectContaining({ kind: 'event_property_is', value: true }),
+      ])
+    );
   });
 });
