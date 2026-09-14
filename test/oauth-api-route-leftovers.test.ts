@@ -3437,3 +3437,870 @@ describe('oauth leftovers authorize POST nonce into auth code after #130', () =>
     expect(stored.nonce).toBe(authReq.nonce);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Soft-cap flood: unicode/state/nonce extremes, redirect slash mismatch,
+// cross-client refresh, revoke hint preference, JWT exp boundary, userinfo
+// Bearer edges, UIA generic action + MXID wrap, XSS client_name, grant-only
+// token, authorize replay, opaque introspect, revoke no-CT, multi-uri
+// authorize, PKCE S256 authorize→token.
+// ---------------------------------------------------------------------------
+
+describe('oauth leftovers authorize GET unicode state/nonce extremes after #130', () => {
+  it('stores extreme-length unicode state and nonce verbatim in auth request', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, cache: mockKv() });
+    const { body: client } = await registerClient(env);
+    const state = `${'日本語状態'.repeat(40)}${'🚀'.repeat(20)}${'x'.repeat(200)}`;
+    const nonce = `${'نونس'.repeat(30)}${'🔐'.repeat(15)}${'n'.repeat(180)}`;
+    expect(state.length).toBeGreaterThan(400);
+    expect(nonce.length).toBeGreaterThan(300);
+    const res = await request(
+      `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&state=${encodeURIComponent(state)}&nonce=${encodeURIComponent(nonce)}`,
+      {},
+      env
+    );
+    expect(res.status).toBe(200);
+    const authPut = sessions.puts.find((p) => p.key.startsWith('oauth_auth_request:'));
+    expect(authPut).toBeTruthy();
+    const stored = JSON.parse(authPut!.value);
+    expect(stored.state).toBe(state);
+    expect(stored.nonce).toBe(nonce);
+    expect(stored.client_id).toBe(client.client_id);
+    expect(stored.redirect_uri).toBe(REDIRECT);
+  });
+
+  it('stores mixed BMP + astral-plane characters in state without truncation', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions });
+    const { body: client } = await registerClient(env);
+    const state = 'café\u0000safe\uD83D\uDE00\u{1F4A9}';
+    const res = await request(
+      `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&state=${encodeURIComponent(state)}`,
+      {},
+      env
+    );
+    expect(res.status).toBe(200);
+    const stored = JSON.parse(
+      sessions.puts.find((p) => p.key.startsWith('oauth_auth_request:'))!.value
+    );
+    expect(stored.state).toBe(state);
+  });
+});
+
+describe('oauth leftovers token redirect_uri trailing slash mismatch after #130', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('character-for-character mismatch when token adds trailing slash', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    await putAuthCode(env, 'slash-add', {
+      client_id: String(client.client_id),
+      redirect_uri: REDIRECT,
+    });
+    const res = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: 'slash-add',
+        redirect_uri: `${REDIRECT}/`,
+      }),
+      env
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: 'invalid_grant',
+      error_description: 'redirect_uri mismatch',
+    });
+    // Code still consumed (deleted before mismatch check)
+    expect(sessions.data['oauth_code:slash-add']).toBeUndefined();
+  });
+
+  it('character-for-character mismatch when stored has trailing slash and token omits it', async () => {
+    const withSlash = `${REDIRECT}/`;
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [withSlash, REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    await putAuthCode(env, 'slash-omit', {
+      client_id: String(client.client_id),
+      redirect_uri: withSlash,
+    });
+    const res = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: 'slash-omit',
+        redirect_uri: REDIRECT,
+      }),
+      env
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error_description: 'redirect_uri mismatch',
+    });
+  });
+
+  it('exact match including trailing slash succeeds', async () => {
+    const withSlash = `${REDIRECT}/`;
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [withSlash],
+      token_endpoint_auth_method: 'none',
+    });
+    await putAuthCode(env, 'slash-exact', {
+      client_id: String(client.client_id),
+      redirect_uri: withSlash,
+    });
+    const res = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: 'slash-exact',
+        redirect_uri: withSlash,
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).access_token).toBeTruthy();
+  });
+});
+
+describe('oauth leftovers refresh_token wrong client after two registers after #130', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('refresh issued to client A rejected when presented by client B', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: createOAuthDb() });
+    const a = await registerClient(env, {
+      client_name: 'ClientA',
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    const b = await registerClient(env, {
+      client_name: 'ClientB',
+      redirect_uris: [REDIRECT_ALT],
+      token_endpoint_auth_method: 'none',
+    });
+    expect(a.body.client_id).not.toBe(b.body.client_id);
+
+    const rt = 'rt-owned-by-a';
+    await sessions.put(
+      `oauth_refresh:${rt}`,
+      JSON.stringify({
+        token_id: 'tid-a',
+        access_token_hash: 'h',
+        refresh_token_hash: 'rh',
+        client_id: a.body.client_id,
+        user_id: USER_ID,
+        device_id: 'DA',
+        scope: 'openid',
+        created_at: NOW,
+        expires_at: NOW + 86400_000,
+      })
+    );
+
+    const wrong = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'refresh_token',
+        client_id: b.body.client_id,
+        refresh_token: rt,
+      }),
+      env
+    );
+    expect(wrong.status).toBe(400);
+    expect(await wrong.json()).toMatchObject({
+      error: 'invalid_grant',
+      error_description: 'Token was not issued to this client',
+    });
+    // Wrong-client attempt must not rotate/delete the refresh token
+    expect(sessions.data[`oauth_refresh:${rt}`]).toBeTruthy();
+
+    const right = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'refresh_token',
+        client_id: a.body.client_id,
+        refresh_token: rt,
+      }),
+      env
+    );
+    expect(right.status).toBe(200);
+    expect((await right.json()).refresh_token).toBeTruthy();
+    expect(sessions.data[`oauth_refresh:${rt}`]).toBeUndefined();
+  });
+});
+
+describe('oauth leftovers revoke access_token hint prefers over refresh key after #130', () => {
+  it('access_token hint skips refresh delete even when same string exists as oauth_refresh key', async () => {
+    const raw = 'ambiguous-token-looks-like-both';
+    const hash = await hashToken(raw);
+    const db = createOAuthDb({
+      tokensByHash: new Map([
+        [hash, { user_id: USER_ID, device_id: 'D', created_at: NOW }],
+      ]),
+    });
+    const sessions = mockKv({
+      [`oauth_refresh:${raw}`]: JSON.stringify({ token_id: 'keep-me', client_id: 'c' }),
+    });
+    const env = makeEnv({ sessions, db });
+
+    const res = await request(
+      '/oauth/revoke',
+      jsonToken({ token: raw, token_type_hint: 'access_token' }),
+      env
+    );
+    expect(res.status).toBe(200);
+    // Hint prefers access path — refresh key must survive
+    expect(sessions.data[`oauth_refresh:${raw}`]).toBeTruthy();
+    expect(sessions.deletes).not.toContain(`oauth_refresh:${raw}`);
+    expect(db.tokensByHash.has(hash)).toBe(false);
+    expect(db.deletes.some((d) => d.sql.includes('FROM access_tokens'))).toBe(true);
+  });
+
+  it('refresh_token hint deletes refresh and does not touch DB access token of same string', async () => {
+    const raw = 'hint-refresh-same-string';
+    const hash = await hashToken(raw);
+    const db = createOAuthDb({
+      tokensByHash: new Map([
+        [hash, { user_id: USER_ID, device_id: 'D', created_at: NOW }],
+      ]),
+    });
+    // deleteReturn non-undefined → early return after refresh delete
+    const sessions = mockKv(
+      { [`oauth_refresh:${raw}`]: JSON.stringify({ token_id: 'rt' }) },
+      /* deleteReturn */ true
+    );
+    const env = makeEnv({ sessions, db });
+    const res = await request(
+      '/oauth/revoke',
+      formToken({ token: raw, token_type_hint: 'refresh_token' }),
+      env
+    );
+    expect(res.status).toBe(200);
+    expect(sessions.data[`oauth_refresh:${raw}`]).toBeUndefined();
+    expect(db.tokensByHash.has(hash)).toBe(true);
+    expect(db.deletes.length).toBe(0);
+  });
+});
+
+describe('oauth leftovers introspect JWT exp strict less-than boundary after #130', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('exp exactly equal to now is still active (strict <)', async () => {
+    const nowSec = Math.floor(NOW / 1000);
+    const token = fakeJwt({
+      sub: USER_ID,
+      client_id: 'exp-eq',
+      exp: nowSec,
+    });
+    const res = await request('/oauth/introspect', jsonToken({ token }));
+    expect(await res.json()).toMatchObject({
+      active: true,
+      sub: USER_ID,
+      exp: nowSec,
+    });
+  });
+
+  it('exp equal to nowSec - 1 is inactive', async () => {
+    const nowSec = Math.floor(NOW / 1000);
+    const token = fakeJwt({
+      sub: USER_ID,
+      exp: nowSec - 1,
+    });
+    const res = await request('/oauth/introspect', formToken({ token }));
+    expect(await res.json()).toEqual({ active: false });
+  });
+
+  it('exp equal to nowSec + 0 via form-urlencoded also active', async () => {
+    const nowSec = Math.floor(NOW / 1000);
+    const token = fakeJwt({ sub: BOB_ID, azp: 'azp-eq', exp: nowSec });
+    const res = await request('/oauth/introspect', formToken({ token }));
+    const body = await res.json();
+    expect(body.active).toBe(true);
+    expect(body.client_id).toBe('azp-eq');
+    expect(body.exp).toBe(nowSec);
+  });
+});
+
+describe('oauth leftovers userinfo Bearer empty / malformed after #130', () => {
+  it('Authorization Bearer with empty token yields M_MISSING_TOKEN', async () => {
+    const res = await request('/oauth/userinfo', {
+      headers: { Authorization: 'Bearer ' },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+  });
+
+  it('Authorization Bearer without space/token yields M_MISSING_TOKEN', async () => {
+    const res = await request('/oauth/userinfo', {
+      headers: { Authorization: 'Bearer' },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+  });
+
+  it('malformed non-Bearer scheme yields M_MISSING_TOKEN', async () => {
+    const res = await request('/oauth/userinfo', {
+      headers: { Authorization: 'Basic dXNlcjpwYXNz' },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+  });
+
+  it('Bearer with unknown opaque token yields M_UNKNOWN_TOKEN', async () => {
+    const env = makeEnv({ db: aliceDb() });
+    const res = await request(
+      '/oauth/userinfo',
+      { headers: { Authorization: 'Bearer not-a-real-token' } },
+      env
+    );
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ errcode: 'M_UNKNOWN_TOKEN' });
+  });
+
+  it('POST userinfo with empty Bearer also missing token', async () => {
+    const res = await request('/oauth/userinfo', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer   ' },
+    });
+    // Bearer\s+(.+) — trailing spaces only: \s+ eats spaces, .+ needs a char → miss
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+  });
+});
+
+describe('oauth leftovers UIA GET unknown action generic copy after #130', () => {
+  it('unknown action string uses generic Approve Request copy', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache });
+    await env.CACHE.put(
+      'uia_session:uia-generic',
+      JSON.stringify({ user_id: USER_ID, completed_stages: [] }),
+      { expirationTtl: 300 }
+    );
+    const res = await request(
+      '/oauth/authorize/uia?session=uia-generic&action=totally.unknown.action.string',
+      {},
+      env
+    );
+    const html = await res.text();
+    expect(html).toContain('Approve Request');
+    expect(html).toContain('An application is requesting your approval.');
+    expect(html).not.toContain('Reset Encryption Keys');
+    expect(html).not.toContain('reset your encryption identity');
+    expect(html).toContain(escapeHtml(USER_ID));
+  });
+
+  it('omitted action also uses generic copy (not cross_signing_reset)', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache });
+    await env.CACHE.put(
+      'uia_session:uia-no-action',
+      JSON.stringify({ user_id: USER_ID, completed_stages: [] }),
+      { expirationTtl: 300 }
+    );
+    const res = await request('/oauth/authorize/uia?session=uia-no-action', {}, env);
+    const html = await res.text();
+    expect(html).toContain('Approve Request');
+    expect(html).not.toContain('Reset Encryption Keys');
+  });
+
+  it('empty action= query uses generic copy', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache });
+    await env.CACHE.put(
+      'uia_session:uia-empty-action',
+      JSON.stringify({ user_id: BOB_ID, completed_stages: [] }),
+      { expirationTtl: 300 }
+    );
+    const res = await request(
+      '/oauth/authorize/uia?session=uia-empty-action&action=',
+      {},
+      env
+    );
+    const html = await res.text();
+    expect(html).toContain('Approve Request');
+    expect(html).toContain(escapeHtml(BOB_ID));
+  });
+});
+
+describe('oauth leftovers UIA POST full MXID username double-wrap after #130', () => {
+  it('approve with full MXID username formatUserId-wraps and fails lookup', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache, db: aliceDb() });
+    await env.CACHE.put(
+      'uia_session:uia-mxid',
+      JSON.stringify({ user_id: USER_ID, completed_stages: [] }),
+      { expirationTtl: 300 }
+    );
+    const res = await request(
+      '/oauth/authorize/uia',
+      {
+        method: 'POST',
+        body: formFields({
+          session: 'uia-mxid',
+          username: USER_ID,
+          password: 'secret',
+          action: 'approve',
+        }),
+      },
+      env
+    );
+    const html = await res.text();
+    expect(html).toContain('Invalid username or password');
+    // Session must remain for retry (not deleted on auth failure)
+    expect(cache.data['uia_session:uia-mxid']).toBeTruthy();
+    const stages = JSON.parse(cache.data['uia_session:uia-mxid']).completed_stages;
+    expect(stages).toEqual([]);
+  });
+
+  it('localpart username still succeeds for same session (contrast)', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache, db: aliceDb() });
+    await env.CACHE.put(
+      'uia_session:uia-local',
+      JSON.stringify({ user_id: USER_ID, completed_stages: [] }),
+      { expirationTtl: 300 }
+    );
+    const res = await request(
+      '/oauth/authorize/uia',
+      {
+        method: 'POST',
+        body: formFields({
+          session: 'uia-local',
+          username: 'alice',
+          password: 'secret',
+          action: 'approve',
+        }),
+      },
+      env
+    );
+    expect(await res.text()).toContain('Request Approved');
+  });
+});
+
+describe('oauth leftovers register client_name XSS escaped on authorize GET after #130', () => {
+  it('XSS client_name is escaped into login HTML on authorize GET', async () => {
+    const cache = mockKv();
+    const env = makeEnv({ cache });
+    const evil = `<img src=x onerror=alert(1)><script>alert("xss")</script>`;
+    const { body: client } = await registerClient(env, {
+      client_name: evil,
+      redirect_uris: [REDIRECT],
+    });
+    expect(client.client_name).toBe(evil);
+    const res = await request(
+      `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code`,
+      {},
+      env
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(escapeHtml(evil));
+    expect(html).not.toContain('<script>');
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(html).toContain('Sign in');
+  });
+
+  it('ampersand and quote client_name escaped in subtitle span', async () => {
+    const env = makeEnv({ cache: mockKv() });
+    const name = `Foo & Bar "Baz" 'Qux'`;
+    const { body: client } = await registerClient(env, {
+      client_name: name,
+      redirect_uris: [REDIRECT],
+    });
+    const res = await request(
+      `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code`,
+      {},
+      env
+    );
+    const html = await res.text();
+    expect(html).toContain(`<span class="client-name">${escapeHtml(name)}</span>`);
+  });
+});
+
+describe('oauth leftovers token form-urlencoded grant_type only after #130', () => {
+  it('form body with only grant_type rejects missing client_id', async () => {
+    const res = await request(
+      '/oauth/token',
+      formToken({ grant_type: 'authorization_code' })
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: 'invalid_client',
+      error_description: 'client_id is required',
+    });
+  });
+
+  it('form body with grant_type refresh_token only also requires client_id', async () => {
+    const res = await request(
+      '/oauth/token',
+      formToken({ grant_type: 'refresh_token' })
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: 'invalid_client',
+      error_description: 'client_id is required',
+    });
+  });
+
+  it('JSON grant_type only likewise requires client_id before grant dispatch', async () => {
+    const res = await request('/oauth/token', jsonToken({ grant_type: 'authorization_code' }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error_description: 'client_id is required',
+    });
+  });
+});
+
+describe('oauth leftovers authorize POST replay after session already deleted after #130', () => {
+  it('second POST with same auth_request_id after successful login is expired', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: aliceDb() });
+    const { body: client } = await registerClient(env);
+    const id = await seededAuth(env, { client_id: client.client_id, state: 'replay-st' });
+
+    const first = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: id,
+        }),
+      },
+      env
+    );
+    expect(first.status).toBe(302);
+    expect(sessions.data[`oauth_auth_request:${id}`]).toBeUndefined();
+
+    const replay = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: id,
+        }),
+      },
+      env
+    );
+    expect(replay.status).toBe(400);
+    expect(await replay.json()).toMatchObject({
+      error: 'invalid_request',
+      error_description: 'Authorization request expired',
+    });
+  });
+
+  it('POST after manual SESSIONS delete of auth request is expired', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: aliceDb() });
+    const { body: client } = await registerClient(env);
+    const id = await seededAuth(env, { client_id: client.client_id });
+    await sessions.delete(`oauth_auth_request:${id}`);
+    const res = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: id,
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error_description: 'Authorization request expired',
+    });
+  });
+});
+
+describe('oauth leftovers introspect opaque DB access token after #130', () => {
+  it('opaque token present in access_tokens returns active with unknown client_id', async () => {
+    const raw = 'opaque-introspect-exists-abc';
+    const hash = await hashToken(raw);
+    const created = 1_701_111_222_000;
+    const db = createOAuthDb({
+      tokensByHash: new Map([
+        [hash, { user_id: USER_ID, device_id: 'OPAQUE1', created_at: created }],
+      ]),
+    });
+    const env = makeEnv({ db });
+    const res = await request('/oauth/introspect', jsonToken({ token: raw }), env);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      active: true,
+      sub: USER_ID,
+      client_id: 'unknown',
+      token_type: 'Bearer',
+      iat: Math.floor(created / 1000),
+    });
+  });
+
+  it('form-urlencoded opaque DB hit for bob device', async () => {
+    const raw = 'opaque-bob-form';
+    const hash = await hashToken(raw);
+    const db = createOAuthDb({
+      tokensByHash: new Map([
+        [hash, { user_id: BOB_ID, device_id: 'BOBDEV', created_at: NOW }],
+      ]),
+    });
+    const env = makeEnv({ db });
+    const res = await request('/oauth/introspect', formToken({ token: raw }), env);
+    expect(await res.json()).toMatchObject({
+      active: true,
+      sub: BOB_ID,
+      client_id: 'unknown',
+      iat: Math.floor(NOW / 1000),
+    });
+  });
+});
+
+describe('oauth leftovers revoke without content-type JSON body after #130', () => {
+  it('JSON body without Content-Type leaves params empty → token required', async () => {
+    const res = await request('/oauth/revoke', {
+      method: 'POST',
+      // intentionally omit Content-Type
+      body: JSON.stringify({ token: 'would-be-ignored', token_type_hint: 'refresh_token' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: 'invalid_request',
+      error_description: 'token is required',
+    });
+  });
+
+  it('empty Content-Type with form-looking body also token required', async () => {
+    const res = await request('/oauth/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': '' },
+      body: 'token=rt-no-ct',
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error_description: 'token is required',
+    });
+  });
+});
+
+describe('oauth leftovers multiple register redirect_uris authorize each after #130', () => {
+  it('registers three redirect_uris and authorize GET succeeds for each', async () => {
+    const uris = [
+      'https://one.example.com/cb',
+      'https://two.example.com/oauth/callback',
+      'http://127.0.0.1:8080/callback',
+    ];
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, cache: mockKv() });
+    const { status, body: client } = await registerClient(env, {
+      client_name: 'MultiUri',
+      redirect_uris: uris,
+    });
+    expect(status).toBe(201);
+    expect(client.redirect_uris).toEqual(uris);
+
+    for (const uri of uris) {
+      const res = await request(
+        `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent(uri)}&response_type=code&state=${encodeURIComponent(uri)}`,
+        {},
+        env
+      );
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('MultiUri');
+    }
+
+    const authPuts = sessions.puts.filter((p) => p.key.startsWith('oauth_auth_request:'));
+    expect(authPuts).toHaveLength(3);
+    const storedUris = authPuts.map((p) => JSON.parse(p.value).redirect_uri).sort();
+    expect(storedUris).toEqual([...uris].sort());
+  });
+
+  it('fourth unlisted redirect_uri rejected after multi register', async () => {
+    const env = makeEnv({ cache: mockKv() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT, REDIRECT_ALT],
+    });
+    const bad = await request(
+      `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent('https://evil.example/cb')}&response_type=code`,
+      {},
+      env
+    );
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({
+      error: 'invalid_request',
+      error_description: 'Invalid redirect_uri',
+    });
+  });
+});
+
+describe('oauth leftovers PKCE S256 authorize GET through token after #130', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('S256 challenge from authorize GET verifies at token with matching verifier', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: aliceDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+      client_name: 'PKCE Public',
+    });
+
+    const verifier = 'pkce-s256-verifier-abcdefghijklmnopqrstuvwxyz01';
+    const digest = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(verifier)
+    );
+    const challenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const getRes = await request(
+      `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256&state=pkce-st`,
+      {},
+      env
+    );
+    expect(getRes.status).toBe(200);
+    const authId = Object.keys(sessions.data)
+      .find((k) => k.startsWith('oauth_auth_request:'))!
+      .replace('oauth_auth_request:', '');
+    const authReq = JSON.parse(sessions.data[`oauth_auth_request:${authId}`]);
+    expect(authReq.code_challenge).toBe(challenge);
+    expect(authReq.code_challenge_method).toBe('S256');
+
+    const postRes = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: authId,
+        }),
+      },
+      env
+    );
+    expect(postRes.status).toBe(302);
+    const loc = new URL(postRes.headers.get('Location')!);
+    expect(loc.searchParams.get('state')).toBe('pkce-st');
+    const code = loc.searchParams.get('code')!;
+    const storedCode = JSON.parse(sessions.data[`oauth_code:${code}`]);
+    expect(storedCode.code_challenge).toBe(challenge);
+    expect(storedCode.code_challenge_method).toBe('S256');
+
+    const tok = await request(
+      '/oauth/token',
+      formToken({
+        grant_type: 'authorization_code',
+        client_id: String(client.client_id),
+        code,
+        redirect_uri: REDIRECT,
+        code_verifier: verifier,
+      }),
+      env
+    );
+    expect(tok.status).toBe(200);
+    const tokens = await tok.json();
+    expect(tokens.access_token).toBeTruthy();
+    expect(tokens.refresh_token).toBeTruthy();
+    expect(tokens.user_id).toBe(USER_ID);
+    expect(sessions.data[`oauth_code:${code}`]).toBeUndefined();
+  });
+
+  it('wrong verifier after S256 authorize GET fails at token', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions, db: aliceDb() });
+    const { body: client } = await registerClient(env, {
+      redirect_uris: [REDIRECT],
+      token_endpoint_auth_method: 'none',
+    });
+    const verifier = 'correct-verifier-abcdefghijklmnopqrstuvwxyz012';
+    const digest = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(verifier)
+    );
+    const challenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const getRes = await request(
+      `/oauth/authorize?client_id=${client.client_id}&redirect_uri=${encodeURIComponent(REDIRECT)}&response_type=code&code_challenge=${challenge}&code_challenge_method=S256`,
+      {},
+      env
+    );
+    expect(getRes.status).toBe(200);
+    const authId = Object.keys(sessions.data)
+      .find((k) => k.startsWith('oauth_auth_request:'))!
+      .replace('oauth_auth_request:', '');
+    const postRes = await request(
+      '/oauth/authorize',
+      {
+        method: 'POST',
+        body: formFields({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: authId,
+        }),
+      },
+      env
+    );
+    const code = new URL(postRes.headers.get('Location')!).searchParams.get('code')!;
+    const bad = await request(
+      '/oauth/token',
+      jsonToken({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code,
+        code_verifier: 'wrong-verifier-abcdefghijklmnopqrstuvwxyz012',
+      }),
+      env
+    );
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({
+      error: 'invalid_grant',
+      error_description: 'Invalid code_verifier',
+    });
+  });
+});
