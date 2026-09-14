@@ -511,7 +511,7 @@ describe('race room-cache invalidate A∥B isolation after #226', () => {
         },
       });
       const db = mockDb({});
-      const [hit, _inv] = await Promise.all([
+      const [hit] = await Promise.all([
         getRoomMetadata(kv, db, ROOM_A),
         invalidateBatchRoomCache(kv, [ROOM_B, ROOM_C]),
       ]);
