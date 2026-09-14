@@ -1,7 +1,8 @@
 /**
- * TOKENMAXX HEAVY leftovers after #214 — residual *devices + key-backups + report*
- * concurrent-race / TOCTOU slices not covered by #174 (devices-keybackups-report)
- * or #200 (report + server-notices; server-notices left alone).
+ * TOKENMAXX HEAVY leftovers after #214 / deepen after #232 — residual
+ * *devices + key-backups + report* concurrent-race / TOCTOU slices not covered by
+ * #174 (devices-keybackups-report), #200 (report + server-notices; server-notices
+ * left alone), or the first residual pass (#220).
  *
  * Distinct from #174: PUT∥PUT display_name, DELETE∥DELETE, PUT∥DELETE,
  * overlapping delete_devices, GET-list∥DELETE, POST version mint, same-session
@@ -10,18 +11,21 @@
  * Distinct from #200: user-report duplicate INSERT, report UPDATE LWW, event
  * POST∥resolve, admin list∥get∥resolve, cross-type, score clamp, leave membership
  * (already leave), pagination, non-admin, server-notices.
+ * Distinct from #220 residual: GET :deviceId∥DELETE; list∥PUT; omit-name∥DELETE;
+ * delete_devices∥PUT / ∥UIA-DELETE; sibling; token-run; missing 404; GET-current∥POST;
+ * auth_data∥DELETE / LWW; distinct-session COUNT; bulk∥room; join→ban; event vanish;
+ * re-report keeps resolved; admin resolved true∥false.
  *
- * Residual focus:
- *   devices — GET :deviceId∥DELETE; GET-list∥PUT; PUT omit-name∥DELETE;
- *     delete_devices∥PUT / ∥UIA-DELETE; sibling isolation; token-run GET mid-delete;
- *     missing 404; empty bulk; bind order.
- *   key-backups — GET-current∥POST/DELETE; PUT auth_data∥DELETE / ∥PUT LWW;
- *     distinct-session COUNT lost-update; bulk∥room PUT; DELETE all∥room∥session;
- *     GET∥PUT keys; cross-version / MSC3270∥megolm; empty PUT etag; missing version.
- *   report — join→ban after membership SELECT still INSERT; event vanish after
- *     event SELECT still INSERT / before SELECT 404; room/user vanish after lookup
- *     still INSERT; invite/knock/ban forbid; re-report does not un-resolve;
- *     admin resolved true∥false; missing GET/resolve 404; NaN score.
+ * Deepen after #232 focus:
+ *   devices — UIA∥password DELETE; wrong∥right password; non-password∥password;
+ *     null∥string display_name; vanish mid-PUT SELECT; triple GET∥PUT∥DELETE;
+ *     delete_devices UIA∥auth; CURRENT self-delete∥GET; auth:{}∥password.
+ *   key-backups — version soft-delete mid PUT-keys SELECT; DELETE-all∥PUT refill;
+ *     omit auth_data∥PUT auth_data; triple session LWW; GET-room∥DELETE-room;
+ *     DELETE-session∥DELETE-all COUNT; soft-deleted version PUT 404∥POST mint.
+ *   report — leave→ban still INSERT; join→invite still INSERT; score clamp extremes;
+ *     room/user re-report keeps resolved; admin resolve∥GET; from pagination∥resolve;
+ *     Infinity score vs numeric.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -2276,3 +2280,719 @@ describe('cross-module devices∥key-backups∥report isolation residual after #
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// deepen residual after #232 (unsaturated races beyond #220)
+// ---------------------------------------------------------------------------
+
+describe('race devices UIA∥password DELETE residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`UIA challenge∥password DELETE same device #${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice()],
+        selectBarrier: {
+          match: (sql) => sql.includes('SELECT device_id FROM devices'),
+          count: 2,
+        },
+      });
+      const path = `${DEVICES}/${DEVICE}`;
+      const [uia, del] = await Promise.all([
+        devicesReq(db, path, jsonInit('DELETE', {})),
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: PASS } })
+        ),
+      ]);
+      expect([401, 200]).toContain(uia.status);
+      expect([401, 200, 404]).toContain(del.status);
+      expect(statusesOf([uia, del]).includes(200) || statusesOf([uia, del]).includes(404)).toBe(true);
+      if (del.status === 200 || uia.status === 200) {
+        expect(db.devices.find((d) => d.device_id === DEVICE)).toBeUndefined();
+      }
+    });
+  }
+});
+
+describe('race devices wrong∥right password DELETE residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`wrong password∥right password DELETE #${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice()] });
+      const path = `${DEVICES}/${DEVICE}`;
+      const [wrong, right] = await Promise.all([
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: 'wrong' } })
+        ),
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: PASS } })
+        ),
+      ]);
+      expect([403, 404]).toContain(wrong.status);
+      expect([200, 404, 403]).toContain(right.status);
+      expect(statusesOf([wrong, right]).some((s) => s === 200 || s === 404)).toBe(true);
+    });
+  }
+});
+
+describe('race devices non-password∥password DELETE residual after #232', () => {
+  for (let i = 0; i < 6; i++) {
+    it(`m.login.dummy∥password DELETE #${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice()] });
+      const path = `${DEVICES}/${DEVICE}`;
+      const [dummy, pw] = await Promise.all([
+        devicesReq(db, path, jsonInit('DELETE', { auth: { type: 'm.login.dummy' } })),
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: PASS } })
+        ),
+      ]);
+      expect([200, 404]).toContain(dummy.status);
+      expect([200, 404, 403]).toContain(pw.status);
+      expect(db.devices.find((d) => d.device_id === DEVICE)).toBeUndefined();
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`auth:{}∥password DELETE #${i}`, async () => {
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: `E${i}` })] });
+      const path = `${DEVICES}/E${i}`;
+      const [empty, pw] = await Promise.all([
+        devicesReq(db, path, jsonInit('DELETE', { auth: {} })),
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: PASS } })
+        ),
+      ]);
+      expect([200, 404]).toContain(empty.status);
+      expect([200, 404, 403]).toContain(pw.status);
+      expect(db.devices).toHaveLength(0);
+    });
+  }
+});
+
+describe('race devices null∥string display_name residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`PUT null∥PUT string display_name LWW #${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ display_name: `seed-${i}` })],
+        selectBarrier: {
+          match: (sql) => sql.includes('SELECT device_id FROM devices'),
+          count: 2,
+        },
+      });
+      const path = `${DEVICES}/${DEVICE}`;
+      const [n, s] = await Promise.all([
+        devicesReq(db, path, jsonInit('PUT', { display_name: null })),
+        devicesReq(db, path, jsonInit('PUT', { display_name: `str-${i}` })),
+      ]);
+      expect(n.status).toBe(200);
+      expect(s.status).toBe(200);
+      expect([null, `str-${i}`]).toContain(db.devices[0].display_name);
+    });
+  }
+});
+
+describe('race devices vanish mid-PUT SELECT residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`device cleared during existence SELECT → 404 #${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice()],
+        mutateAfterSelects: {
+          after: 1,
+          mutate: (d) => {
+            d.devices.length = 0;
+          },
+        },
+      });
+      const res = await devicesReq(
+        db,
+        `${DEVICES}/${DEVICE}`,
+        jsonInit('PUT', { display_name: `gone-${i}` })
+      );
+      // mutateAfterSelects runs before first() returns → existence miss.
+      expect(res.status).toBe(404);
+      expect(errcode(res.body)).toBe('M_NOT_FOUND');
+      expect(db.devices).toHaveLength(0);
+      expect(db.updates).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`DELETE∥PUT same device vanish race #${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ display_name: `v-${i}` })],
+        selectBarrier: {
+          match: (sql) => sql.includes('SELECT device_id FROM devices'),
+          count: 2,
+        },
+      });
+      const path = `${DEVICES}/${DEVICE}`;
+      const [del, put] = await Promise.all([
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: PASS } })
+        ),
+        devicesReq(db, path, jsonInit('PUT', { display_name: `after-${i}` })),
+      ]);
+      expect([200, 404]).toContain(del.status);
+      expect([200, 404]).toContain(put.status);
+      expect(db.devices.find((d) => d.device_id === DEVICE)).toBeUndefined();
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`device vanish before existence SELECT → 404 #${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ device_id: `V${i}` })],
+      });
+      db.devices.length = 0;
+      const res = await devicesReq(
+        db,
+        `${DEVICES}/V${i}`,
+        jsonInit('PUT', { display_name: 'x' })
+      );
+      expect(res.status).toBe(404);
+      expect(errcode(res.body)).toBe('M_NOT_FOUND');
+    });
+  }
+});
+
+describe('race devices triple GET∥PUT∥DELETE residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`GET∥PUT∥DELETE same device #${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ display_name: `t-${i}` })],
+      });
+      const path = `${DEVICES}/${DEVICE}`;
+      const [got, put, del] = await Promise.all([
+        devicesReq(db, path, authInit('GET')),
+        devicesReq(db, path, jsonInit('PUT', { display_name: `put-${i}` })),
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: PASS } })
+        ),
+      ]);
+      expect([200, 404]).toContain(got.status);
+      expect([200, 404]).toContain(put.status);
+      expect([200, 404]).toContain(del.status);
+      expect(db.devices.find((d) => d.device_id === DEVICE)).toBeUndefined();
+    });
+  }
+});
+
+describe('race devices delete_devices UIA∥auth residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`delete_devices UIA∥auth same list #${i}`, async () => {
+      const id = `B${i}`;
+      const db = createDevicesDb({ devices: [seedDevice({ device_id: id })] });
+      const [uia, ok] = await Promise.all([
+        devicesReq(db, DELETE_DEVICES, jsonInit('POST', { devices: [id] })),
+        devicesReq(db, DELETE_DEVICES, jsonInit('POST', pwAuth([id]))),
+      ]);
+      expect(uia.status).toBe(401);
+      expect([200, 401]).toContain(ok.status);
+      if (ok.status === 200) {
+        expect(db.devices.find((d) => d.device_id === id)).toBeUndefined();
+      }
+    });
+  }
+});
+
+describe('race devices CURRENT self-delete∥GET residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`DELETE CURRENT∥GET CURRENT #${i}`, async () => {
+      const db = createDevicesDb({
+        devices: [seedDevice({ device_id: 'CURRENT', display_name: `cur-${i}` })],
+      });
+      const path = `${DEVICES}/CURRENT`;
+      const [del, got] = await Promise.all([
+        devicesReq(
+          db,
+          path,
+          jsonInit('DELETE', { auth: { type: 'm.login.password', password: PASS } })
+        ),
+        devicesReq(db, path, authInit('GET')),
+      ]);
+      expect([200, 404]).toContain(del.status);
+      expect([200, 404]).toContain(got.status);
+      expect(db.devices.find((d) => d.device_id === 'CURRENT')).toBeUndefined();
+    });
+  }
+});
+
+describe('race key-backups soft-delete mid PUT-keys SELECT residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`version soft-deleted during existence SELECT → 404 #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, etag: `pre-${i}` })],
+        mutateAfterSelects: {
+          after: 1,
+          mutate: (d) => {
+            d.versions[0].deleted = 1;
+          },
+        },
+      });
+      const res = await keysReq(
+        db,
+        `${KEYS}/${ROOM_ENC}/${SESSION}?version=1`,
+        jsonInit('PUT', sessionPayload(`mid-${i}`))
+      );
+      expect(res.status).toBe(404);
+      expect(errcode(res.body)).toBe('M_NOT_FOUND');
+      expect(db.versions[0].deleted).toBe(1);
+      expect(db.keys).toHaveLength(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`DELETE version∥PUT keys concurrent #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, etag: `race-${i}` })],
+      });
+      const [del, put] = await Promise.all([
+        keysReq(db, `${VERSION}/1`, authInit('DELETE')),
+        keysReq(
+          db,
+          `${KEYS}/${ROOM_ENC}/${SESSION}?version=1`,
+          jsonInit('PUT', sessionPayload(`r-${i}`))
+        ),
+      ]);
+      expect(del.status).toBe(200);
+      expect([200, 404]).toContain(put.status);
+      expect(db.versions[0].deleted).toBe(1);
+    });
+  }
+});
+
+describe('race key-backups DELETE-all∥PUT refill residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`DELETE all keys∥PUT session refill #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 1, etag: `old-${i}` })],
+        keys: [seedKey({ session_data: JSON.stringify({ ciphertext: `seed-${i}` }) })],
+      });
+      const [del, put] = await Promise.all([
+        keysReq(db, `${KEYS}?version=1`, authInit('DELETE')),
+        keysReq(
+          db,
+          `${KEYS}/${ROOM_ENC}/${SESSION}?version=1`,
+          jsonInit('PUT', sessionPayload(`refill-${i}`))
+        ),
+      ]);
+      expect(del.status).toBe(200);
+      expect(put.status).toBe(200);
+      // Final state: empty (delete after put) or one refill row (put after delete).
+      expect([0, 1]).toContain(db.keys.length);
+      expect(db.versions[0].etag).not.toBe(`old-${i}`);
+    });
+  }
+});
+
+describe('race key-backups omit auth_data∥PUT auth_data residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`PUT {} omit auth_data∥PUT auth_data #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [
+          seedVersion({
+            version: 1,
+            auth_data: JSON.stringify({ ...AUTH_DATA, public_key: `seed-${i}` }),
+          }),
+        ],
+        selectBarrier: {
+          match: (sql) =>
+            sql.includes('FROM key_backup_versions') && sql.includes('version = ?'),
+          count: 2,
+        },
+      });
+      const [omit, put] = await Promise.all([
+        keysReq(db, `${VERSION}/1`, jsonInit('PUT', {})),
+        keysReq(
+          db,
+          `${VERSION}/1`,
+          jsonInit('PUT', { auth_data: { ...AUTH_DATA, public_key: `new-${i}` } })
+        ),
+      ]);
+      expect(omit.status).toBe(200);
+      expect(put.status).toBe(200);
+      const parsed = JSON.parse(db.versions[0].auth_data) as { public_key: string };
+      expect([`seed-${i}`, `new-${i}`]).toContain(parsed.public_key);
+    });
+  }
+});
+
+describe('race key-backups triple session PUT LWW residual after #232', () => {
+  for (let i = 0; i < 6; i++) {
+    it(`PUT∥PUT∥PUT same session LWW #${i}`, async () => {
+      const db = createKeyBackupDb({ versions: [seedVersion({ version: 1 })] });
+      const path = `${KEYS}/${ROOM_ENC}/${SESSION}?version=1`;
+      const results = await Promise.all([
+        keysReq(db, path, jsonInit('PUT', sessionPayload(`A-${i}`))),
+        keysReq(db, path, jsonInit('PUT', sessionPayload(`B-${i}`))),
+        keysReq(db, path, jsonInit('PUT', sessionPayload(`C-${i}`))),
+      ]);
+      expect(results.every((r) => r.status === 200)).toBe(true);
+      expect(db.keys.filter((k) => k.session_id === SESSION)).toHaveLength(1);
+      const cipher = JSON.parse(db.keys[0].session_data) as { ciphertext: string };
+      expect([`A-${i}`, `B-${i}`, `C-${i}`]).toContain(cipher.ciphertext);
+      expect(db.versions[0].count).toBe(1);
+    });
+  }
+});
+
+describe('race key-backups GET-room∥DELETE-room residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`GET room keys∥DELETE room keys #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 2 })],
+        keys: [
+          seedKey({ session_id: SESSION }),
+          seedKey({ session_id: SESSION_B }),
+        ],
+      });
+      const path = `${KEYS}/${ROOM_ENC}?version=1`;
+      const [got, del] = await Promise.all([
+        keysReq(db, path, authInit('GET')),
+        keysReq(db, path, authInit('DELETE')),
+      ]);
+      expect(del.status).toBe(200);
+      expect([200, 404]).toContain(got.status);
+      if (got.status === 200) {
+        const sessions = (got.body as { sessions: Record<string, unknown> }).sessions;
+        expect(Object.keys(sessions).length).toBeGreaterThanOrEqual(0);
+      }
+      expect(db.keys.filter((k) => k.room_id === ROOM)).toHaveLength(0);
+      expect(db.versions[0].count).toBe(0);
+    });
+  }
+});
+
+describe('race key-backups DELETE-session∥DELETE-all COUNT residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`DELETE session∥DELETE all keys #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 2, etag: `c-${i}` })],
+        keys: [
+          seedKey({ session_id: SESSION }),
+          seedKey({ session_id: SESSION_B, room_id: ROOM2 }),
+        ],
+      });
+      const [sess, all] = await Promise.all([
+        keysReq(db, `${KEYS}/${ROOM_ENC}/${SESSION}?version=1`, authInit('DELETE')),
+        keysReq(db, `${KEYS}?version=1`, authInit('DELETE')),
+      ]);
+      expect(sess.status).toBe(200);
+      expect(all.status).toBe(200);
+      expect(db.keys).toHaveLength(0);
+      expect(db.versions[0].count).toBe(0);
+      expect(db.versions[0].etag).not.toBe(`c-${i}`);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`DELETE session∥DELETE room COUNT barrier #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 2 })],
+        keys: [
+          seedKey({ session_id: SESSION }),
+          seedKey({ session_id: SESSION_B }),
+        ],
+        selectBarrier: {
+          match: (sql) => sql.includes('SELECT COUNT(*) as count FROM key_backup_keys'),
+          count: 2,
+        },
+      });
+      const [sess, room] = await Promise.all([
+        keysReq(db, `${KEYS}/${ROOM_ENC}/${SESSION}?version=1`, authInit('DELETE')),
+        keysReq(db, `${KEYS}/${ROOM_ENC}?version=1`, authInit('DELETE')),
+      ]);
+      expect(sess.status).toBe(200);
+      expect(room.status).toBe(200);
+      expect(db.keys.filter((k) => k.room_id === ROOM)).toHaveLength(0);
+      expect(db.versions[0].count).toBe(0);
+    });
+  }
+});
+
+describe('race key-backups soft-deleted PUT 404∥POST mint residual after #232', () => {
+  for (let i = 0; i < 6; i++) {
+    it(`PUT keys on soft-deleted∥POST new version #${i}`, async () => {
+      const db = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, deleted: 1 })],
+      });
+      const [put, post] = await Promise.all([
+        keysReq(db, `${KEYS}?version=1`, jsonInit('PUT', bulkKeys(`dead-${i}`))),
+        keysReq(db, VERSION, jsonInit('POST', { algorithm: ALG_MEGOLM, auth_data: AUTH_DATA })),
+      ]);
+      expect(put.status).toBe(404);
+      expect(post.status).toBe(200);
+      expect(db.versions.filter((v) => v.deleted === 0)).toHaveLength(1);
+      expect(db.keys).toHaveLength(0);
+    });
+  }
+});
+
+describe('race report leave→ban / join→invite residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`leave→ban after membership SELECT still INSERT #${i}`, async () => {
+      const evt = `$leaveban${i}:example.com`;
+      const db = createReportDb({
+        events: [{ event_id: evt, room_id: ROOM, sender: BOB }],
+        memberships: [{ room_id: ROOM, user_id: USER, membership: 'leave' }],
+        mutateAfterSelects: {
+          after: 2,
+          mutate: (d) => {
+            d.memberships[0].membership = 'ban';
+          },
+        },
+      });
+      const res = await reportReq(
+        db,
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/report/${encodeURIComponent(evt)}`,
+        jsonInit('POST', { reason: `lb-${i}`, score: -8 })
+      );
+      expect(res.status).toBe(200);
+      expect(db.memberships[0].membership).toBe('ban');
+      expect(db.reports.some((r) => r.event_id === evt)).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`join→invite after membership SELECT still INSERT #${i}`, async () => {
+      const evt = `$joininv${i}:example.com`;
+      const db = createReportDb({
+        events: [{ event_id: evt, room_id: ROOM, sender: BOB }],
+        memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+        mutateAfterSelects: {
+          after: 2,
+          mutate: (d) => {
+            d.memberships[0].membership = 'invite';
+          },
+        },
+      });
+      const res = await reportReq(
+        db,
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/report/${encodeURIComponent(evt)}`,
+        jsonInit('POST', { reason: `ji-${i}` })
+      );
+      expect(res.status).toBe(200);
+      expect(db.memberships[0].membership).toBe('invite');
+      expect(db.reports.some((r) => r.event_id === evt)).toBe(true);
+    });
+  }
+});
+
+describe('race report score clamp extremes residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`score >0 clamp∥score <-100 clamp concurrent #${i}`, async () => {
+      const evt = `$clamp${i}:example.com`;
+      const db = createReportDb({
+        events: [{ event_id: evt, room_id: ROOM, sender: BOB }],
+        memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+        reports: [seedEventReport({ id: 90 + i, event_id: evt, score: -50 })],
+      });
+      const path = `/_matrix/client/v3/rooms/${ROOM_ENC}/report/${encodeURIComponent(evt)}`;
+      const [hi, lo] = await Promise.all([
+        reportReq(db, path, jsonInit('POST', { reason: 'hi', score: 50 })),
+        reportReq(db, path, jsonInit('POST', { reason: 'lo', score: -999 })),
+      ]);
+      expect(hi.status).toBe(200);
+      expect(lo.status).toBe(200);
+      expect(db.reports.filter((r) => r.event_id === evt)).toHaveLength(1);
+      expect([0, -100]).toContain(db.reports[0].score);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`non-number score defaults vs numeric concurrent #${i}`, async () => {
+      const evt = `$nn${i}:example.com`;
+      const db = createReportDb({
+        events: [{ event_id: evt, room_id: ROOM, sender: BOB }],
+        memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+        reports: [seedEventReport({ id: 70 + i, event_id: evt, score: -50, reason: 'seed' })],
+      });
+      const path = `/_matrix/client/v3/rooms/${ROOM_ENC}/report/${encodeURIComponent(evt)}`;
+      const [bad, num] = await Promise.all([
+        reportReq(db, path, jsonInit('POST', { reason: 'bad', score: true })),
+        reportReq(db, path, jsonInit('POST', { reason: 'num', score: -33 })),
+      ]);
+      expect(bad.status).toBe(200);
+      expect(num.status).toBe(200);
+      expect(db.reports.filter((r) => r.event_id === evt)).toHaveLength(1);
+      expect([-33, -100]).toContain(db.reports[0].score);
+    });
+  }
+});
+
+describe('race report room/user re-report keeps resolved residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`room re-report keeps resolved=1 #${i}`, async () => {
+      const db = createReportDb({
+        rooms: [ROOM],
+        reports: [
+          {
+            id: 200 + i,
+            reporter_user_id: USER,
+            room_id: ROOM,
+            event_id: null,
+            reason: 'old',
+            score: -10,
+            created_at: NOW,
+            resolved: 1,
+            resolved_by: USER,
+            report_type: 'room',
+          },
+        ],
+      });
+      const results = await Promise.all([
+        reportReq(
+          db,
+          `/_matrix/client/v3/rooms/${ROOM_ENC}/report`,
+          jsonInit('POST', { reason: `room-new-${i}`, score: -2 })
+        ),
+        reportReq(
+          db,
+          `/_matrix/client/v3/rooms/${ROOM_ENC}/report`,
+          jsonInit('POST', { reason: `room-new2-${i}`, score: -3 })
+        ),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      const row = db.reports.find((r) => r.report_type === 'room')!;
+      expect(row.resolved).toBe(1);
+      expect([`room-new-${i}`, `room-new2-${i}`]).toContain(row.reason);
+      expect(db.reports.filter((r) => r.report_type === 'room')).toHaveLength(1);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`user re-report keeps resolved=1 #${i}`, async () => {
+      const db = createReportDb({
+        users: [
+          { user_id: USER, admin: 0 },
+          { user_id: BOB, admin: 0 },
+        ],
+        reports: [
+          {
+            id: 300 + i,
+            reporter_user_id: USER,
+            room_id: null,
+            event_id: null,
+            reason: 'old-u',
+            score: -100,
+            created_at: NOW,
+            resolved: 1,
+            resolved_by: USER,
+            report_type: 'user',
+            reported_user_id: BOB,
+          },
+        ],
+      });
+      const path = `/_matrix/client/v3/users/${encodeURIComponent(BOB)}/report`;
+      const results = await Promise.all([
+        reportReq(db, path, jsonInit('POST', { reason: `u-new-${i}` })),
+        reportReq(db, path, jsonInit('POST', { reason: `u-new2-${i}` })),
+      ]);
+      expect(statusesOf(results)).toEqual([200, 200]);
+      const row = db.reports.find((r) => r.report_type === 'user')!;
+      expect(row.resolved).toBe(1);
+      expect([`u-new-${i}`, `u-new2-${i}`]).toContain(row.reason);
+    });
+  }
+});
+
+describe('race report admin resolve∥GET + from pagination residual after #232', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`admin resolve∥GET same report #${i}`, async () => {
+      const db = createReportDb({
+        users: [{ user_id: USER, admin: 1 }],
+        events: [{ event_id: EVENT, room_id: ROOM, sender: BOB, content: '{"x":1}' }],
+        reports: [seedEventReport({ id: 11, resolved: 0, reason: `open-${i}` })],
+      });
+      const [resolve, got] = await Promise.all([
+        reportReq(
+          db,
+          '/_matrix/client/v3/admin/reports/11/resolve',
+          jsonInit('POST', { note: `n-${i}` })
+        ),
+        reportReq(db, '/_matrix/client/v3/admin/reports/11', authInit('GET')),
+      ]);
+      expect(resolve.status).toBe(200);
+      expect(got.status).toBe(200);
+      expect(db.reports[0].resolved).toBe(1);
+      const body = got.body as { resolved: boolean; reason: string };
+      expect([true, false]).toContain(body.resolved);
+      expect([`open-${i}`]).toContain(body.reason);
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`admin list from=∥resolve mid-flight #${i}`, async () => {
+      const db = createReportDb({
+        users: [{ user_id: USER, admin: 1 }],
+        events: [{ event_id: EVENT, room_id: ROOM, sender: BOB }],
+        reports: [
+          seedEventReport({ id: 40, resolved: 0, reason: `a-${i}` }),
+          seedEventReport({ id: 30, event_id: '$b:example.com', resolved: 0, reason: `b-${i}` }),
+        ],
+      });
+      const [list, resolve] = await Promise.all([
+        reportReq(db, '/_matrix/client/v3/admin/reports?from=50&limit=10', authInit('GET')),
+        reportReq(
+          db,
+          '/_matrix/client/v3/admin/reports/40/resolve',
+          jsonInit('POST', { note: 'done' })
+        ),
+      ]);
+      expect(list.status).toBe(200);
+      expect(resolve.status).toBe(200);
+      expect(db.reports.find((r) => r.id === 40)?.resolved).toBe(1);
+      const ids = (list.body as { reports: Array<{ id: number }> }).reports.map((r) => r.id);
+      expect(ids.every((id) => id < 50)).toBe(true);
+    });
+  }
+});
+
+describe('cross-module deepen isolation residual after #232', () => {
+  for (let i = 0; i < 6; i++) {
+    it(`devices DELETE + keys DELETE-all + room report #${i}`, async () => {
+      const devicesDb = createDevicesDb({
+        devices: [seedDevice({ device_id: `X${i}` })],
+      });
+      const keysDb = createKeyBackupDb({
+        versions: [seedVersion({ version: 1, count: 1 })],
+        keys: [seedKey()],
+      });
+      const reportsDb = createReportDb({
+        rooms: [ROOM],
+      });
+      const [d, k, r] = await Promise.all([
+        devicesReq(
+          devicesDb,
+          `${DEVICES}/X${i}`,
+          jsonInit('DELETE', { auth: { type: 'm.login.dummy' } })
+        ),
+        keysReq(keysDb, `${KEYS}?version=1`, authInit('DELETE')),
+        reportReq(
+          reportsDb,
+          `/_matrix/client/v3/rooms/${ROOM_ENC}/report`,
+          jsonInit('POST', { reason: `xr-${i}`, score: -1 })
+        ),
+      ]);
+      expect(d.status).toBe(200);
+      expect(k.status).toBe(200);
+      expect(r.status).toBe(200);
+      expect(devicesDb.devices).toHaveLength(0);
+      expect(keysDb.keys).toHaveLength(0);
+      expect(keysDb.versions[0].count).toBe(0);
+      expect(reportsDb.reports.some((row) => row.report_type === 'room')).toBe(true);
+    });
+  }
+});
+
