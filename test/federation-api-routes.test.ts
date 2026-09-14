@@ -1062,8 +1062,7 @@ describe('federation key endpoints', () => {
     );
     expect(noNotary.status).toBe(500);
   });
-
-
+});
 
 describe('PUT /_matrix/federation/v1/send/:txnId', () => {
   beforeEach(() => {
