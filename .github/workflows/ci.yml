@@ -66,6 +66,21 @@ jobs:
       - run: npm ci
       - run: npm run test:crypto-db
 
+  # Fail-fast canary for turn service concurrent-race leftovers (waves 1–2 +
+  # fourth-wave residual after #313 / tip past #315). Isolates flake attribution
+  # before the full vitest suite.
+  turn-concurrent:
+    name: Turn Concurrent Race Canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:turn-concurrent
+
   test:
     name: Tests
     runs-on: ubuntu-latest
