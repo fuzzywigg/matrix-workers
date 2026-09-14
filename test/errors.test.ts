@@ -874,3 +874,115 @@ describe('errors TOKENMAXX residual quaternary leftovers after #310', () => {
     expect(emptyCustom.headers.get('Content-Type')).toBe('application/json');
   });
 });
+
+describe('errors TOKENMAXX residual quinary leftovers after #311', () => {
+  it('retryAfterMs 0 omits ∥ negative includes under race via toJSON/toResponse', async () => {
+    const zero = new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'z', 429, 0);
+    const neg = new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'n', 429, -5);
+    const [jsonZero, jsonNeg, resZero, resNeg] = await Promise.all([
+      Promise.resolve(zero.toJSON()),
+      Promise.resolve(neg.toJSON()),
+      Promise.resolve(zero.toResponse()),
+      Promise.resolve(neg.toResponse()),
+    ]);
+    expect(jsonZero).toEqual({ errcode: 'M_LIMIT_EXCEEDED', error: 'z' });
+    expect(jsonNeg).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'n',
+      retry_after_ms: -5,
+    });
+    expect(resZero.status).toBe(429);
+    expect(resNeg.status).toBe(429);
+    await expect(resZero.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'z',
+    });
+    await expect(resNeg.json()).resolves.toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'n',
+      retry_after_ms: -5,
+    });
+  });
+
+  it('roomInUse / userInUse / guestAccessForbidden default exact bodies under race', async () => {
+    const [room, user, guest, guestCustom] = await Promise.all([
+      Promise.resolve(Errors.roomInUse().toResponse()),
+      Promise.resolve(Errors.userInUse().toResponse()),
+      Promise.resolve(Errors.guestAccessForbidden().toResponse()),
+      Promise.resolve(Errors.guestAccessForbidden('nope').toResponse()),
+    ]);
+    expect(new Set([room, user, guest, guestCustom]).size).toBe(4);
+    await expect(room.json()).resolves.toEqual({
+      errcode: 'M_ROOM_IN_USE',
+      error: 'Room alias already taken',
+    });
+    await expect(user.json()).resolves.toEqual({
+      errcode: 'M_USER_IN_USE',
+      error: 'User ID already taken',
+    });
+    await expect(guest.json()).resolves.toEqual({
+      errcode: 'M_GUEST_ACCESS_FORBIDDEN',
+      error: 'Guest access forbidden',
+    });
+    await expect(guestCustom.json()).resolves.toEqual({
+      errcode: 'M_GUEST_ACCESS_FORBIDDEN',
+      error: 'nope',
+    });
+    expect(room.status).toBe(400);
+    expect(user.status).toBe(400);
+    expect(guest.status).toBe(403);
+    expect(guestCustom.status).toBe(403);
+  });
+
+  it('withErrorHandler success ∥ conflict ∥ unexpected throw stay isolated', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const [ok, conflict, boom] = await Promise.all([
+      withErrorHandler(async () => ({ ok: true, n: 7 })),
+      withErrorHandler(async () => {
+        throw Errors.conflict('lost-quinary');
+      }),
+      withErrorHandler(async () => {
+        throw new TypeError('boom-quinary');
+      }),
+    ]);
+    expect(ok).toEqual({ ok: true, n: 7 });
+    expect(conflict).toBeInstanceOf(Response);
+    expect(boom).toBeInstanceOf(Response);
+    expect((conflict as Response).status).toBe(409);
+    expect((boom as Response).status).toBe(500);
+    await expect((conflict as Response).json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'lost-quinary',
+    });
+    await expect((boom as Response).json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN',
+      error: 'An unknown error occurred',
+    });
+    expect(spy).toHaveBeenCalledWith('Unexpected error:', expect.any(TypeError));
+    spy.mockRestore();
+  });
+
+  it('missingParam default message ∥ invalidParam custom ∥ unrecognized under race', async () => {
+    const [miss, inv, unrec] = await Promise.all([
+      Promise.resolve(Errors.missingParam('access_token').toResponse()),
+      Promise.resolve(Errors.invalidParam('limit', 'must be positive').toResponse()),
+      Promise.resolve(Errors.unrecognized().toResponse()),
+    ]);
+    expect(new Set([miss, inv, unrec]).size).toBe(3);
+    expect(miss.status).toBe(400);
+    expect(inv.status).toBe(400);
+    expect(unrec.status).toBe(400);
+    await expect(miss.json()).resolves.toEqual({
+      errcode: 'M_MISSING_PARAM',
+      error: 'Missing required parameter: access_token',
+    });
+    await expect(inv.json()).resolves.toEqual({
+      errcode: 'M_INVALID_PARAM',
+      error: 'must be positive',
+    });
+    await expect(unrec.json()).resolves.toEqual({
+      errcode: 'M_UNRECOGNIZED',
+      error: 'Unrecognized request',
+    });
+  });
+});

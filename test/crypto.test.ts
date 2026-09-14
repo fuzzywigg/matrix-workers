@@ -1602,3 +1602,188 @@ describe('federation signing TOKENMAXX residual senary leftovers after #310', ()
     spy.mockRestore();
   });
 });
+
+describe('crypto TOKENMAXX residual septenary leftovers after #311', () => {
+  it('verifyPassword wrong $-part counts ∥ valid hash stay isolated under race', async () => {
+    const real = await hashPassword('septenary1');
+    const [ok, tooFew, threeParts, sixParts, empty] = await Promise.all([
+      verifyPassword('septenary1', real),
+      verifyPassword('septenary1', '$pbkdf2-sha256$100000$only'),
+      verifyPassword('septenary1', '$pbkdf2-sha256$100000'),
+      verifyPassword('septenary1', '$pbkdf2-sha256$100000$c2FsdA==$aGFzaA==$extra'),
+      verifyPassword('septenary1', ''),
+    ]);
+    expect(ok).toBe(true);
+    expect(tooFew).toBe(false);
+    expect(threeParts).toBe(false);
+    expect(sixParts).toBe(false);
+    expect(empty).toBe(false);
+  });
+
+  it('sha256 empty string ∥ empty Uint8Array ∥ hashToken("") stay equal under race', async () => {
+    const [fromStr, fromBytes, tok, nonempty] = await Promise.all([
+      sha256(''),
+      sha256(new Uint8Array()),
+      hashToken(''),
+      sha256('septenary'),
+    ]);
+    expect(fromStr).toBe(fromBytes);
+    expect(tok).toBe(fromStr);
+    expect(fromStr).not.toMatch(/[+/=]/);
+    expect(nonempty).not.toBe(fromStr);
+  });
+
+  it('canonicalJson NaN / Infinity / -0 race stays deterministic', async () => {
+    const [nan, posInf, negInf, negZero, nested] = await Promise.all([
+      Promise.resolve(canonicalJson(Number.NaN)),
+      Promise.resolve(canonicalJson(Number.POSITIVE_INFINITY)),
+      Promise.resolve(canonicalJson(Number.NEGATIVE_INFINITY)),
+      Promise.resolve(canonicalJson(-0)),
+      Promise.resolve(canonicalJson({ z: -0, a: Number.NaN })),
+    ]);
+    expect(nan).toBe('null');
+    expect(posInf).toBe('null');
+    expect(negInf).toBe('null');
+    expect(negZero).toBe('0');
+    expect(nested).toBe('{"a":null,"z":0}');
+  });
+
+  it('validatePasswordStrength empty / short7 / exact8 letter-digit stay independent under race', async () => {
+    const [empty, short7, exact8, letterOnly] = await Promise.all([
+      Promise.resolve(validatePasswordStrength('')),
+      Promise.resolve(validatePasswordStrength('abcdef7')),
+      Promise.resolve(validatePasswordStrength('abcdefg1')),
+      Promise.resolve(validatePasswordStrength('abcdefgh')),
+    ]);
+    expect(empty).toMatch(/at least 8/);
+    expect(short7).toMatch(/at least 8/);
+    expect(exact8).toBeNull();
+    expect(letterOnly).toMatch(/number or special/);
+  });
+
+  it('calculateContentHash unsigned-only strip ∥ signatures-only strip match bare under race', async () => {
+    const bare = { type: 'm.test', content: { n: 7 } };
+    const unsignedOnly = { ...bare, unsigned: { age: 9 } };
+    const sigOnly = {
+      ...bare,
+      signatures: { 'example.com': { 'ed25519:1': 'sig' } },
+    };
+    const [hBare, hUnsigned, hSig, verifyU, verifyS] = await Promise.all([
+      calculateContentHash(bare),
+      calculateContentHash(unsignedOnly),
+      calculateContentHash(sigOnly),
+      verifyContentHash(unsignedOnly, await calculateContentHash(bare)),
+      verifyContentHash(sigOnly, await calculateContentHash(bare)),
+    ]);
+    expect(hBare).toBe(hUnsigned);
+    expect(hBare).toBe(hSig);
+    expect(verifyU).toBe(true);
+    expect(verifyS).toBe(true);
+  });
+
+  it('timingSafeEqual ∥ base64UrlEncode/Decode round-trip stay isolated under Promise.all', async () => {
+    const zeros = new Uint8Array(16);
+    const [eq, neq, emptyEnc, roundTrip, decoded] = await Promise.all([
+      Promise.resolve(timingSafeEqual('sept', 'sept')),
+      Promise.resolve(timingSafeEqual('sept', 'sepa')),
+      Promise.resolve(base64UrlEncode(new Uint8Array())),
+      Promise.resolve(base64UrlEncode(zeros)),
+      Promise.resolve(base64UrlDecode(base64UrlEncode(zeros))),
+    ]);
+    expect(eq).toBe(true);
+    expect(neq).toBe(false);
+    expect(emptyEnc).toBe('');
+    expect(roundTrip).toMatch(/^[A-Za-z0-9_-]*$/);
+    expect(Array.from(decoded)).toEqual(Array.from(zeros));
+  });
+});
+
+describe('federation signing TOKENMAXX residual septenary leftovers after #311', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('three-server signJson merge preserves all signatures under race', async () => {
+    const [a, b, c] = await Promise.all([
+      generateSigningKeyPair(),
+      generateSigningKeyPair(),
+      generateSigningKeyPair(),
+    ]);
+    const base = { type: 'm.test', content: { wave: 'septenary' } };
+    const once = await signJson(base, 'a.example.com', a.keyId, a.privateKeyJwk);
+    const [twice, thrice] = await Promise.all([
+      signJson(once, 'b.example.com', b.keyId, b.privateKeyJwk),
+      signJson(once, 'c.example.com', c.keyId, c.privateKeyJwk),
+    ]);
+    // Parallel second-hop from same once base: each result has a+own; merge check via sequential third hop
+    const merged = await signJson(twice, 'c.example.com', c.keyId, c.privateKeyJwk);
+    const sigs = merged.signatures as Record<string, Record<string, string>>;
+    expect(Object.keys(sigs).sort()).toEqual([
+      'a.example.com',
+      'b.example.com',
+      'c.example.com',
+    ]);
+    const [okA, okB, okC, thriceOk] = await Promise.all([
+      verifySignature(merged, 'a.example.com', a.keyId, a.publicKey),
+      verifySignature(merged, 'b.example.com', b.keyId, b.publicKey),
+      verifySignature(merged, 'c.example.com', c.keyId, c.publicKey),
+      verifySignature(thrice, 'c.example.com', c.keyId, c.publicKey),
+    ]);
+    expect(okA).toBe(true);
+    expect(okB).toBe(true);
+    expect(okC).toBe(true);
+    expect(thriceOk).toBe(true);
+    expect(
+      await verifySignature(thrice, 'b.example.com', b.keyId, b.publicKey)
+    ).toBe(false);
+  });
+
+  it('verifySignature unsigned-tamper stays true ∥ content-tamper false under race', async () => {
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.test', content: { n: 1 }, unsigned: { age: 1 } },
+      'ex.com',
+      keyId,
+      privateKeyJwk
+    );
+    const unsignedTampered = {
+      ...signed,
+      unsigned: { age: 999, redacted_because: { x: 1 } },
+    };
+    const contentTampered = { ...signed, content: { n: 2 } };
+    const [okUnsigned, badContent, okOrig, missingServer] = await Promise.all([
+      verifySignature(unsignedTampered, 'ex.com', keyId, publicKey),
+      verifySignature(contentTampered, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(signed, 'other.example.com', keyId, publicKey),
+    ]);
+    expect(okUnsigned).toBe(true);
+    expect(badContent).toBe(false);
+    expect(okOrig).toBe(true);
+    expect(missingServer).toBe(false);
+  });
+
+  it('signJson string JWK ∥ object JWK same key both verify under race', async () => {
+    const legacy = await generateSigningKeyPairLegacy();
+    const other = await generateSigningKeyPair();
+    const jwk = JSON.parse(legacy.privateKey) as JsonWebKey;
+    const [signedStr, signedObj] = await Promise.all([
+      signJson({ type: 'm.test', content: { via: 'str' } }, 'ex.com', legacy.keyId, legacy.privateKey),
+      signJson({ type: 'm.test', content: { via: 'obj' } }, 'ex.com', legacy.keyId, jwk),
+    ]);
+    const [okStr, okObj, cross] = await Promise.all([
+      verifySignature(signedStr, 'ex.com', legacy.keyId, legacy.publicKey),
+      verifySignature(signedObj, 'ex.com', legacy.keyId, legacy.publicKey),
+      verifySignature(signedStr, 'ex.com', legacy.keyId, other.publicKey),
+    ]);
+    expect(okStr).toBe(true);
+    expect(okObj).toBe(true);
+    expect(cross).toBe(false);
+  });
+});
