@@ -3459,3 +3459,240 @@ describe('database CRUD TOKENMAXX residual leftovers after #264', () => {
     expect(db._state.streamPosition).toBe(9);
   });
 });
+
+describe('database CRUD TOKENMAXX residual leftovers after #272', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('concurrent hard-cap reject + successful storeEvent: reject leaves sibling stream intact', async () => {
+    const db = createCrudDb({ streamPosition: 6 });
+    const hard = pdu({
+      event_id: '$hard-sib',
+      type: 'm.room.message',
+      content: { body: 'ok' },
+    });
+    hard.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
+    const ok = pdu({
+      event_id: '$ok-sib',
+      type: 'm.room.message',
+      content: { body: 'n' },
+    });
+    const [rej, win] = await Promise.allSettled([storeEvent(db, hard), storeEvent(db, ok)]);
+    expect(rej.status).toBe('rejected');
+    if (rej.status === 'rejected') {
+      expect(rej.reason).toMatchObject({ errcode: 'M_TOO_LARGE' });
+      expect((rej.reason as MatrixApiError).message).toMatch(/D1 row limit/);
+    }
+    expect(win.status).toBe('fulfilled');
+    if (win.status === 'fulfilled') {
+      expect(win.value).toBe(7);
+    }
+    expect(db._state.events.map((e) => e.event_id)).toEqual(['$ok-sib']);
+    expect(db._state.streamPosition).toBe(7);
+  });
+
+  it('storeEventIdempotent oversized inserts under race while storeEvent(huge) rejects', async () => {
+    const db = createCrudDb({ streamPosition: 2 });
+    const huge = pdu({
+      event_id: '$huge-idem',
+      type: 'm.room.message',
+      content: { body: 'x'.repeat(70_000) },
+    });
+    const ok = pdu({
+      event_id: '$ok-idem-race',
+      type: 'm.room.message',
+      content: { body: 'ok' },
+    });
+    const [idem, storeOk, storeHuge] = await Promise.allSettled([
+      storeEventIdempotent(db, huge),
+      storeEvent(db, ok),
+      storeEvent(db, { ...huge, event_id: '$huge-store' }),
+    ]);
+    expect(idem.status).toBe('fulfilled');
+    if (idem.status === 'fulfilled') {
+      expect(idem.value.inserted).toBe(true);
+      expect(idem.value.streamOrdering).not.toBeNull();
+    }
+    expect(storeOk.status).toBe('fulfilled');
+    expect(storeHuge.status).toBe('rejected');
+    if (storeHuge.status === 'rejected') {
+      expect(storeHuge.reason).toMatchObject({ errcode: 'M_TOO_LARGE' });
+    }
+    const ids = db._state.events.map((e) => e.event_id).sort();
+    expect(ids).toEqual(['$huge-idem', '$ok-idem-race'].sort());
+    expect(ids).not.toContain('$huge-store');
+  });
+
+  it('tryInsertJoinMembership concurrent leave→join upgrades collapse to one join', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'leave',
+          event_id: '$left',
+          display_name: 'Gone',
+          avatar_url: null,
+        },
+      ],
+    });
+    const [a, b] = await Promise.all([
+      tryInsertJoinMembership(db, ROOM, USER, '$join-leave-a', 'A'),
+      tryInsertJoinMembership(db, ROOM, USER, '$join-leave-b', 'B'),
+    ]);
+    expect(db._state.memberships).toHaveLength(1);
+    expect(db._state.memberships[0].membership).toBe('join');
+    const winners = [a, b].filter((r) => r.inserted);
+    const losers = [a, b].filter((r) => !r.inserted);
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(losers[0].eventId).toBe(winners[0].eventId);
+    expect(db._state.memberships[0].event_id).toBe(winners[0].eventId);
+  });
+
+  it('tryInsertJoinMembership concurrent ban→join upgrades collapse to one join', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'ban',
+          event_id: '$banned',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    const [a, b] = await Promise.all([
+      tryInsertJoinMembership(db, ROOM, USER, '$join-ban-a', 'A'),
+      tryInsertJoinMembership(db, ROOM, USER, '$join-ban-b', 'B'),
+    ]);
+    expect(db._state.memberships).toHaveLength(1);
+    expect(db._state.memberships[0].membership).toBe('join');
+    const winners = [a, b].filter((r) => r.inserted);
+    expect(winners).toHaveLength(1);
+    expect(db._state.memberships[0].event_id).toBe(winners[0].eventId);
+  });
+
+  it('concurrent getLatestStreamPosition + storeEvent stays coherent', async () => {
+    const db = createCrudDb({
+      events: [eventRowFromPdu(pdu({ event_id: '$e0', type: 'm.room.message' }), 3)],
+      streamPosition: 3,
+    });
+    const [tip, stream] = await Promise.all([
+      getLatestStreamPosition(db),
+      storeEvent(db, pdu({ event_id: '$e1', type: 'm.room.message', content: { body: 'n' } })),
+    ]);
+    expect([3, 4]).toContain(tip);
+    expect(stream).toBe(4);
+    expect(db._state.streamPosition).toBe(4);
+    expect(db._state.events.map((e) => e.event_id).sort()).toEqual(['$e0', '$e1']);
+  });
+
+  it('concurrent getRoomState / getStateEvent + state storeEvent sees old or new only', async () => {
+    const old = pdu({
+      event_id: '$old-name',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'Old' },
+    });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(old, 1)],
+      roomState: [{ room_id: ROOM, event_type: 'm.room.name', state_key: '', event_id: '$old-name' }],
+      streamPosition: 1,
+    });
+    const neu = pdu({
+      event_id: '$new-name',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'New' },
+    });
+    const [, state, single] = await Promise.all([
+      storeEvent(db, neu),
+      getRoomState(db, ROOM),
+      getStateEvent(db, ROOM, 'm.room.name', ''),
+    ]);
+    const nameIds = state
+      .filter((e) => e.type === 'm.room.name')
+      .map((e) => e.event_id);
+    expect(nameIds).toHaveLength(1);
+    expect(['$old-name', '$new-name']).toContain(nameIds[0]);
+    expect(single === null || ['$old-name', '$new-name'].includes(single.event_id)).toBe(true);
+    // Final writer must win room_state
+    const final = await getStateEvent(db, ROOM, 'm.room.name', '');
+    expect(final?.event_id).toBe('$new-name');
+  });
+
+  it('concurrent getEventsByIds overlapping pages stay isolated', async () => {
+    const rows = Array.from({ length: 150 }, (_, i) =>
+      eventRowFromPdu(
+        pdu({ event_id: `$e${i}`, type: 'm.room.message', content: { body: String(i) } }),
+        i + 1
+      )
+    );
+    const db = createCrudDb({ events: rows, streamPosition: 150 });
+    const allIds = rows.map((r) => r.event_id);
+    const subset = allIds.slice(0, 50);
+    const missing = Array.from({ length: 30 }, (_, i) => `$missing-${i}`);
+    const [full, part, none] = await Promise.all([
+      getEventsByIds(db, allIds),
+      getEventsByIds(db, subset),
+      getEventsByIds(db, missing),
+    ]);
+    expect(full).toHaveLength(150);
+    expect(part).toHaveLength(50);
+    expect(none).toEqual([]);
+    expect(new Set(full.map((e) => e.event_id)).size).toBe(150);
+    expect(part.map((e) => e.event_id).sort()).toEqual([...subset].sort());
+    expect(db._state.events).toHaveLength(150);
+  });
+
+  it('deleteAllUserTokens ∥ createAccessToken ∥ getUserByTokenHash stay coherent', async () => {
+    const db = createCrudDb({
+      tokens: [
+        {
+          token_id: 't1',
+          token_hash: 'hash-old',
+          user_id: USER,
+          device_id: 'DEV',
+          created_at: NOW,
+        },
+      ],
+    });
+    const [del, created, lookup] = await Promise.all([
+      deleteAllUserTokens(db, USER),
+      createAccessToken(db, 'tid-new', 'hash-new', USER, 'DEV2'),
+      getUserByTokenHash(db, 'hash-old'),
+    ]);
+    expect(del).toBeUndefined();
+    expect(created).toBeUndefined();
+    // Mid-flight lookup may see the old row or miss after delete
+    if (lookup !== null) {
+      expect(lookup).toMatchObject({ userId: USER, deviceId: 'DEV' });
+    }
+    const remaining = db._state.tokens.filter((t) => t.user_id === USER);
+    // delete-all then create → [hash-new]; create then delete-all → [] (new wiped too).
+    // hash-old must never survive both completing.
+    expect(remaining.every((t) => t.token_hash === 'hash-new')).toBe(true);
+    expect(remaining.length).toBeLessThanOrEqual(1);
+  });
+
+  it('concurrent getRoomEvents forwards and backwards stay independently correct', async () => {
+    const rows = [1, 2, 3, 4, 5].map((n) =>
+      eventRowFromPdu(pdu({ event_id: `$e${n}`, type: 'm.room.message' }), n)
+    );
+    const db = createCrudDb({ events: rows, streamPosition: 5 });
+    const [fwd, back] = await Promise.all([
+      getRoomEvents(db, ROOM, undefined, 10, 'f'),
+      getRoomEvents(db, ROOM, undefined, 10, 'b'),
+    ]);
+    expect(fwd.events.map((e) => e.event_id)).toEqual(['$e1', '$e2', '$e3', '$e4', '$e5']);
+    expect(back.events.map((e) => e.event_id)).toEqual(['$e5', '$e4', '$e3', '$e2', '$e1']);
+    expect(fwd.end).toBe(5);
+    expect(back.end).toBe(1);
+  });
+});

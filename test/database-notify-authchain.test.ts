@@ -1366,3 +1366,216 @@ describe('notify / auth-chain / servers TOKENMAXX residual leftovers after #264'
     expect(binds[1]).toEqual(['@alice:example.com', '@alice:example.com']);
   });
 });
+
+describe('notify / auth-chain / servers TOKENMAXX residual leftovers after #272', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('concurrent notify on one env with roomId filter isolates dual-room fan-out', async () => {
+    const notifies: { userId: string; body: unknown }[] = [];
+    const membersByRoom: Record<string, string[]> = {
+      '!a:example.com': ['@a1:example.com', '@a2:example.com'],
+      '!b:example.com': ['@b1:example.com'],
+    };
+    const env = {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              return {
+                async all<T>() {
+                  if (sql.includes('room_memberships')) {
+                    const roomId = args[0] as string;
+                    return {
+                      results: (membersByRoom[roomId] ?? []).map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            const body = await req.json();
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+    await Promise.all([
+      notifyUsersOfEvent(env, '!a:example.com', '$ea', 'm.room.message'),
+      notifyUsersOfEvent(env, '!b:example.com', '$eb', 'm.room.member'),
+    ]);
+    const aUsers = notifies
+      .filter((n) => (n.body as { room_id: string }).room_id === '!a:example.com')
+      .map((n) => n.userId)
+      .sort();
+    const bUsers = notifies
+      .filter((n) => (n.body as { room_id: string }).room_id === '!b:example.com')
+      .map((n) => n.userId);
+    expect(aUsers).toEqual(['@a1:example.com', '@a2:example.com']);
+    expect(bUsers).toEqual(['@b1:example.com']);
+    expect(notifies).toHaveLength(3);
+  });
+
+  it('concurrent notify outer catch when membership prepare throws still resolves', async () => {
+    const env = {
+      DB: {
+        prepare() {
+          throw new Error('membership query down');
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: () => ({
+          async fetch() {
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+    await expect(
+      Promise.all([
+        notifyUsersOfEvent(env, '!a:example.com', '$e1', 'm.room.message'),
+        notifyUsersOfEvent(env, '!b:example.com', '$e2', 'm.room.message'),
+      ])
+    ).resolves.toEqual([undefined, undefined]);
+    expect(console.error).toHaveBeenCalled();
+    const prefixes = (console.error as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+    expect(prefixes.every((p) => p === '[database] Failed to notify users of event:')).toBe(true);
+    expect(prefixes.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('concurrent identical getAuthChain tips keep independent seen sets', async () => {
+    const events = new Map<string, PDU>([
+      ['$tip', pdu('$tip', ['$l', '$r'])],
+      ['$l', pdu('$l', ['$root'])],
+      ['$r', pdu('$r', ['$root'])],
+      ['$root', pdu('$root', [])],
+    ]);
+    const db = createAuthChainDb(events);
+    const [a, b] = await Promise.all([getAuthChain(db, ['$tip']), getAuthChain(db, ['$tip'])]);
+    expect(a).toHaveLength(4);
+    expect(b).toHaveLength(4);
+    expect(new Set(a.map((e) => e.event_id))).toEqual(new Set(['$tip', '$l', '$r', '$root']));
+    expect(new Set(b.map((e) => e.event_id))).toEqual(new Set(['$tip', '$l', '$r', '$root']));
+  });
+
+  it('concurrent getAuthChain cap warn does not poison a short sibling chain', async () => {
+    const deep = new Map<string, PDU>();
+    for (let i = 0; i < 520; i++) {
+      deep.set(`$d${i}`, pdu(`$d${i}`, i === 0 ? [] : [`$d${i - 1}`]));
+    }
+    const short = new Map<string, PDU>([
+      ['$s2', pdu('$s2', ['$s1'])],
+      ['$s1', pdu('$s1', ['$s0'])],
+      ['$s0', pdu('$s0', [])],
+    ]);
+    // Shared DB that serves both graphs
+    const combined = new Map<string, PDU>([...deep, ...short]);
+    const db = createAuthChainDb(combined);
+    const [capped, brief] = await Promise.all([
+      getAuthChain(db, ['$d519']),
+      getAuthChain(db, ['$s2']),
+    ]);
+    expect(capped).toHaveLength(500);
+    expect(brief.map((e) => e.event_id)).toEqual(['$s2', '$s1', '$s0']);
+    expect(console.warn).toHaveBeenCalledWith(
+      '[getAuthChain] reached MAX_AUTH_CHAIN_SIZE cap',
+      500,
+      'aborting traversal'
+    );
+  });
+
+  it('concurrent getStateAtEvent last-wins on colliding auth type+key', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$leaf',
+        pdu('$leaf', ['$a1', '$a2'], {
+          type: 'm.room.message',
+          content: { body: 'x' },
+        }),
+      ],
+      [
+        '$a1',
+        pdu('$a1', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'first' },
+        }),
+      ],
+      [
+        '$a2',
+        pdu('$a2', [], {
+          type: 'm.room.name',
+          state_key: '',
+          content: { name: 'second' },
+        }),
+      ],
+    ]);
+    delete (events.get('$leaf') as { state_key?: string }).state_key;
+    const db = createAuthChainDb(events);
+    const [s1, s2] = await Promise.all([getStateAtEvent(db, '$leaf'), getStateAtEvent(db, '$leaf')]);
+    expect(s1).toHaveLength(1);
+    expect(s2).toHaveLength(1);
+    // last auth id in the leaf's auth_events list wins ($a2)
+    expect(s1[0].event_id).toBe('$a2');
+    expect(s2[0].event_id).toBe('$a2');
+    expect(s1[0].content).toEqual({ name: 'second' });
+  });
+
+  it('getServersInRoomsWithUser concurrent distinct users isolate binds and results', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare() {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            const subject = args[0] as string;
+            return {
+              async all<T>() {
+                if (subject === '@alice:example.com') {
+                  return {
+                    results: [
+                      { server_name: 'peer-a.example.com' },
+                      { server_name: null },
+                    ] as T[],
+                  };
+                }
+                return {
+                  results: [{ server_name: 'peer-b.example.com' }] as T[],
+                };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const [alice, bob] = await Promise.all([
+      getServersInRoomsWithUser(db, '@alice:example.com'),
+      getServersInRoomsWithUser(db, '@bob:example.com'),
+    ]);
+    expect(alice).toEqual(['peer-a.example.com']);
+    expect(bob).toEqual(['peer-b.example.com']);
+    expect(binds).toHaveLength(2);
+    expect(binds).toEqual(
+      expect.arrayContaining([
+        ['@alice:example.com', '@alice:example.com'],
+        ['@bob:example.com', '@bob:example.com'],
+      ])
+    );
+  });
+});

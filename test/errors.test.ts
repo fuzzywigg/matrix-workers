@@ -579,3 +579,63 @@ describe('errors TOKENMAXX residual leftovers after #264', () => {
     await expect(j.json()).resolves.toEqual({});
   });
 });
+
+describe('errors TOKENMAXX residual leftovers after #272', () => {
+  it('toJSON omits retry_after_ms for falsy -0 while including NEGATIVE_INFINITY', () => {
+    const omit = new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'neg-zero', 429, Number(-0));
+    const keep = new MatrixApiError(ErrorCodes.M_LIMIT_EXCEEDED, 'neg-inf', 429, Number.NEGATIVE_INFINITY);
+    expect(omit.toJSON()).toEqual({ errcode: 'M_LIMIT_EXCEEDED', error: 'neg-zero' });
+    expect(Object.prototype.hasOwnProperty.call(omit.toJSON(), 'retry_after_ms')).toBe(false);
+    expect(keep.toJSON()).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'neg-inf',
+      retry_after_ms: Number.NEGATIVE_INFINITY,
+    });
+  });
+
+  it('withErrorHandler passes through fulfilled undefined alongside a MatrixApiError race', async () => {
+    const [undef, conflict] = await Promise.all([
+      withErrorHandler(async () => undefined),
+      withErrorHandler(async () => {
+        throw Errors.conflict('race');
+      }),
+    ]);
+    expect(undef).toBeUndefined();
+    expect(conflict).toBeInstanceOf(Response);
+    expect((conflict as Response).status).toBe(409);
+    await expect((conflict as Response).json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'race',
+    });
+  });
+
+  it('userInUse / roomInUse / guestAccessForbidden / invalidRoomState stay isolated under race', async () => {
+    const [u, r, g, i] = await Promise.all([
+      Promise.resolve(Errors.userInUse('u').toResponse()),
+      Promise.resolve(Errors.roomInUse('r').toResponse()),
+      Promise.resolve(Errors.guestAccessForbidden('g').toResponse()),
+      Promise.resolve(Errors.invalidRoomState('i').toResponse()),
+    ]);
+    expect(u).not.toBe(r);
+    expect(u.status).toBe(400);
+    expect(r.status).toBe(400);
+    expect(g.status).toBe(403);
+    expect(i.status).toBe(400);
+    await expect(u.json()).resolves.toEqual({ errcode: 'M_USER_IN_USE', error: 'u' });
+    await expect(r.json()).resolves.toEqual({ errcode: 'M_ROOM_IN_USE', error: 'r' });
+    await expect(g.json()).resolves.toEqual({ errcode: 'M_GUEST_ACCESS_FORBIDDEN', error: 'g' });
+    await expect(i.json()).resolves.toEqual({ errcode: 'M_INVALID_ROOM_STATE', error: 'i' });
+  });
+
+  it('emptyResponse() default 200 races with emptyResponse(202)', async () => {
+    const [def, custom] = await Promise.all([
+      Promise.resolve(emptyResponse()),
+      Promise.resolve(emptyResponse(202)),
+    ]);
+    expect(def).not.toBe(custom);
+    expect(def.status).toBe(200);
+    expect(custom.status).toBe(202);
+    await expect(def.json()).resolves.toEqual({});
+    await expect(custom.json()).resolves.toEqual({});
+  });
+});
