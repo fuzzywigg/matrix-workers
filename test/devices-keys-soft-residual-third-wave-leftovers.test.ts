@@ -62,7 +62,6 @@ import { verifyPassword } from '../src/utils/crypto';
 
 const USER = '@alice:example.com';
 const BOB = '@bob:example.com';
-const DEVICE = 'DEVICEA';
 const SERVER = 'example.com';
 const PASS = 's3cret';
 const AUTH = { Authorization: 'Bearer test-token' };
