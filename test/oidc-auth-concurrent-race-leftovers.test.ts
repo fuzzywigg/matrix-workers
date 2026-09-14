@@ -1,19 +1,19 @@
 /**
  * TOKENMAXX HEAVY leftovers after #221 / deepen after #232 / residual after #238
- * / tip deepen after #252 — oidc-auth *concurrent race / TOCTOU* for
- * `src/api/oidc-auth.ts` (providers / login / callback / auth_metadata /
- * MSC3861 identity reset).
+ * / tip deepen after #252 / residual after #260 — oidc-auth *concurrent race /
+ * TOCTOU* for `src/api/oidc-auth.ts` (providers / login / callback /
+ * auth_metadata / MSC3861 identity reset).
  *
  * Soft/route leftovers for oidc-auth are deep (#113/#143/#147) but concurrent-
  * race coverage was near-zero: only a sequential "consumes state exactly once"
  * case in oidc-auth-api-routes (no Promise.all / SESSIONS get-barrier double-
  * spend / parallel login state mint / identity-reset races).
  *
- * Distinct from tip #252 (crypto+db+errors), #244 (this slice residual after
- * #238), #241/#240/#239 siblings, and saturated keys/media/rooms/voip/sync/
- * push/login-qr-identity concurrent-race files. Orthogonal to
- * oauth-concurrent-race — this slice is *external IdP* SSO, not `/oauth/*`
- * AS provider.
+ * Distinct from tip #260 (oauth+oidc deleteBarrier tip), #252 (crypto+db+
+ * errors), #244 (this slice residual after #238), #241/#240/#239 siblings,
+ * and saturated keys/media/rooms/voip/sync/push concurrent-race files.
+ * Orthogonal to oauth-concurrent-race — this slice is *external IdP* SSO,
+ * not `/oauth/*` AS provider.
  *
  * Focus: parallel login distinct oidc_state mint; callback state double-
  * consume get-barrier TOCTOU; distinct-state parallel redeem; provider
@@ -28,6 +28,9 @@
  * Residual after #252 tip: deleteBarrier state consume, return_to query,
  * MSC3861 change_type SQL literal, wrong-key decrypt, null claims UPDATE,
  * icon_url null echo, auto_create=0 state consume, device/api scopes bind.
+ * Residual after #260 tip: mismatch under deleteBarrier, Provider Not Found
+ * still burns state, distinct-sub auto-link same mxid, fail-after-consume,
+ * empty return_to default∥query isolation, disable-after-deleteBarrier.
  *
  * Tests-only. Fixtures use example.com only. No product inventing.
  */
@@ -4398,6 +4401,266 @@ describe('race residual oidc wrong-key + null claims + icon null + state consume
         .map((v) => JSON.parse(v).returnTo as string)
         .sort();
       expect(returns).toEqual([`/p${i}`, withQuery].sort());
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// After #260 tip: residual mismatch deleteBarrier / Provider Not Found burns
+// state / distinct-sub auto-link / fail-after-consume / empty return_to /
+// disable-after-deleteBarrier niches unsaturated by #260/#252/#244.
+// ---------------------------------------------------------------------------
+
+describe('race residual oidc mismatch + Provider Not Found state burn after #260 tip', () => {
+  it('provider mismatch under deleteBarrier — both observe; state burned', async () => {
+    const sessions = mockKv(
+      {},
+      { deleteBarrier: { count: 2, match: (k) => k.startsWith('oidc_state:') } }
+    );
+    const state = seedState(sessions, 'mm-del', { providerId: 'other' });
+    const db = createOidcRaceDb({ providers: [seedProvider()] });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=c1&state=${state}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=c2&state=${state}`, {}, env),
+    ]);
+    expect(
+      results.every(
+        (r) => r.text.includes('Provider mismatch') || r.text.includes('Invalid State')
+      )
+    ).toBe(true);
+    expect(results.some((r) => r.text.includes('Provider mismatch'))).toBe(true);
+    expect(sessions.data[`oidc_state:${state}`]).toBeUndefined();
+    expect(sessions.deletes.filter((k) => k === `oidc_state:${state}`).length).toBeGreaterThanOrEqual(
+      1
+    );
+    expect(createDevice).not.toHaveBeenCalled();
+  });
+
+  it('Provider Not Found (enabled=0) still consumes distinct oidc_state under parallel', async () => {
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'pnf-a');
+    const s2 = seedState(sessions, 'pnf-b');
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ enabled: 0 })],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    for (const r of results) expect(r.text).toContain('Provider Not Found');
+    expect(sessions.data[`oidc_state:${s1}`]).toBeUndefined();
+    expect(sessions.data[`oidc_state:${s2}`]).toBeUndefined();
+    expect(sessions.deletes).toEqual(
+      expect.arrayContaining([`oidc_state:${s1}`, `oidc_state:${s2}`])
+    );
+    expect(createUser).not.toHaveBeenCalled();
+    expect(createDevice).not.toHaveBeenCalled();
+  });
+
+  it('dual callback deleteBarrier then disable — Provider Not Found after state burn', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv(
+      {},
+      { deleteBarrier: { count: 2, match: (k) => k === 'oidc_state:dis-after-del' } }
+    );
+    const state = seedState(sessions, 'dis-after-del');
+    const provider = seedProvider({ client_secret_encrypted: secret, enabled: 0 });
+    const db = createOidcRaceDb({ providers: [provider] });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=c1&state=${state}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=c2&state=${state}`, {}, env),
+    ]);
+    expect(
+      results.every(
+        (r) =>
+          r.text.includes('Provider Not Found') || r.text.includes('Invalid State')
+      )
+    ).toBe(true);
+    expect(results.some((r) => r.text.includes('Provider Not Found'))).toBe(true);
+    expect(sessions.data[`oidc_state:${state}`]).toBeUndefined();
+    expect(sessions.deletes.filter((k) => k === `oidc_state:${state}`).length).toBeGreaterThanOrEqual(
+      1
+    );
+    // No second-chance login with burned state
+    const retry = await request(
+      `/auth/oidc/${PROVIDER_ID}/callback?code=c3&state=${state}`,
+      {},
+      env
+    );
+    expect(retry.text).toContain('Invalid State');
+  });
+
+  it('empty/omitted return_to defaults to / ∥ query return_to isolation under parallel', async () => {
+    const sessions = mockKv();
+    const db = createOidcRaceDb({ providers: [seedProvider()] });
+    const env = envFor({ sessions, db });
+    const withQuery = '/room/!x:example.com?via=example.com';
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/login`, {}, env),
+      request(
+        `/auth/oidc/${PROVIDER_ID}/login?return_to=${encodeURIComponent(withQuery)}`,
+        {},
+        env
+      ),
+      request(`/auth/oidc/${PROVIDER_ID}/login?return_to=`, {}, env),
+    ]);
+    expect(statusesOf(results)).toEqual([302, 302, 302]);
+    const returns = Object.values(sessions.data)
+      .map((v) => JSON.parse(v).returnTo as string)
+      .sort();
+    expect(returns).toEqual(['/', '/', withQuery].sort());
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`mismatch deleteBarrier residual flood-${i}`, async () => {
+      const sessions = mockKv(
+        {},
+        { deleteBarrier: { count: 2, match: (k) => k === `oidc_state:mm-f-${i}` } }
+      );
+      const state = seedState(sessions, `mm-f-${i}`, { providerId: 'wrong' });
+      const db = createOidcRaceDb({ providers: [seedProvider()] });
+      const env = envFor({ sessions, db });
+      const results = await Promise.all([
+        request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${state}`, {}, env),
+        request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${state}`, {}, env),
+      ]);
+      expect(
+        results.every(
+          (r) => r.text.includes('Provider mismatch') || r.text.includes('Invalid State')
+        )
+      ).toBe(true);
+      expect(sessions.data[`oidc_state:${state}`]).toBeUndefined();
+    });
+  }
+});
+
+describe('race residual oidc distinct-sub auto-link + fail-after-consume after #260 tip', () => {
+  it('dual distinct-sub auto-link → same derived mxid — createUser never; ≥2 link INSERTs', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'dsub-a');
+    const s2 = seedState(sessions, 'dsub-b');
+    validateIDToken
+      .mockResolvedValueOnce({
+        sub: 'sub-alpha',
+        preferred_username: 'alice',
+        email: 'a@example.com',
+        name: 'Alice A',
+      })
+      .mockResolvedValueOnce({
+        sub: 'sub-beta',
+        preferred_username: 'alice',
+        email: 'b@example.com',
+        name: 'Alice B',
+      });
+    deriveUsername.mockReturnValue('alice');
+    getUserById.mockResolvedValue({ user_id: USER });
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret, auto_create_users: 1 })],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    expect(results.every((r) => r.text.includes('Login Successful'))).toBe(true);
+    expect(createUser).not.toHaveBeenCalled();
+    const linkInserts = db.inserts.filter((x) => x.sql.includes('INSERT INTO idp_user_links'));
+    expect(linkInserts.length).toBeGreaterThanOrEqual(2);
+    const externalIds = linkInserts.map((ins) => ins.args[1] as string).sort();
+    expect(externalIds).toEqual(['sub-alpha', 'sub-beta'].sort());
+    expect(linkInserts.every((ins) => ins.args[2] === USER)).toBe(true);
+    expect(sessions.data[`oidc_state:${s1}`]).toBeUndefined();
+    expect(sessions.data[`oidc_state:${s2}`]).toBeUndefined();
+  });
+
+  it('token exchange rejection still consumes both oidc_state keys under parallel', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'ex-consume-a');
+    const s2 = seedState(sessions, 'ex-consume-b');
+    exchangeCodeForTokens.mockRejectedValue(new Error('exchange-fail'));
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret })],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    for (const r of results) expect(r.text).toContain('Authentication Failed');
+    expect(sessions.data[`oidc_state:${s1}`]).toBeUndefined();
+    expect(sessions.data[`oidc_state:${s2}`]).toBeUndefined();
+    expect(sessions.deletes).toEqual(
+      expect.arrayContaining([`oidc_state:${s1}`, `oidc_state:${s2}`])
+    );
+    expect(createDevice).not.toHaveBeenCalled();
+  });
+
+  it('id_token validate rejection still consumes both oidc_state keys under parallel', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'val-consume-a');
+    const s2 = seedState(sessions, 'val-consume-b');
+    validateIDToken.mockRejectedValue(new Error('bad-jwt'));
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret })],
+    });
+    const env = envFor({ sessions, db });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    for (const r of results) expect(r.text).toContain('Authentication Failed');
+    expect(sessions.data[`oidc_state:${s1}`]).toBeUndefined();
+    expect(sessions.data[`oidc_state:${s2}`]).toBeUndefined();
+    expect(sessions.deletes).toEqual(
+      expect.arrayContaining([`oidc_state:${s1}`, `oidc_state:${s2}`])
+    );
+  });
+
+  it('wrong-key decrypt Authentication Failed still burns distinct states under parallel', async () => {
+    const secret = await encryptClientSecret();
+    const sessions = mockKv();
+    const s1 = seedState(sessions, 'wk-burn-a');
+    const s2 = seedState(sessions, 'wk-burn-b');
+    const wrongKeyBytes = new Uint8Array(32).fill(7);
+    const wrongKey = btoa(String.fromCharCode(...wrongKeyBytes));
+    const db = createOidcRaceDb({
+      providers: [seedProvider({ client_secret_encrypted: secret })],
+    });
+    const env = envFor({ sessions, db, oidcKey: wrongKey });
+    const results = await Promise.all([
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+      request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+    ]);
+    expect(results.every((r) => r.text.includes('Authentication Failed'))).toBe(true);
+    expect(sessions.data[`oidc_state:${s1}`]).toBeUndefined();
+    expect(sessions.data[`oidc_state:${s2}`]).toBeUndefined();
+    expect(createAccessToken).not.toHaveBeenCalled();
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`fail-after-consume residual flood-${i}`, async () => {
+      const secret = await encryptClientSecret();
+      const sessions = mockKv();
+      const s1 = seedState(sessions, `fac-a-${i}`);
+      const s2 = seedState(sessions, `fac-b-${i}`);
+      exchangeCodeForTokens.mockRejectedValue(new Error(`ex-fail-${i}`));
+      const db = createOidcRaceDb({
+        providers: [seedProvider({ client_secret_encrypted: secret })],
+      });
+      const env = envFor({ sessions, db });
+      const results = await Promise.all([
+        request(`/auth/oidc/${PROVIDER_ID}/callback?code=a&state=${s1}`, {}, env),
+        request(`/auth/oidc/${PROVIDER_ID}/callback?code=b&state=${s2}`, {}, env),
+      ]);
+      for (const r of results) expect(r.text).toContain('Authentication Failed');
+      expect(sessions.data[`oidc_state:${s1}`]).toBeUndefined();
+      expect(sessions.data[`oidc_state:${s2}`]).toBeUndefined();
     });
   }
 });
