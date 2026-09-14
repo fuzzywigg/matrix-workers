@@ -15,7 +15,10 @@
  *   multi-AS interest → both IDs; room-shaped state_key ≠ room ns;
  *   HTTP 200 + sent_at UPDATE throw → retry; whitespace state_key ' ';
  *   malformed protocols → M_UNKNOWN_TOKEN under race; SERVER_NAME case;
- *   empty sender_localpart → @:SERVER; invalid+good users .some OR allow.
+ *   empty sender_localpart → @:SERVER; invalid+good users .some OR allow;
+ *   optionalAuth ignores AS; wave-2: excludeAsId NaN; first exclusive wins;
+ *   sender+state_key multi-AS; protocols ' '/'' ; users:{}; dup access_token;
+ *   retry_count UPDATE throw; last_row_id 0.
  *
  * Tests-only. Fixtures use example.com / matrix.example.com only.
  * No product inventing. Does not touch auth.ts source (HITL).
@@ -26,11 +29,13 @@ import type { Env } from '../src/types';
 import type { AppServiceRegistration } from '../src/services/appservice';
 import {
   getAppServices,
+  getAppServiceByToken,
   getInterestedAppServices,
   isExclusiveAppServiceAlias,
   isExclusiveAppServiceUser,
   sendAppServiceTransaction,
 } from '../src/services/appservice';
+import { extractAccessToken } from '../src/middleware/auth';
 import { hashToken } from '../src/utils/crypto';
 
 // Real requireAuth/optionalAuth loaded via importActual in auth suites below
@@ -1200,4 +1205,565 @@ describe('race quinary auth after #276 (real requireAuth)', () => {
       });
     }
   });
+
+  describe('protocols whitespace throws under race', () => {
+    for (let i = 0; i < 8; i++) {
+      it(`protocols ' ' → unknown ∥ ''→[] ∥ null→[] flood-${i}`, async () => {
+        const tokWs = `as_proto_ws_${i}`;
+        const tokEmpty = `as_proto_empty_${i}`;
+        const tokNull = `as_proto_null_${i}`;
+        const dbWs = createAuthDb({
+          appservices: new Map([
+            [
+              tokWs,
+              asRow({
+                as_token: tokWs,
+                sender_localpart: 'wsproto',
+                // " " is truthy → JSON.parse(" ") throws → swallowed to unknown
+                protocols: ' ',
+                namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+              }),
+            ],
+          ]),
+        });
+        const dbEmpty = createAuthDb({
+          appservices: new Map([
+            [
+              tokEmpty,
+              asRow({
+                as_token: tokEmpty,
+                sender_localpart: 'emptyproto',
+                // "" is falsy → [] (same as null), not throw
+                protocols: '',
+                namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+              }),
+            ],
+          ]),
+        });
+        const dbNull = createAuthDb({
+          appservices: new Map([
+            [
+              tokNull,
+              asRow({
+                as_token: tokNull,
+                sender_localpart: 'nullproto',
+                protocols: null,
+                namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+              }),
+            ],
+          ]),
+        });
+
+        const wsCtx = makeAuthCtx({
+          db: dbWs,
+          headers: { Authorization: `Bearer ${tokWs}` },
+        });
+        const emptyCtx = makeAuthCtx({
+          db: dbEmpty,
+          headers: { Authorization: `Bearer ${tokEmpty}` },
+        });
+        const nullCtx = makeAuthCtx({
+          db: dbNull,
+          headers: { Authorization: `Bearer ${tokNull}` },
+        });
+
+        const [wsRes, emptyRes, nullRes] = await Promise.all([
+          realRequireAuth()(wsCtx, vi.fn()),
+          realRequireAuth()(emptyCtx, vi.fn(async () => 'empty')),
+          realRequireAuth()(nullCtx, vi.fn(async () => 'ok')),
+        ]);
+
+        expect(await jsonBody(wsRes as Response)).toMatchObject({
+          errcode: 'M_UNKNOWN_TOKEN',
+          status: 401,
+        });
+        expect(emptyRes).toBe('empty');
+        expect(emptyCtx.get('userId')).toBe(`@emptyproto:${AUTH_SERVER}`);
+        expect(nullRes).toBe('ok');
+        expect(nullCtx.get('userId')).toBe(`@nullproto:${AUTH_SERVER}`);
+      });
+    }
+  });
+
+  describe('namespaces.users {} skips gate', () => {
+    for (let i = 0; i < 8; i++) {
+      it(`users:{} allows any local ∥ foreign forbid ∥ array deny flood-${i}`, async () => {
+        const tokObj = `as_users_obj_${i}`;
+        const tokArr = `as_users_arr_${i}`;
+        const dbObj = createAuthDb({
+          appservices: new Map([
+            [
+              tokObj,
+              asRow({
+                as_token: tokObj,
+                sender_localpart: 'objbot',
+                // {}.length is undefined → gate skipped
+                namespaces: JSON.stringify({
+                  users: {},
+                  rooms: [],
+                  aliases: [],
+                }),
+              }),
+            ],
+          ]),
+        });
+        const dbArr = createAuthDb({
+          appservices: new Map([
+            [
+              tokArr,
+              asRow({
+                as_token: tokArr,
+                sender_localpart: 'arrbot',
+                namespaces: JSON.stringify({
+                  users: [
+                    {
+                      exclusive: true,
+                      regex: `@arr_only_.*:${AUTH_SERVER.replace(/\./g, '\\.')}`,
+                    },
+                  ],
+                  rooms: [],
+                  aliases: [],
+                }),
+              }),
+            ],
+          ]),
+        });
+
+        const localAny = `@anyone_${i}:${AUTH_SERVER}`;
+        const foreign = `@anyone_${i}:other.example.com`;
+        const denied = `@anyone_${i}:${AUTH_SERVER}`;
+
+        const [localRes, foreignRes, denyRes] = await Promise.all([
+          realRequireAuth()(
+            makeAuthCtx({
+              db: dbObj,
+              url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent(localAny)}`,
+              headers: { Authorization: `Bearer ${tokObj}` },
+            }),
+            vi.fn(async () => 'local')
+          ),
+          realRequireAuth()(
+            makeAuthCtx({
+              db: dbObj,
+              url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent(foreign)}`,
+              headers: { Authorization: `Bearer ${tokObj}` },
+            }),
+            vi.fn()
+          ),
+          realRequireAuth()(
+            makeAuthCtx({
+              db: dbArr,
+              url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent(denied)}`,
+              headers: { Authorization: `Bearer ${tokArr}` },
+            }),
+            vi.fn()
+          ),
+        ]);
+
+        expect(localRes).toBe('local');
+        expect(await jsonBody(foreignRes as Response)).toMatchObject({
+          errcode: 'M_FORBIDDEN',
+          error: 'Cannot impersonate users on other servers',
+          status: 403,
+        });
+        expect(await jsonBody(denyRes as Response)).toMatchObject({
+          errcode: 'M_FORBIDDEN',
+          error: 'User not in application service namespace',
+          status: 403,
+        });
+      });
+    }
+  });
+
+  describe('duplicate access_token query first-wins', () => {
+    for (let i = 0; i < 8; i++) {
+      it(`good&bad → good ∥ bad&good → unknown under race flood-${i}`, async () => {
+        const good = `syt_dup_good_${i}`;
+        const bad = `syt_dup_bad_${i}`;
+        const goodHash = await hashToken(good);
+        const db = createAuthDb({
+          tokens: new Map([
+            [goodHash, { user_id: `@dup_${i}:${AUTH_SERVER}`, device_id: 'D' }],
+          ]),
+        });
+
+        // URLSearchParams.get returns first value only
+        const goodFirst = makeAuthCtx({
+          db,
+          url: `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(good)}&access_token=${encodeURIComponent(bad)}`,
+        });
+        const badFirst = makeAuthCtx({
+          db,
+          url: `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(bad)}&access_token=${encodeURIComponent(good)}`,
+        });
+
+        expect(
+          extractAccessToken(
+            new Request(
+              `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(good)}&access_token=${encodeURIComponent(bad)}`
+            )
+          )
+        ).toBe(good);
+        expect(
+          extractAccessToken(
+            new Request(
+              `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(bad)}&access_token=${encodeURIComponent(good)}`
+            )
+          )
+        ).toBe(bad);
+
+        const [goodRes, badRes] = await Promise.all([
+          realRequireAuth()(goodFirst, vi.fn(async () => 'good')),
+          realRequireAuth()(badFirst, vi.fn()),
+        ]);
+
+        expect(goodRes).toBe('good');
+        expect(goodFirst.get('userId')).toBe(`@dup_${i}:${AUTH_SERVER}`);
+        expect(await jsonBody(badRes as Response)).toMatchObject({
+          errcode: 'M_UNKNOWN_TOKEN',
+          status: 401,
+        });
+      });
+    }
+  });
+});
+
+// ===========================================================================
+// Quinary deepen wave-2 — appservice NaN / retry-throw / first-wins / cross-axis
+// ===========================================================================
+
+describe('race quinary appservice excludeAsId NaN after #276', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`excludeAsId NaN still matches exclusive user∥alias flood-${i}`, async () => {
+      const bridge = registration('bridge', {
+        users: [{ exclusive: true, regex: `^@_bridge_.*:${AS_ESC}$` }],
+        rooms: [],
+        aliases: [{ exclusive: true, regex: `^#_bridge_.*:${AS_ESC}$` }],
+      });
+      const other = registration('other', {
+        users: [{ exclusive: true, regex: `^@_other_.*:${AS_ESC}$` }],
+        rooms: [],
+        aliases: [{ exclusive: true, regex: `^#_other_.*:${AS_ESC}$` }],
+      });
+      const services = [bridge, other];
+      const uid = `@_bridge_u_${i}:${AS_SERVER}`;
+      const alias = `#_bridge_a_${i}:${AS_SERVER}`;
+      const falsyNan = NaN as unknown as string;
+
+      const [uNan, uBridge, aNan, aBridge] = await Promise.all([
+        Promise.resolve(isExclusiveAppServiceUser(services, uid, falsyNan)),
+        Promise.resolve(isExclusiveAppServiceUser(services, uid, 'bridge')),
+        Promise.resolve(isExclusiveAppServiceAlias(services, alias, falsyNan)),
+        Promise.resolve(isExclusiveAppServiceAlias(services, alias, 'bridge')),
+      ]);
+      expect(uNan?.id).toBe('bridge');
+      expect(uBridge).toBeNull();
+      expect(aNan?.id).toBe('bridge');
+      expect(aBridge).toBeNull();
+    });
+  }
+});
+
+describe('race quinary appservice first exclusive wins under race after #276', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`[first,second] same regex → first ∥ exclude first → second flood-${i}`, async () => {
+      const first = registration('first', {
+        users: [{ exclusive: true, regex: `^@_shared_.*:${AS_ESC}$` }],
+        rooms: [],
+        aliases: [{ exclusive: true, regex: `^#_shared_.*:${AS_ESC}$` }],
+      });
+      const second = registration('second', {
+        users: [{ exclusive: true, regex: `^@_shared_.*:${AS_ESC}$` }],
+        rooms: [],
+        aliases: [{ exclusive: true, regex: `^#_shared_.*:${AS_ESC}$` }],
+      });
+      const services = [first, second];
+      const uid = `@_shared_bot_${i}:${AS_SERVER}`;
+      const alias = `#_shared_room_${i}:${AS_SERVER}`;
+
+      const [uFirst, uExcl, aFirst, aExcl] = await Promise.all([
+        Promise.resolve(isExclusiveAppServiceUser(services, uid)),
+        Promise.resolve(isExclusiveAppServiceUser(services, uid, 'first')),
+        Promise.resolve(isExclusiveAppServiceAlias(services, alias)),
+        Promise.resolve(isExclusiveAppServiceAlias(services, alias, 'first')),
+      ]);
+      expect(uFirst?.id).toBe('first');
+      expect(uExcl?.id).toBe('second');
+      expect(aFirst?.id).toBe('first');
+      expect(aExcl?.id).toBe('second');
+    });
+  }
+});
+
+describe('race quinary appservice cross-axis sender+state_key multi-AS after #276', () => {
+  for (let i = 0; i < 10; i++) {
+    it(`bridge sender + soft state_key → ['bridge','soft'] flood-${i}`, async () => {
+      const bridge = registration('bridge', {
+        users: [{ exclusive: false, regex: `^@_bridge_.*:${AS_ESC}$` }],
+        rooms: [],
+        aliases: [],
+      });
+      const soft = registration('soft', {
+        users: [{ exclusive: false, regex: `^@_soft_.*:${AS_ESC}$` }],
+        rooms: [],
+        aliases: [],
+      });
+      const services = [bridge, soft];
+
+      const [both, senderOnly, skOnly, neither] = await Promise.all([
+        Promise.resolve(
+          getInterestedAppServices(services, {
+            room_id: `!plain_${i}:${AS_SERVER}`,
+            sender: `@_bridge_bot_${i}:${AS_SERVER}`,
+            state_key: `@_soft_ghost_${i}:${AS_SERVER}`,
+            type: 'm.room.member',
+          })
+        ),
+        Promise.resolve(
+          getInterestedAppServices(services, {
+            room_id: `!plain_${i}:${AS_SERVER}`,
+            sender: `@_bridge_bot_${i}:${AS_SERVER}`,
+            state_key: `@alice_${i}:${AS_SERVER}`,
+            type: 'm.room.member',
+          })
+        ),
+        Promise.resolve(
+          getInterestedAppServices(services, {
+            room_id: `!plain_${i}:${AS_SERVER}`,
+            sender: `@alice_${i}:${AS_SERVER}`,
+            state_key: `@_soft_ghost_${i}:${AS_SERVER}`,
+            type: 'm.room.member',
+          })
+        ),
+        Promise.resolve(
+          getInterestedAppServices(services, {
+            room_id: `!plain_${i}:${AS_SERVER}`,
+            sender: `@alice_${i}:${AS_SERVER}`,
+            state_key: `@bob_${i}:${AS_SERVER}`,
+            type: 'm.room.member',
+          })
+        ),
+      ]);
+      expect(both.map((a) => a.id)).toEqual(['bridge', 'soft']);
+      expect(senderOnly.map((a) => a.id)).toEqual(['bridge']);
+      expect(skOnly.map((a) => a.id)).toEqual(['soft']);
+      expect(neither).toEqual([]);
+    });
+  }
+});
+
+describe('race quinary appservice protocols whitespace∥empty list/ByToken after #276', () => {
+  function createAsDb(rows: Map<string, Record<string, unknown>>) {
+    return {
+      prepare(_sql: string) {
+        return {
+          bind(asToken: string) {
+            return {
+              async first<T>() {
+                return (rows.get(asToken) as T) ?? null;
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  function createListDb(rows: Record<string, unknown>[]) {
+    return {
+      prepare(_sql: string) {
+        return {
+          bind(..._args: unknown[]) {
+            return this;
+          },
+          async all<T>() {
+            return { results: rows as T[] };
+          },
+        };
+      },
+    } as unknown as D1Database;
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`protocols ' ' throw ∥ ''→[] ∥ null→[] ByToken∥list flood-${i}`, async () => {
+      const tokWs = `tok-ws-${i}`;
+      const tokEmpty = `tok-empty-${i}`;
+      const tokNull = `tok-null-${i}`;
+      const wsRow = {
+        id: `ws_${i}`,
+        url: 'https://ws.example.com',
+        as_token: tokWs,
+        hs_token: 'hs',
+        sender_localpart: 'bot',
+        rate_limited: 0,
+        protocols: ' ',
+        namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+      };
+      const emptyRow = {
+        id: `empty_${i}`,
+        url: 'https://empty.example.com',
+        as_token: tokEmpty,
+        hs_token: 'hs',
+        sender_localpart: 'bot',
+        rate_limited: 0,
+        protocols: '',
+        namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+      };
+      const nullRow = {
+        id: `null_${i}`,
+        url: 'https://null.example.com',
+        as_token: tokNull,
+        hs_token: 'hs',
+        sender_localpart: 'bot',
+        rate_limited: 0,
+        protocols: null,
+        namespaces: JSON.stringify({ users: [], rooms: [], aliases: [] }),
+      };
+
+      const [byWs, byEmpty, byNull, listWs, listEmpty, listNull] = await Promise.all([
+        Promise.resolve()
+          .then(() => getAppServiceByToken(createAsDb(new Map([[tokWs, wsRow]])), tokWs))
+          .then((v) => ({ ok: true as const, v }))
+          .catch((e) => ({ ok: false as const, err: e })),
+        getAppServiceByToken(createAsDb(new Map([[tokEmpty, emptyRow]])), tokEmpty),
+        getAppServiceByToken(createAsDb(new Map([[tokNull, nullRow]])), tokNull),
+        Promise.resolve()
+          .then(() => getAppServices(createListDb([wsRow])))
+          .then((v) => ({ ok: true as const, v }))
+          .catch((e) => ({ ok: false as const, err: e })),
+        getAppServices(createListDb([emptyRow])),
+        getAppServices(createListDb([nullRow])),
+      ]);
+
+      expect(byWs.ok).toBe(false);
+      expect(byEmpty).toMatchObject({ id: `empty_${i}`, protocols: [] });
+      expect(byNull).toMatchObject({ id: `null_${i}`, protocols: [] });
+      expect(listWs.ok).toBe(false);
+      expect(listEmpty[0]).toMatchObject({ id: `empty_${i}`, protocols: [] });
+      expect(listNull[0]).toMatchObject({ id: `null_${i}`, protocols: [] });
+    });
+  }
+});
+
+describe('race quinary appservice retry_count UPDATE throw after #276', () => {
+  const NOW = 1_700_000_200_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: NOW });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('{}', { status: 200 }))
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  function createTxnDb(opts: { throwOnRetry?: boolean; startRowId?: number } = {}) {
+    const inserts: Array<{ appservice_id: string; events: string; created_at: number }> = [];
+    const updates: Array<{ kind: 'sent' | 'retry'; args: unknown[] }> = [];
+    let nextRowId = opts.startRowId ?? 100;
+
+    const db = {
+      inserts,
+      updates,
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async run() {
+                if (sql.includes('INSERT INTO appservice_transactions')) {
+                  const [appservice_id, events, created_at] = args as [string, string, number];
+                  inserts.push({ appservice_id, events, created_at });
+                  return { meta: { last_row_id: nextRowId++ } };
+                }
+                if (sql.includes('SET sent_at')) {
+                  updates.push({ kind: 'sent', args });
+                  return { meta: { changes: 1 } };
+                }
+                if (sql.includes('retry_count')) {
+                  if (opts.throwOnRetry) {
+                    throw new Error('retry_count update failed');
+                  }
+                  updates.push({ kind: 'retry', args });
+                  return { meta: { changes: 1 } };
+                }
+                return { meta: { changes: 0 } };
+              },
+            };
+          },
+        };
+      },
+    };
+
+    return db as unknown as D1Database & {
+      inserts: typeof inserts;
+      updates: typeof updates;
+    };
+  }
+
+  for (let i = 0; i < 10; i++) {
+    it(`500 + retry throw rejects ∥ sibling 200 sent_at ok flood-${i}`, async () => {
+      const failDb = createTxnDb({ throwOnRetry: true });
+      const okDb = createTxnDb();
+      // Distinct URLs so fetch mock is race-safe under Promise.all
+      const failAs = registration(
+        'fail',
+        { users: [], rooms: [], aliases: [] },
+        { url: 'https://fail.example.com' }
+      );
+      const okAs = registration(
+        'ok',
+        { users: [], rooms: [], aliases: [] },
+        { url: 'https://ok.example.com' }
+      );
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => {
+          if (String(url).includes('fail.example.com')) {
+            return new Response('boom', { status: 500 });
+          }
+          return new Response('{}', { status: 200 });
+        })
+      );
+
+      const [failed, ok] = await Promise.all([
+        Promise.resolve()
+          .then(() =>
+            sendAppServiceTransaction(failDb, failAs, [{ type: 'm.room.message', n: i }])
+          )
+          .then((v) => ({ ok: true as const, v }))
+          .catch((e) => ({ ok: false as const, err: e })),
+        sendAppServiceTransaction(okDb, okAs, [{ type: 'm.room.message', n: i }]),
+      ]);
+
+      // retry_count UPDATE is outside try — throw propagates (unlike sent_at)
+      expect(failed.ok).toBe(false);
+      expect(ok).toBe(true);
+      expect(failDb.updates.some((u) => u.kind === 'sent')).toBe(false);
+      expect(okDb.updates).toEqual([{ kind: 'sent', args: [NOW, 100] }]);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`last_row_id 0 → …/transactions/0 under parallel flood-${i}`, async () => {
+      const db = createTxnDb({ startRowId: 0 });
+      const bridge = registration('bridge', { users: [], rooms: [], aliases: [] });
+      (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+        new Response('{}', { status: 200 })
+      );
+
+      const ok = await sendAppServiceTransaction(db, bridge, [
+        { type: 'm.room.message', n: i },
+      ]);
+      expect(ok).toBe(true);
+      const calledUrl = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+      expect(calledUrl).toBe(
+        'https://bridge.example.com/_matrix/app/v1/transactions/0'
+      );
+      expect(db.updates).toEqual([{ kind: 'sent', args: [NOW, 0] }]);
+    });
+  }
 });
