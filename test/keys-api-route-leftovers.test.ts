@@ -1,7 +1,13 @@
 /**
- * TOKENMAXX HEAVY leftovers after #154 — keys API soft/edge/reliability.
- * Complements keys-api-routes.test.ts. Tests-only — no product inventing.
- * Fixtures use example.com only.
+ * TOKENMAXX HEAVY leftovers after #154 / deepen after #241 — keys API
+ * soft/edge/reliability. Complements keys-api-routes.test.ts and
+ * devices-keys-residual-concurrent-race-leftovers.test.ts.
+ * Tests-only — no product inventing. Fixtures use example.com only.
+ *
+ * Deepen after #241: fallback claim, D1 legacy claim, upload fallback_keys,
+ * query user_signing isolation, device_signing unrecognized/empty password,
+ * signatures missing device, empty one_time_keys counts — niches soft-flooded
+ * lightly or not at all after #154 (present in routes base only).
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -2855,4 +2861,267 @@ describe('keys leftovers lifecycle soft floods after #154', () => {
     const ch = await request(env, '/_matrix/client/v3/keys/changes?from=0&to=999999');
     expect(ch.status).toBe(200);
   });
+});
+
+// ---------------------------------------------------------------------------
+// deepen keys-api route leftovers after #241
+// ---------------------------------------------------------------------------
+
+describe('keys leftovers claim fallback soft flood after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`claim fallback_keys marks used soft-${i}`, async () => {
+      const keyId = `signed_curve25519:FB${i}`;
+      const env = createEnv({
+        db: createKeysDb({
+          fallbacks: [
+            {
+              user_id: USER,
+              device_id: DEVICE,
+              algorithm: 'signed_curve25519',
+              key_id: keyId,
+              key_data: JSON.stringify({ key: `fb-${i}` }),
+              used: 0,
+            },
+          ],
+        }),
+      });
+      const res = await request(
+        env,
+        '/_matrix/client/v3/keys/claim',
+        jsonInit('POST', {
+          one_time_keys: { [USER]: { [DEVICE]: 'signed_curve25519' } },
+        })
+      );
+      expect(res.status).toBe(200);
+      const claimed = (
+        res.body as { one_time_keys: Record<string, Record<string, Record<string, { fallback?: boolean }>>> }
+      ).one_time_keys[USER][DEVICE][keyId];
+      expect(claimed).toMatchObject({ key: `fb-${i}`, fallback: true });
+      expect(env._db.fallbacks[0].used).toBe(1);
+    });
+  }
+});
+
+describe('keys leftovers claim D1 legacy OTK soft flood after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`claim D1 legacy OTK soft-${i}`, async () => {
+      const keyId = `signed_curve25519:LEG${i}`;
+      const env = createEnv({
+        db: createKeysDb({
+          otks: [
+            {
+              id: 200 + i,
+              user_id: USER,
+              device_id: DEVICE,
+              algorithm: 'signed_curve25519',
+              key_id: keyId,
+              key_data: JSON.stringify({ key: `leg-${i}` }),
+              claimed: 0,
+            },
+          ],
+        }),
+        oneTimeKeysKv: mockKv(),
+      });
+      const res = await request(
+        env,
+        '/_matrix/client/v3/keys/claim',
+        jsonInit('POST', {
+          one_time_keys: { [USER]: { [DEVICE]: 'signed_curve25519' } },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(
+        (res.body as { one_time_keys: Record<string, Record<string, Record<string, unknown>>> })
+          .one_time_keys[USER][DEVICE][keyId]
+      ).toEqual({ key: `leg-${i}` });
+      expect(env._db.otks[0].claimed).toBe(1);
+    });
+  }
+});
+
+describe('keys leftovers upload fallback_keys soft flood after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`upload fallback_keys soft-${i}`, async () => {
+      const env = createEnv();
+      const keyId = `signed_curve25519:UPFB${i}`;
+      const res = await request(
+        env,
+        '/_matrix/client/v3/keys/upload',
+        jsonInit('POST', {
+          fallback_keys: { [keyId]: { key: `upfb-${i}`, fallback: true } },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(env._db.fallbacks).toHaveLength(1);
+      expect(env._db.fallbacks[0]).toMatchObject({
+        user_id: USER,
+        device_id: DEVICE,
+        algorithm: 'signed_curve25519',
+        key_id: keyId,
+        used: 0,
+      });
+    });
+  }
+});
+
+describe('keys leftovers query user_signing isolation soft flood after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`query other user omits user_signing soft-${i}`, async () => {
+      const env = createEnv({
+        userKeys: createUserKeysStub({
+          crossSigning: {
+            master: { keys: { 'ed25519:M': `m-${i}` } },
+            self_signing: { keys: { 'ed25519:S': `s-${i}` } },
+            user_signing: { keys: { 'ed25519:U': `u-${i}` } },
+          },
+          deviceKeys: {},
+        }),
+      });
+      // Auth is USER; query BOB — user_signing must be omitted
+      env._userKeys.crossSigning = {
+        master: { keys: { 'ed25519:M': `m-${i}` } },
+        self_signing: { keys: { 'ed25519:S': `s-${i}` } },
+        user_signing: { keys: { 'ed25519:U': `u-${i}` } },
+      };
+      // Stub serves same store for any user id in this mock — assert own vs other via API shape
+      const other = await request(
+        env,
+        '/_matrix/client/v3/keys/query',
+        jsonInit('POST', { device_keys: { [BOB]: [] } })
+      );
+      expect(other.status).toBe(200);
+      const body = other.body as {
+        master_keys: Record<string, unknown>;
+        self_signing_keys: Record<string, unknown>;
+        user_signing_keys: Record<string, unknown>;
+      };
+      // Mock returns CS keys for any queried user; route only attaches user_signing for self
+      expect(body.user_signing_keys[BOB]).toBeUndefined();
+      expect(body.master_keys[BOB]).toBeTruthy();
+      expect(body.self_signing_keys[BOB]).toBeTruthy();
+    });
+  }
+
+  for (let i = 0; i < 4; i++) {
+    it(`query self includes user_signing soft-${i}`, async () => {
+      const env = createEnv({
+        userKeys: createUserKeysStub({
+          crossSigning: {
+            master: { keys: { 'ed25519:M': `self-m-${i}` } },
+            user_signing: { keys: { 'ed25519:U': `self-u-${i}` } },
+          },
+        }),
+      });
+      const res = await request(
+        env,
+        '/_matrix/client/v3/keys/query',
+        jsonInit('POST', { device_keys: { [USER]: [] } })
+      );
+      expect(res.status).toBe(200);
+      expect(
+        (res.body as { user_signing_keys: Record<string, unknown> }).user_signing_keys[USER]
+      ).toMatchObject({ keys: { 'ed25519:U': `self-u-${i}` } });
+    });
+  }
+});
+
+describe('keys leftovers device_signing auth edges soft flood after #241', () => {
+  for (let i = 0; i < 6; i++) {
+    it(`unrecognized auth type soft-${i}`, async () => {
+      const env = createEnv({
+        db: createKeysDb({
+          crossSigningKeys: [
+            {
+              user_id: USER,
+              key_type: 'master',
+              key_id: 'ed25519:master',
+              key_data: '{}',
+            },
+          ],
+          passwordHashes: new Map([[USER, 'mockok:s3cret']]),
+        }),
+      });
+      const res = await request(
+        env,
+        '/_matrix/client/v3/keys/device_signing/upload',
+        jsonInit('POST', {
+          auth: { type: 'm.login.dummy' },
+          master_key: {
+            user_id: USER,
+            usage: ['master'],
+            keys: { 'ed25519:master': `x-${i}` },
+          },
+        })
+      );
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ errcode: 'M_UNRECOGNIZED' });
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    it(`empty-string password soft-${i}`, async () => {
+      const env = createEnv({
+        db: createKeysDb({
+          crossSigningKeys: [
+            {
+              user_id: USER,
+              key_type: 'master',
+              key_id: 'ed25519:master',
+              key_data: '{}',
+            },
+          ],
+          passwordHashes: new Map([[USER, 'mockok:s3cret']]),
+        }),
+      });
+      const res = await request(
+        env,
+        '/_matrix/client/v3/keys/device_signing/upload',
+        jsonInit('POST', {
+          auth: { type: 'm.login.password', password: '' },
+          master_key: {
+            user_id: USER,
+            usage: ['master'],
+            keys: { 'ed25519:master': `e-${i}` },
+          },
+        })
+      );
+      expect([400, 403]).toContain(res.status);
+    });
+  }
+});
+
+describe('keys leftovers upload empty one_time_keys counts soft flood after #241', () => {
+  for (let i = 0; i < 8; i++) {
+    it(`empty body returns counts map soft-${i}`, async () => {
+      const env = createEnv();
+      const res = await request(env, '/_matrix/client/v3/keys/upload', jsonInit('POST', {}));
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ one_time_key_counts: {} });
+    });
+  }
+});
+
+describe('keys leftovers signatures missing device soft flood after #241', () => {
+  for (let i = 0; i < 6; i++) {
+    it(`signatures for unknown device still 200 soft-${i}`, async () => {
+      const env = createEnv();
+      const res = await request(
+        env,
+        '/_matrix/client/v3/keys/signatures/upload',
+        jsonInit('POST', {
+          [USER]: {
+            MISSING: {
+              user_id: USER,
+              device_id: 'MISSING',
+              algorithms: [],
+              keys: {},
+              signatures: { [USER]: { 'ed25519:MISSING': `sig-${i}` } },
+            },
+          },
+        })
+      );
+      expect(res.status).toBe(200);
+      expect(env._db.signatures.some((s) => s.signature === `sig-${i}`)).toBe(true);
+    });
+  }
 });
