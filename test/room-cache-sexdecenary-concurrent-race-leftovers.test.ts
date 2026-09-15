@@ -1,5 +1,5 @@
 /**
- * TOKENMAXX HEAVY leftovers after #332 quindecenary / tip #336 — sexdecenary
+ * TOKENMAXX HEAVY leftovers after #332 quindecenary / tip #342 — sexdecenary
  * room-cache *concurrent race / TOCTOU* niches not landed by quindecenary:
  *   - joinedRaw EPSILON isDm∥MAX_VALUE non-DM∥invitedRaw "0" stays
  *   - name null→isDm∥avatar url:-1∥avatar url:1 under miss
