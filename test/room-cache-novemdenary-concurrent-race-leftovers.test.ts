@@ -603,15 +603,22 @@ describe('race novemdenary getBatch getThrow∥putHold∥inv deleteThrow after #
       // StaleC remains because delete threw before removing
       expect(ctl.data[metaKey(ROOM_C)]).toBeDefined();
 
-      releasePut(metaKey(ROOM_B));
+      // getBatch returns before fire-and-forget put settles
       const map = await batchP;
       expect(map.get(ROOM_A)?.name).toBe('FreshA');
       expect(map.get(ROOM_B)?.name).toBe('FreshB');
       // C was hot at cache-check time (before/despite failed delete)
       expect(map.get(ROOM_C)?.name).toBe('StaleC');
       expect(db.batchCalls).toBe(2);
-      expect(JSON.parse(ctl.data[metaKey(ROOM_B)]).name).toBe('FreshB');
+      // B put still held — key not written yet
+      expect(ctl.data[metaKey(ROOM_B)]).toBeUndefined();
       expect(ctl.putTtl.get(metaKey(ROOM_B))).toBe(TTL_SECONDS);
+
+      releasePut(metaKey(ROOM_B));
+      await vi.waitFor(() => {
+        expect(ctl.data[metaKey(ROOM_B)]).toBeDefined();
+      });
+      expect(JSON.parse(ctl.data[metaKey(ROOM_B)]).name).toBe('FreshB');
     });
   }
 });
