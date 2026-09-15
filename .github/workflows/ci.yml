@@ -99,7 +99,8 @@ jobs:
 
   # Fail-fast canary for turn concurrent-race leftovers
   # (first-wave #299 + second-wave #313 + third-wave #333 + fourth-wave
-  # deepen). Isolates flake attribution before the full vitest suite.
+  # #349 + fifth-wave deepen). Isolates flake attribution before the full
+  # vitest suite.
   turn-concurrent:
     name: Turn Concurrent Race Canary
     runs-on: ubuntu-latest
