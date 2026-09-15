@@ -4167,3 +4167,343 @@ describe('RoomDurableObject hibernation sexdecenary receipt/ws leftovers after #
     });
   }
 });
+
+/**
+ * TOKENMAXX HEAVY leftovers after #353 / tip c8c1af7 (#364/#366) —
+ * RoomDurableObject hibernation *septendecenary* relaunch of closed #370
+ * (timeout ""→0 / "-5" past / "60000" stays, Upgrade "WebSocket " trailing
+ * 426∥ping, GET /receipts∥HTTP receipt, WS read∥HTTP typing, webSocketError∥
+ * HTTP receipt, broadcast∥WS close, receipt thread∥HTTP typing, JSON
+ * "\"x\""/1.5 silent∥HTTP). Sexdecenary stopped at JSON true/0/{}.
+ */
+
+describe('RoomDurableObject hibernation septendecenary typing/upgrade leftovers after #353', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`typing timeout ""→0∥"-5" past∥"60000" stays∥peer flood-${i}`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(330_000);
+      const { do: room } = makeRacingRoomDo();
+
+      // "" → Math.min("",120000)=0 → already expired at GET
+      await room.fetch(
+        new Request('https://do/typing', {
+          method: 'PUT',
+          body: JSON.stringify({
+            user_id: '@empty:example.com',
+            typing: true,
+            timeout: '',
+          }),
+        })
+      );
+      const emptyTyping = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(emptyTyping.user_ids).toEqual([]);
+
+      // "-5" → Math.min("-5",120000)=-5 → expiresAt in the past
+      await room.fetch(
+        new Request('https://do/typing', {
+          method: 'PUT',
+          body: JSON.stringify({
+            user_id: '@neg:example.com',
+            typing: true,
+            timeout: '-5',
+          }),
+        })
+      );
+      const negTyping = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(negTyping.user_ids).toEqual([]);
+
+      // "60000" → Math.min("60000",120000)=60000 → still active
+      await room.fetch(
+        new Request('https://do/typing', {
+          method: 'PUT',
+          body: JSON.stringify({
+            user_id: '@str60:example.com',
+            typing: true,
+            timeout: '60000',
+          }),
+        })
+      );
+
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              typing: true,
+              timeout: 30_000,
+            }),
+          })
+        ),
+        room.fetch(new Request('https://do/typing')),
+      ]);
+
+      const typing = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(typing.user_ids).toContain('@str60:example.com');
+      expect(typing.user_ids).toContain('@a:example.com');
+      expect(typing.user_ids).not.toContain('@empty:example.com');
+      expect(typing.user_ids).not.toContain('@neg:example.com');
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`Upgrade "WebSocket " trailing 426∥WS ping isolation flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      state.sockets.push(a);
+
+      const [bad] = await Promise.all([
+        room.fetch(
+          new Request('https://do/websocket', { headers: { Upgrade: 'WebSocket ' } })
+        ),
+        wsMsg(room, a, JSON.stringify({ type: 'ping' })),
+      ]);
+      expect(bad.status).toBe(426);
+      expect(await bad.text()).toBe('Expected websocket upgrade');
+      expect(a.sent).toContain(JSON.stringify({ type: 'pong' }));
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`GET /receipts∥HTTP receipt peer isolation flood-${i}`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(340_000);
+      const { state, do: room } = makeRacingRoomDo();
+
+      const [receiptsRes] = await Promise.all([
+        room.fetch(new Request('https://do/receipts')),
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@b:example.com',
+              event_id: '$s17-rcpt',
+              receipt_type: 'm.read',
+            }),
+          })
+        ),
+      ]);
+      expect(receiptsRes.status).toBe(200);
+      const body = (await receiptsRes.json()) as {
+        receipts: Record<string, unknown>;
+      };
+      expect(body).toHaveProperty('receipts');
+      expect(state.storage.map.has('receipt:@b:example.com:m.read:unthreaded')).toBe(true);
+    });
+  }
+});
+
+describe('RoomDurableObject hibernation septendecenary receipt/ws leftovers after #353', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`WS read∥HTTP typing both visible flood-${i}`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(350_000);
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      state.sockets.push(a, b);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify({ type: 'read', event_id: '$s17-read' })),
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@c:example.com',
+              typing: true,
+              timeout: 5_000,
+            }),
+          })
+        ),
+      ]);
+
+      expect(state.storage.map.has('receipt:@a:example.com:m.read:unthreaded')).toBe(true);
+      expect(
+        a.sent.some((s) => {
+          const m = JSON.parse(s) as { type: string; user_id?: string };
+          return m.type === 'typing' && m.user_id === '@c:example.com';
+        })
+      ).toBe(true);
+      const typing = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(typing.user_ids).toEqual(['@c:example.com']);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`webSocketError∥HTTP receipt peer isolation flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      state.sockets.push(a, b);
+      (
+        room as unknown as { sessions: Map<FakeWebSocket, { userId: string }> }
+      ).sessions.set(a, { userId: '@a:example.com' });
+      (
+        room as unknown as { sessions: Map<FakeWebSocket, { userId: string }> }
+      ).sessions.set(b, { userId: '@b:example.com' });
+
+      await Promise.all([
+        wsError(room, a, new Error('s17-err')),
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@c:example.com',
+              event_id: '$s17-err-rcpt',
+              receipt_type: 'm.read',
+            }),
+          })
+        ),
+      ]);
+
+      expect(
+        (room as unknown as { sessions: Map<FakeWebSocket, unknown> }).sessions.has(a)
+      ).toBe(false);
+      expect(
+        (room as unknown as { sessions: Map<FakeWebSocket, unknown> }).sessions.has(b)
+      ).toBe(true);
+      expect(state.storage.map.has('receipt:@c:example.com:m.read:unthreaded')).toBe(true);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`broadcast∥webSocketClose both settle flood-${i}`, async () => {
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      const b = new FakeWebSocket();
+      b.serializeAttachment({ userId: '@b:example.com', id: '2' });
+      state.sockets.push(a, b);
+      (
+        room as unknown as { sessions: Map<FakeWebSocket, { userId: string }> }
+      ).sessions.set(a, { userId: '@a:example.com' });
+      (
+        room as unknown as { sessions: Map<FakeWebSocket, { userId: string }> }
+      ).sessions.set(b, { userId: '@b:example.com' });
+
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/broadcast', {
+            method: 'POST',
+            body: JSON.stringify({ type: 'custom', n: i }),
+          })
+        ),
+        wsClose(room, a),
+      ]);
+
+      expect(
+        (room as unknown as { sessions: Map<FakeWebSocket, unknown> }).sessions.has(a)
+      ).toBe(false);
+      expect(
+        (room as unknown as { sessions: Map<FakeWebSocket, unknown> }).sessions.has(b)
+      ).toBe(true);
+      // b should see broadcast and/or disconnect notice
+      expect(b.sent.length).toBeGreaterThan(0);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`receipt thread PUT∥HTTP typing both settle flood-${i}`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(360_000);
+      const { state, do: room } = makeRacingRoomDo();
+
+      await Promise.all([
+        room.fetch(
+          new Request('https://do/receipt', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@a:example.com',
+              event_id: '$s17-thr',
+              receipt_type: 'm.read',
+              thread_id: '$root17',
+            }),
+          })
+        ),
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@b:example.com',
+              typing: true,
+              timeout: 5_000,
+            }),
+          })
+        ),
+      ]);
+
+      expect(state.storage.map.has('receipt:@a:example.com:m.read:$root17')).toBe(true);
+      const threaded = state.storage.map.get('receipt:@a:example.com:m.read:$root17') as {
+        event_id: string;
+      };
+      expect(threaded.event_id).toBe('$s17-thr');
+      const typing = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(typing.user_ids).toEqual(['@b:example.com']);
+    });
+  }
+
+  for (let i = 0; i < 8; i++) {
+    it(`JSON "\\"x\\""/1.5 WS silent∥HTTP typing flood-${i}`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(370_000);
+      const { state, do: room } = makeRacingRoomDo();
+      const a = new FakeWebSocket();
+      a.serializeAttachment({ userId: '@a:example.com', id: '1' });
+      state.sockets.push(a);
+
+      await Promise.all([
+        wsMsg(room, a, JSON.stringify('x')),
+        wsMsg(room, a, JSON.stringify(1.5)),
+        room.fetch(
+          new Request('https://do/typing', {
+            method: 'PUT',
+            body: JSON.stringify({
+              user_id: '@b:example.com',
+              typing: true,
+              timeout: 5_000,
+            }),
+          })
+        ),
+      ]);
+
+      // string/number: truthy data but no .type → default silent
+      expect(
+        a.sent.every((s) => {
+          const m = JSON.parse(s) as { type: string };
+          return m.type === 'typing';
+        })
+      ).toBe(true);
+      const typing = (await (await room.fetch(new Request('https://do/typing'))).json()) as {
+        user_ids: string[];
+      };
+      expect(typing.user_ids).toEqual(['@b:example.com']);
+    });
+  }
+});
