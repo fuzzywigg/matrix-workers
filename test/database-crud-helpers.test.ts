@@ -5325,3 +5325,215 @@ describe('database CRUD TOKENMAXX residual denary leftovers after #380', () => {
     });
   });
 });
+
+describe('database CRUD TOKENMAXX residual undecenary leftovers after #395', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('getPasswordHash missing ∥ createUser: hash null or settled under race', async () => {
+    const db = createCrudDb();
+    const [hash] = await Promise.all([
+      getPasswordHash(db, USER),
+      createUser(db, USER, 'alice', 'pbkdf2-undecenary', false),
+    ]);
+    expect(hash === null || hash === 'pbkdf2-undecenary').toBe(true);
+    await expect(getPasswordHash(db, USER)).resolves.toBe('pbkdf2-undecenary');
+    await expect(getUserByLocalpart(db, 'alice')).resolves.toMatchObject({
+      user_id: USER,
+    });
+  });
+
+  it('deleteRoomAlias ∥ getRoomByAlias: lookup sees room or null under race', async () => {
+    const db = createCrudDb({
+      aliases: [
+        {
+          alias: '#und:example.com',
+          room_id: ROOM,
+          creator_id: USER,
+          created_at: NOW,
+        },
+      ],
+    });
+    const [got] = await Promise.all([
+      getRoomByAlias(db, '#und:example.com'),
+      deleteRoomAlias(db, '#und:example.com'),
+    ]);
+    expect(got === null || got === ROOM).toBe(true);
+    await expect(getRoomByAlias(db, '#und:example.com')).resolves.toBeNull();
+  });
+
+  it('getRoomEvents(b) ∥ storeEvent: page length old or includes new only', async () => {
+    const a = pdu({ event_id: '$a-und', type: 'm.room.message', content: { body: 'a' } });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(a, 1)],
+      streamPosition: 1,
+    });
+    const neu = pdu({ event_id: '$b-und', type: 'm.room.message', content: { body: 'b' } });
+    const [page, stream] = await Promise.all([
+      getRoomEvents(db, ROOM, undefined, 10, 'b'),
+      storeEvent(db, neu),
+    ]);
+    expect(stream).toBe(2);
+    expect(page.events.length).toBeGreaterThanOrEqual(1);
+    expect(page.events.length).toBeLessThanOrEqual(2);
+    expect(
+      page.events.every((e) => e.event_id === '$a-und' || e.event_id === '$b-und')
+    ).toBe(true);
+    await expect(getEvent(db, '$b-und')).resolves.toMatchObject({ event_id: '$b-und' });
+  });
+
+  it('getUserRooms(invite) ∥ updateMembership invite→join: page sees room or empty', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'invite',
+          event_id: '$invite',
+          display_name: 'Alice',
+          avatar_url: null,
+        },
+      ],
+    });
+    const [rooms] = await Promise.all([
+      getUserRooms(db, USER, 'invite'),
+      updateMembership(db, ROOM, USER, 'join', '$join-und'),
+    ]);
+    expect(rooms.length).toBeLessThanOrEqual(1);
+    expect(rooms.every((r) => r === ROOM)).toBe(true);
+    await expect(getUserRooms(db, USER, 'invite')).resolves.toEqual([]);
+    await expect(getUserRooms(db, USER, 'join')).resolves.toEqual([ROOM]);
+  });
+
+  it('createAccessToken ∥ getUserByTokenHash missing: read sees null or token', async () => {
+    const db = createCrudDb();
+    const [got] = await Promise.all([
+      getUserByTokenHash(db, 'hash-undecenary'),
+      createAccessToken(db, 'tid-und', 'hash-undecenary', USER, 'DEV-UND'),
+    ]);
+    expect(got === null || got?.userId === USER).toBe(true);
+    await expect(getUserByTokenHash(db, 'hash-undecenary')).resolves.toEqual({
+      userId: USER,
+      deviceId: 'DEV-UND',
+    });
+  });
+
+  it('updateUserProfile display-only ∥ getUserById: avatar stays; display old or new', async () => {
+    const db = createCrudDb({
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: 'Alice',
+          avatar_url: 'mxc://example.com/av',
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+    });
+    const [got] = await Promise.all([
+      getUserById(db, USER),
+      updateUserProfile(db, USER, 'Alice Undecenary', undefined),
+    ]);
+    expect(got).not.toBeNull();
+    expect(got!.avatar_url).toBe('mxc://example.com/av');
+    expect(['Alice', 'Alice Undecenary']).toContain(got!.display_name);
+    await expect(getUserById(db, USER)).resolves.toMatchObject({
+      display_name: 'Alice Undecenary',
+      avatar_url: 'mxc://example.com/av',
+    });
+  });
+
+  it('getEventsSince ∥ storeEventIdempotent duplicate: page/idempotent stay coherent', async () => {
+    const seed = pdu({ event_id: '$seed-und', type: 'm.room.message', content: { body: 's' } });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(seed, 3)],
+      streamPosition: 3,
+    });
+    const dup = pdu({ event_id: '$seed-und', type: 'm.room.message', content: { body: 's' } });
+    const [page, insert] = await Promise.all([
+      getEventsSince(db, ROOM, 3, 10),
+      storeEventIdempotent(db, dup),
+    ]);
+    expect(insert.inserted).toBe(false);
+    expect(page).toEqual([]);
+    await expect(getLatestStreamPosition(db)).resolves.toBe(3);
+    await expect(getEvent(db, '$seed-und')).resolves.toMatchObject({ event_id: '$seed-und' });
+  });
+
+  it('tryInsertJoinMembership invite→join ∥ getRoomMembers(join): filter old or new', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'invite',
+          event_id: '$invite',
+          display_name: 'Alice',
+          avatar_url: null,
+        },
+      ],
+    });
+    const [joined, upgrade] = await Promise.all([
+      getRoomMembers(db, ROOM, 'join'),
+      tryInsertJoinMembership(db, ROOM, USER, '$join-und', 'Alice'),
+    ]);
+    expect(upgrade.inserted).toBe(true);
+    expect(upgrade.eventId).toBe('$join-und');
+    expect(joined.length).toBeLessThanOrEqual(1);
+    expect(joined.every((m) => m.membership === 'join')).toBe(true);
+    await expect(getRoomMembers(db, ROOM, 'join')).resolves.toEqual([
+      {
+        userId: USER,
+        membership: 'join',
+        displayName: 'Alice',
+        avatarUrl: undefined,
+      },
+    ]);
+    await expect(getMembership(db, ROOM, USER)).resolves.toEqual({
+      membership: 'join',
+      eventId: '$join-und',
+    });
+  });
+
+  it('getDevice ∥ deleteDevice: read sees device or null; sibling KEEP untouched', async () => {
+    const db = createCrudDb({
+      devices: [
+        {
+          user_id: USER,
+          device_id: 'KEEP',
+          display_name: 'Laptop',
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: NOW,
+        },
+        {
+          user_id: USER,
+          device_id: 'DROP',
+          display_name: 'Phone',
+          last_seen_ts: null,
+          last_seen_ip: null,
+          created_at: NOW,
+        },
+      ],
+    });
+    const [got] = await Promise.all([
+      getDevice(db, USER, 'DROP'),
+      deleteDevice(db, USER, 'DROP'),
+    ]);
+    expect(got === null || got?.device_id === 'DROP').toBe(true);
+    await expect(getDevice(db, USER, 'DROP')).resolves.toBeNull();
+    await expect(getDevice(db, USER, 'KEEP')).resolves.toMatchObject({
+      device_id: 'KEEP',
+      display_name: 'Laptop',
+    });
+  });
+});
