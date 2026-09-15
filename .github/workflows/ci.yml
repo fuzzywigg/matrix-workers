@@ -129,7 +129,8 @@ jobs:
 
   # Fail-fast canary for room-cache concurrent leftovers
   # (tridecenary #314 + quattuordecenary #325 + quindecenary #332 +
-  # sexdecenary deepen). Isolates flake attribution before the full suite.
+  # sexdecenary #353 + octodenary deepen). Isolates flake attribution
+  # before the full suite.
   room-cache:
     name: Room-Cache Concurrent Canary
     runs-on: ubuntu-latest
