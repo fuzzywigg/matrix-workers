@@ -54,6 +54,9 @@ jobs:
       - run: npm run test:media-presence-soft-concurrent
 
   # Focused gate for crypto + database residual coverage (fast signal vs full suite).
+  # Covers base + residual waves through octonary/senary #336 and nonary/septenary
+  # tip-relaunch after #342 (crypto/federation signing, CRUD TOCTOU, notify/auth-chain,
+  # validateEventSize, errors).
   crypto-db:
     name: Crypto + DB residual tests
     runs-on: ubuntu-latest

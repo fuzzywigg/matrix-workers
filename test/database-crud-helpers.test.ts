@@ -4670,3 +4670,222 @@ describe('database CRUD TOKENMAXX residual senary leftovers after #330', () => {
     }
   });
 });
+
+describe('database CRUD TOKENMAXX residual septenary leftovers after #336 / tip post #342', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('getUserById missing ∥ createUser: read sees null or user under race', async () => {
+    const db = createCrudDb();
+    const [got] = await Promise.all([
+      getUserById(db, USER),
+      createUser(db, USER, 'alice', 'pbkdf2-alice', false),
+    ]);
+    expect(got === null || got?.user_id === USER).toBe(true);
+    await expect(getUserById(db, USER)).resolves.toMatchObject({
+      user_id: USER,
+      localpart: 'alice',
+      is_guest: false,
+    });
+    await expect(getPasswordHash(db, USER)).resolves.toBe('pbkdf2-alice');
+  });
+
+  it('getDevice missing ∥ createDevice: read sees null or device under race', async () => {
+    const db = createCrudDb();
+    const [got] = await Promise.all([
+      getDevice(db, USER, 'DEV-NEW'),
+      createDevice(db, USER, 'DEV-NEW', 'Phone'),
+    ]);
+    expect(got === null || got?.device_id === 'DEV-NEW').toBe(true);
+    await expect(getDevice(db, USER, 'DEV-NEW')).resolves.toMatchObject({
+      user_id: USER,
+      device_id: 'DEV-NEW',
+      display_name: 'Phone',
+    });
+  });
+
+  it('getMembership invite ∥ updateMembership ban: read sees invite or ban', async () => {
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'invite',
+          event_id: '$invite',
+          display_name: 'Alice',
+          avatar_url: null,
+        },
+      ],
+    });
+    const [got] = await Promise.all([
+      getMembership(db, ROOM, USER),
+      updateMembership(db, ROOM, USER, 'ban', '$ban', 'Alice'),
+    ]);
+    expect(got).not.toBeNull();
+    expect(['invite', 'ban']).toContain(got!.membership);
+    expect(['$invite', '$ban']).toContain(got!.eventId);
+    await expect(getMembership(db, ROOM, USER)).resolves.toEqual({
+      membership: 'ban',
+      eventId: '$ban',
+    });
+  });
+
+  it('getRoom missing ∥ createRoom: lookup sees null or room under race', async () => {
+    const db = createCrudDb();
+    const [got] = await Promise.all([
+      getRoom(db, ROOM),
+      createRoom(db, ROOM, '10', USER, true),
+    ]);
+    expect(got === null || got?.room_id === ROOM).toBe(true);
+    await expect(getRoom(db, ROOM)).resolves.toEqual({
+      room_id: ROOM,
+      room_version: '10',
+      creator_id: USER,
+      is_public: true,
+      created_at: NOW,
+    });
+  });
+
+  it('getStateEvent ∥ storeEventIdempotent state overwrite: read sees old or new', async () => {
+    const oldEvt = pdu({
+      event_id: '$name-old',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'Old' },
+    });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(oldEvt, 1)],
+      roomState: [
+        { room_id: ROOM, event_type: 'm.room.name', state_key: '', event_id: '$name-old' },
+      ],
+      streamPosition: 1,
+    });
+    const neu = pdu({
+      event_id: '$name-new',
+      type: 'm.room.name',
+      state_key: '',
+      content: { name: 'New' },
+    });
+    const [got, insert] = await Promise.all([
+      getStateEvent(db, ROOM, 'm.room.name', ''),
+      storeEventIdempotent(db, neu),
+    ]);
+    expect(insert.inserted).toBe(true);
+    expect(got).not.toBeNull();
+    expect(['Old', 'New']).toContain((got!.content as { name: string }).name);
+    await expect(getStateEvent(db, ROOM, 'm.room.name', '')).resolves.toMatchObject({
+      event_id: '$name-new',
+      content: { name: 'New' },
+    });
+  });
+
+  it('deleteAccessToken one hash ∥ createAccessToken other: sibling hash stays', async () => {
+    const db = createCrudDb({
+      tokens: [
+        {
+          token_id: 'tid-keep',
+          token_hash: 'hash-keep',
+          user_id: USER,
+          device_id: 'DEV1',
+          created_at: NOW,
+        },
+        {
+          token_id: 'tid-del',
+          token_hash: 'hash-del',
+          user_id: USER,
+          device_id: 'DEV2',
+          created_at: NOW,
+        },
+      ],
+    });
+    await Promise.all([
+      deleteAccessToken(db, 'hash-del'),
+      createAccessToken(db, 'tid-new', 'hash-new', USER, 'DEV3'),
+    ]);
+    await expect(getUserByTokenHash(db, 'hash-del')).resolves.toBeNull();
+    await expect(getUserByTokenHash(db, 'hash-keep')).resolves.toEqual({
+      userId: USER,
+      deviceId: 'DEV1',
+    });
+    await expect(getUserByTokenHash(db, 'hash-new')).resolves.toEqual({
+      userId: USER,
+      deviceId: 'DEV3',
+    });
+  });
+
+  it('getEventsSince(since=tip) ∥ storeEvent: page empty or new only', async () => {
+    const seed = pdu({ event_id: '$seed-sep', type: 'm.room.message', content: { body: 's' } });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(seed, 7)],
+      streamPosition: 7,
+    });
+    const neu = pdu({ event_id: '$neu-sep', type: 'm.room.message', content: { body: 'n' } });
+    const [page, stream] = await Promise.all([
+      getEventsSince(db, ROOM, 7, 10),
+      storeEvent(db, neu),
+    ]);
+    expect(stream).toBe(8);
+    expect(page.length).toBeLessThanOrEqual(1);
+    expect(page.every((e) => e.event_id === '$neu-sep')).toBe(true);
+    await expect(getEventsSince(db, ROOM, 7, 10)).resolves.toMatchObject([
+      { event_id: '$neu-sep' },
+    ]);
+  });
+
+  it('getUserRooms(join) ∥ updateMembership leave: page sees room or empty', async () => {
+    const other = '!other:example.com';
+    const db = createCrudDb({
+      memberships: [
+        {
+          room_id: ROOM,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$j1',
+          display_name: null,
+          avatar_url: null,
+        },
+        {
+          room_id: other,
+          user_id: USER,
+          membership: 'join',
+          event_id: '$j2',
+          display_name: null,
+          avatar_url: null,
+        },
+      ],
+    });
+    const [rooms] = await Promise.all([
+      getUserRooms(db, USER, 'join'),
+      updateMembership(db, ROOM, USER, 'leave', '$leave'),
+    ]);
+    expect(rooms.length).toBeGreaterThanOrEqual(1);
+    expect(rooms.length).toBeLessThanOrEqual(2);
+    expect(rooms).toContain(other);
+    await expect(getUserRooms(db, USER, 'join')).resolves.toEqual([other]);
+    await expect(getMembership(db, ROOM, USER)).resolves.toEqual({
+      membership: 'leave',
+      eventId: '$leave',
+    });
+  });
+
+  it('getEventsByIds ∥ getEvent same id stay coherent under race', async () => {
+    const a = pdu({ event_id: '$a-sep', type: 'm.room.message', content: { body: 'a' } });
+    const b = pdu({ event_id: '$b-sep', type: 'm.room.message', content: { body: 'b' } });
+    const db = createCrudDb({
+      events: [eventRowFromPdu(a, 1), eventRowFromPdu(b, 2)],
+      streamPosition: 2,
+    });
+    const [byIds, single, missing] = await Promise.all([
+      getEventsByIds(db, ['$a-sep', '$b-sep', '$missing']),
+      getEvent(db, '$a-sep'),
+      getEvent(db, '$missing'),
+    ]);
+    expect(byIds.map((e) => e.event_id).sort()).toEqual(['$a-sep', '$b-sep'].sort());
+    expect(single).toMatchObject({ event_id: '$a-sep', content: { body: 'a' } });
+    expect(missing).toBeNull();
+  });
+});
