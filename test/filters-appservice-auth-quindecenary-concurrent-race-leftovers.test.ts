@@ -8,7 +8,7 @@
  *   Filters "Infinity" / "-Infinity" / "undefined" / "1E2" string-primitive mint + TTL ∥ carol forbid
  *     | quattuordecenary "-1"/"42"/"1e2"/"NaN"; never Infinity/-Inf/undefined/upper-sci str
  *   Filters stored "Infinity" / "-0" / "1E2" / "undefined" / [false] / {"":0} GET soft ∥ carol read-forbid
- *     | quattuordecenary "-1"/"42"/"1"/"[]"/"{}",[0]; never Inf/-0/upper-sci/undef/[false]/{"":0}
+ *     | quattuordecenary "-1"/"42"/"1"/"[]"/"{}";/[0]; never Inf/-0/upper-sci/undef/[false]/{"":0}
  *   isExclusiveAppServiceAlias within-AS false→true hit ∥ all-false miss ∥ wrong exclude
  *     | quattuordecenary within-AS USER; tridecenary exclusive:false ALIAS; never within-AS ALIAS multi-ns
  *   multi room-ns first-miss second-hit room interest ∥ users-only twin
