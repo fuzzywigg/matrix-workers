@@ -2852,3 +2852,213 @@ describe('notify / auth-chain TOKENMAXX residual octonary leftovers after #356',
     expect(byEvent['$e2'].sort()).toEqual(['@only2:example.com', '@shared:example.com']);
   });
 });
+
+describe('notify / auth-chain TOKENMAXX residual nonary leftovers after #372', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeNotifyEnv(
+    membersByRoom: Record<string, string[]>,
+    opts?: { failUsers?: Set<string>; throwOnRooms?: Set<string> }
+  ) {
+    const notifies: { userId: string; body: unknown }[] = [];
+    return {
+      notifies,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              const roomId = args[0] as string;
+              return {
+                async all<T>() {
+                  if (opts?.throwOnRooms?.has(roomId)) {
+                    throw new Error('membership boom');
+                  }
+                  if (sql.includes('room_memberships')) {
+                    const members = membersByRoom[roomId] ?? [];
+                    return {
+                      results: members.map((user_id) => ({ user_id })) as T[],
+                    };
+                  }
+                  return { results: [] };
+                },
+              };
+            },
+          };
+        },
+      },
+      SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: (id: { name: string }) => ({
+          async fetch(req: Request) {
+            if (opts?.failUsers?.has(id.name)) throw new Error('do fail');
+            const body = await req.json();
+            notifies.push({ userId: id.name, body });
+            return new Response('ok');
+          },
+        }),
+      },
+    } as any;
+  }
+
+  it('two Sync DO fails among three ∥ sibling room isolates fan-out', async () => {
+    const env = makeNotifyEnv(
+      {
+        '!r:example.com': ['@a:example.com', '@b:example.com', '@c:example.com'],
+        '!ok:example.com': ['@z:example.com'],
+      },
+      { failUsers: new Set(['@a:example.com', '@c:example.com']) }
+    );
+    await Promise.all([
+      notifyUsersOfEvent(env, '!r:example.com', '$two-fail', 'm.room.message'),
+      notifyUsersOfEvent(env, '!ok:example.com', '$ok', 'm.room.member'),
+    ]);
+    expect(env.notifies.map((n: { userId: string }) => n.userId).sort()).toEqual([
+      '@b:example.com',
+      '@z:example.com',
+    ]);
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @a:example.com of event:',
+      expect.any(Error)
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify user @c:example.com of event:',
+      expect.any(Error)
+    );
+  });
+
+  it('getAuthChain empty seed ∥ populated sibling stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      ['$root', pdu('$root', [])],
+      ['$child', pdu('$child', ['$root'])],
+    ]);
+    const db = createAuthChainDb(events);
+    const [empty, populated] = await Promise.all([
+      getAuthChain(db, []),
+      getAuthChain(db, ['$child']),
+    ]);
+    expect(empty).toEqual([]);
+    expect(populated.map((e) => e.event_id).sort()).toEqual(['$child', '$root'].sort());
+  });
+
+  it('getStateAtEvent missing leaf ∥ create present stay isolated', async () => {
+    const events = new Map<string, PDU>([
+      [
+        '$create',
+        pdu('$create', [], {
+          type: 'm.room.create',
+          state_key: '',
+          content: { creator: '@s:example.com' },
+        }),
+      ],
+      [
+        '$leaf',
+        pdu('$leaf', ['$create'], {
+          type: 'm.room.message',
+          content: { body: 'y' },
+        }),
+      ],
+    ]);
+    delete (events.get('$leaf') as { state_key?: string }).state_key;
+    const db = createAuthChainDb(events);
+    const [missing, populated] = await Promise.all([
+      getStateAtEvent(db, '$gone'),
+      getStateAtEvent(db, '$leaf'),
+    ]);
+    expect(missing).toEqual([]);
+    expect(populated).toHaveLength(1);
+    expect(populated[0].type).toBe('m.room.create');
+  });
+
+  it('getServersInRoomsWithUser empty-string subject ∥ multi under race', async () => {
+    const binds: unknown[][] = [];
+    const db = {
+      prepare() {
+        return {
+          bind(...args: unknown[]) {
+            binds.push(args);
+            const subject = args[0] as string;
+            return {
+              async all<T>() {
+                if (subject === '') {
+                  return { results: [{ server_name: null }] as T[] };
+                }
+                if (subject === '@multi:example.com') {
+                  return {
+                    results: [
+                      { server_name: 'a.example.com' },
+                      { server_name: 'b.example.com' },
+                    ] as T[],
+                  };
+                }
+                return { results: [] as T[] };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const [emptySubj, multi] = await Promise.all([
+      getServersInRoomsWithUser(db, ''),
+      getServersInRoomsWithUser(db, '@multi:example.com'),
+    ]);
+    expect(emptySubj).toEqual([]);
+    expect(multi).toEqual(['a.example.com', 'b.example.com']);
+    expect(binds).toHaveLength(2);
+  });
+
+  it('notify zero-members ∥ membership boom outer-catch both isolate under race', async () => {
+    const env = makeNotifyEnv(
+      {
+        '!empty:example.com': [],
+        '!boom:example.com': ['@x:example.com'],
+      },
+      { throwOnRooms: new Set(['!boom:example.com']) }
+    );
+    await Promise.all([
+      notifyUsersOfEvent(env, '!empty:example.com', '$empty', 'm.room.message'),
+      notifyUsersOfEvent(env, '!boom:example.com', '$boom', 'm.room.member'),
+    ]);
+    expect(env.notifies).toEqual([]);
+    expect(console.log).toHaveBeenCalledWith(
+      '[database] Notifying',
+      0,
+      'users of event',
+      '$empty',
+      'users:',
+      ''
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      '[database] Failed to notify users of event:',
+      expect.any(Error)
+    );
+  });
+
+  it('notify same room two events fan-out distinct event_ids under race', async () => {
+    const env = makeNotifyEnv({
+      '!r:example.com': ['@a:example.com', '@b:example.com'],
+    });
+    await Promise.all([
+      notifyUsersOfEvent(env, '!r:example.com', '$e1-non', 'm.room.message'),
+      notifyUsersOfEvent(env, '!r:example.com', '$e2-non', 'm.room.member'),
+    ]);
+    expect(env.notifies).toHaveLength(4);
+    const byEvent = env.notifies.reduce(
+      (acc: Record<string, string[]>, n: { userId: string; body: { event_id: string } }) => {
+        const id = n.body.event_id;
+        acc[id] = acc[id] ?? [];
+        acc[id].push(n.userId);
+        return acc;
+      },
+      {}
+    );
+    expect(byEvent['$e1-non'].sort()).toEqual(['@a:example.com', '@b:example.com']);
+    expect(byEvent['$e2-non'].sort()).toEqual(['@a:example.com', '@b:example.com']);
+  });
+});

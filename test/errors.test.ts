@@ -1399,3 +1399,119 @@ describe('errors TOKENMAXX residual octonary leftovers after #356', () => {
     await expect(nul.json()).resolves.toBeNull();
   });
 });
+
+describe('errors TOKENMAXX residual nonary leftovers after #372', () => {
+  it('unknownToken/badJson/notJson/notFound default exacts under race', async () => {
+    const [tok, bad, notJ, nf] = await Promise.all([
+      Promise.resolve(Errors.unknownToken().toResponse()),
+      Promise.resolve(Errors.badJson().toResponse()),
+      Promise.resolve(Errors.notJson().toResponse()),
+      Promise.resolve(Errors.notFound().toResponse()),
+    ]);
+    expect(new Set([tok, bad, notJ, nf]).size).toBe(4);
+    expect(tok.status).toBe(401);
+    expect(bad.status).toBe(400);
+    expect(notJ.status).toBe(400);
+    expect(nf.status).toBe(404);
+    await expect(tok.json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN_TOKEN',
+      error: 'Unknown token',
+    });
+    await expect(bad.json()).resolves.toEqual({
+      errcode: 'M_BAD_JSON',
+      error: 'Could not parse request body as JSON',
+    });
+    await expect(notJ.json()).resolves.toEqual({
+      errcode: 'M_NOT_JSON',
+      error: 'Content-Type must be application/json',
+    });
+    await expect(nf.json()).resolves.toEqual({ errcode: 'M_NOT_FOUND', error: 'Not found' });
+  });
+
+  it('tooLarge/conflict/unrecognized/unknown default exacts under race', async () => {
+    const [large, conf, unrec, unk] = await Promise.all([
+      Promise.resolve(Errors.tooLarge().toResponse()),
+      Promise.resolve(Errors.conflict().toResponse()),
+      Promise.resolve(Errors.unrecognized().toResponse()),
+      Promise.resolve(Errors.unknown().toResponse()),
+    ]);
+    expect(large.status).toBe(413);
+    expect(conf.status).toBe(409);
+    expect(unrec.status).toBe(400);
+    expect(unk.status).toBe(500);
+    await expect(large.json()).resolves.toEqual({
+      errcode: 'M_TOO_LARGE',
+      error: 'Request too large',
+    });
+    await expect(conf.json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'State changed concurrently; retry the operation',
+    });
+    await expect(unrec.json()).resolves.toEqual({
+      errcode: 'M_UNRECOGNIZED',
+      error: 'Unrecognized request',
+    });
+    await expect(unk.json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN',
+      error: 'An unknown error occurred',
+    });
+  });
+
+  it('withErrorHandler success ∥ tooLarge ∥ conflict customs under race', async () => {
+    const [ok, large, conf] = await Promise.all([
+      withErrorHandler(async () => ({ ok: true, n: 1 })),
+      withErrorHandler(async () => {
+        throw Errors.tooLarge('payload');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.conflict('retry-me');
+      }),
+    ]);
+    expect(ok).toEqual({ ok: true, n: 1 });
+    expect((large as Response).status).toBe(413);
+    expect((conf as Response).status).toBe(409);
+    await expect((large as Response).json()).resolves.toEqual({
+      errcode: 'M_TOO_LARGE',
+      error: 'payload',
+    });
+    await expect((conf as Response).json()).resolves.toEqual({
+      errcode: 'M_CONFLICT',
+      error: 'retry-me',
+    });
+  });
+
+  it('missingParam/invalidParam/limitExceeded toJSON under race', async () => {
+    const [miss, inv, lim, limRetry] = await Promise.all([
+      Promise.resolve(Errors.missingParam('user_id').toJSON()),
+      Promise.resolve(Errors.invalidParam('limit', 'must be positive').toJSON()),
+      Promise.resolve(Errors.limitExceeded().toJSON()),
+      Promise.resolve(Errors.limitExceeded('slow', 1500).toJSON()),
+    ]);
+    expect(miss).toEqual({
+      errcode: 'M_MISSING_PARAM',
+      error: 'Missing required parameter: user_id',
+    });
+    expect(inv).toEqual({ errcode: 'M_INVALID_PARAM', error: 'must be positive' });
+    expect(lim).toEqual({ errcode: 'M_LIMIT_EXCEEDED', error: 'Rate limit exceeded' });
+    expect(limRetry).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'slow',
+      retry_after_ms: 1500,
+    });
+  });
+
+  it('jsonResponse array ∥ emptyResponse 204 ∥ jsonResponse false under race', async () => {
+    const [arr, empty, falsy] = await Promise.all([
+      Promise.resolve(jsonResponse([1, null, false], 202)),
+      Promise.resolve(emptyResponse(204)),
+      Promise.resolve(jsonResponse(false, 200)),
+    ]);
+    expect(new Set([arr, empty, falsy]).size).toBe(3);
+    expect(arr.status).toBe(202);
+    expect(empty.status).toBe(204);
+    expect(falsy.status).toBe(200);
+    await expect(arr.json()).resolves.toEqual([1, null, false]);
+    await expect(empty.json()).resolves.toEqual({});
+    await expect(falsy.json()).resolves.toBe(false);
+  });
+});
