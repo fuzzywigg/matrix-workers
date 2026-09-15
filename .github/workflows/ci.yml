@@ -83,7 +83,7 @@ jobs:
 
 
   # Fail-fast canary for admin + federation concurrent leftovers
-  # (quinary #317 + senary #328 + octonary deepen complementary to #335).
+  # (quinary #317 + senary #328 + octonary #342 + denary deepen complementary to #351).
   # Isolates flake attribution before the full vitest suite.
   admin-federation:
     name: Admin/Federation Concurrent Canary
