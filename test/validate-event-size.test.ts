@@ -1213,3 +1213,152 @@ describe('validateEventSize TOKENMAXX residual denary leftovers after #380', () 
     }
   });
 });
+
+describe('validateEventSize TOKENMAXX residual undecenary leftovers after #395', () => {
+  /**
+   * Inflate a PDU to exactly `target` serialized bytes via one long pad string.
+   * Same O(1) pad strategy as septenary/denary (avoids prev_events explosion).
+   */
+  function inflateToExactSerializedSize(event: PDU, target: number): void {
+    const baseLen = JSON.stringify(event).length;
+    const roughNeed = Math.max(0, target - baseLen - 4);
+    event.prev_events = [...event.prev_events, 'x'.repeat(roughNeed)];
+    let len = JSON.stringify(event).length;
+    const idx = event.prev_events.length - 1;
+    while (len > target && event.prev_events[idx].length > 0) {
+      event.prev_events[idx] = event.prev_events[idx].slice(0, -1);
+      len = JSON.stringify(event).length;
+    }
+    while (len < target) {
+      event.prev_events[idx] += 'x';
+      len = JSON.stringify(event).length;
+    }
+    expect(JSON.stringify(event).length).toBe(target);
+  }
+
+  it('string content ok ∥ array content ok ∥ soft-over under race', async () => {
+    const strEvt = baseEvent({ body: 'x' });
+    (strEvt as { content: unknown }).content = 'plain-string';
+    const arrEvt = baseEvent({ body: 'y' });
+    (arrEvt as { content: unknown }).content = [1, 2, 3];
+    const overhead = JSON.stringify({ body: '' }).length;
+    const soft = baseEvent({ body: 'z'.repeat(65_536 - overhead + 1) });
+    const beforeStr = JSON.stringify(strEvt);
+    const beforeArr = JSON.stringify(arrEvt);
+    const beforeSoft = JSON.stringify(soft);
+    const [strResult, arrResult, softResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(strEvt as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(arrEvt as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => validateEventSize(soft)),
+    ]);
+    expect(strResult.status).toBe('fulfilled');
+    expect(arrResult.status).toBe('fulfilled');
+    expect(softResult.status).toBe('rejected');
+    if (softResult.status === 'rejected') {
+      expect((softResult.reason as MatrixApiError).errcode).toBe('M_TOO_LARGE');
+      expect((softResult.reason as MatrixApiError).status).toBe(413);
+    }
+    expect(JSON.stringify(strEvt)).toBe(beforeStr);
+    expect(JSON.stringify(arrEvt)).toBe(beforeArr);
+    expect(JSON.stringify(soft)).toBe(beforeSoft);
+    expect(strEvt.content).toBe('plain-string');
+    expect(arrEvt.content).toEqual([1, 2, 3]);
+  });
+
+  it('hard exact-boundary ok ∥ soft exact ok ∥ soft one-over under race', async () => {
+    const hardOk = baseEvent({ body: 'ok' });
+    inflateToExactSerializedSize(hardOk, 921_600);
+    expect(JSON.stringify(hardOk.content).length).toBeLessThanOrEqual(65_536);
+    const overhead = JSON.stringify({ body: '' }).length;
+    const softAt = baseEvent({ body: 'y'.repeat(65_536 - overhead) });
+    expect(JSON.stringify(softAt.content).length).toBe(65_536);
+    const softOver = baseEvent({ body: 'z'.repeat(65_536 - overhead + 1) });
+    const beforeHard = JSON.stringify(hardOk);
+    const beforeAt = JSON.stringify(softAt);
+    const beforeOver = JSON.stringify(softOver);
+    const [hardResult, atResult, overResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(hardOk);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(softAt);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => validateEventSize(softOver)),
+    ]);
+    expect(hardResult.status).toBe('fulfilled');
+    expect(atResult.status).toBe('fulfilled');
+    expect(overResult.status).toBe('rejected');
+    if (overResult.status === 'rejected') {
+      expect((overResult.reason as MatrixApiError).message).toBe(
+        'Event content exceeds 65536 byte limit (got 65537)'
+      );
+    }
+    expect(JSON.stringify(hardOk)).toBe(beforeHard);
+    expect(JSON.stringify(softAt)).toBe(beforeAt);
+    expect(JSON.stringify(softOver)).toBe(beforeOver);
+  });
+
+  it('null content ∥ missing content ∥ soft-over neither mutates under race', async () => {
+    const nullEvt = baseEvent({ body: 'x' });
+    (nullEvt as { content: unknown }).content = null;
+    const missing = baseEvent({ body: 'y' });
+    delete (missing as { content?: unknown }).content;
+    const overhead = JSON.stringify({ body: '' }).length;
+    const soft = baseEvent({ body: 'q'.repeat(65_536 - overhead + 1) });
+    const beforeNull = JSON.stringify(nullEvt);
+    const beforeMissing = JSON.stringify(missing);
+    const beforeSoft = JSON.stringify(soft);
+    const [nullResult, missResult, softResult] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        validateEventSize(nullEvt as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => {
+        validateEventSize(missing as PDU);
+        return 'ok';
+      }),
+      Promise.resolve().then(() => validateEventSize(soft)),
+    ]);
+    expect(nullResult.status).toBe('fulfilled');
+    expect(missResult.status).toBe('fulfilled');
+    expect(softResult.status).toBe('rejected');
+    expect(JSON.stringify(nullEvt)).toBe(beforeNull);
+    expect(JSON.stringify(missing)).toBe(beforeMissing);
+    expect(JSON.stringify(soft)).toBe(beforeSoft);
+    expect(nullEvt.content).toBeNull();
+    expect((missing as { content?: unknown }).content).toBeUndefined();
+  });
+
+  it('soft got-count message ∥ hard got-count message distinct under race', async () => {
+    const overhead = JSON.stringify({ body: '' }).length;
+    const soft = baseEvent({ body: 's'.repeat(65_536 - overhead + 1) });
+    const softLen = JSON.stringify(soft.content).length;
+    const hard = baseEvent({ body: 'ok' });
+    inflateToExactSerializedSize(hard, 921_601);
+    const hardLen = JSON.stringify(hard).length;
+    const [softResult, hardResult] = await Promise.allSettled([
+      Promise.resolve().then(() => validateEventSize(soft)),
+      Promise.resolve().then(() => validateEventSize(hard)),
+    ]);
+    expect(softResult.status).toBe('rejected');
+    expect(hardResult.status).toBe('rejected');
+    if (softResult.status === 'rejected' && hardResult.status === 'rejected') {
+      expect((softResult.reason as MatrixApiError).message).toBe(
+        `Event content exceeds 65536 byte limit (got ${softLen})`
+      );
+      expect((hardResult.reason as MatrixApiError).message).toBe(
+        `Serialized event exceeds 921600 byte D1 row limit (got ${hardLen})`
+      );
+      expect((softResult.reason as MatrixApiError).errcode).toBe('M_TOO_LARGE');
+      expect((hardResult.reason as MatrixApiError).errcode).toBe('M_TOO_LARGE');
+    }
+  });
+});
