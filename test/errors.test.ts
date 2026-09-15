@@ -1500,15 +1500,15 @@ describe('errors TOKENMAXX residual nonary leftovers after #372', () => {
     });
   });
 
-  it('jsonResponse array ∥ emptyResponse 204 ∥ jsonResponse false under race', async () => {
+  it('jsonResponse array ∥ emptyResponse 206 ∥ jsonResponse false under race', async () => {
     const [arr, empty, falsy] = await Promise.all([
       Promise.resolve(jsonResponse([1, null, false], 202)),
-      Promise.resolve(emptyResponse(204)),
+      Promise.resolve(emptyResponse(206)),
       Promise.resolve(jsonResponse(false, 200)),
     ]);
     expect(new Set([arr, empty, falsy]).size).toBe(3);
     expect(arr.status).toBe(202);
-    expect(empty.status).toBe(204);
+    expect(empty.status).toBe(206);
     expect(falsy.status).toBe(200);
     await expect(arr.json()).resolves.toEqual([1, null, false]);
     await expect(empty.json()).resolves.toEqual({});
