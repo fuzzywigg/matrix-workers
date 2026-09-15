@@ -5207,7 +5207,7 @@ describe('RoomDurableObject hibernation novemdenary receipt/ws leftovers after #
 /**
  * TOKENMAXX HEAVY leftovers after #400 — RoomDurableObject hibernation
  * *vicenary* (timeout "+0"→expired / "1e4" stays / "119999" stays,
- * Upgrade " websocket" 426∥ping, GET /state∥WS ping, WS typing∥HTTP receipt,
+ * Upgrade "web space" 426∥ping, GET /state∥WS ping, WS typing∥HTTP receipt,
  * webSocketClose∥WS ping, broadcast∥HTTP typing, receipt fully_read∥webSocketError,
  * JSON "undefined" silent∥HTTP). Novemdenary stopped at "-0"/"120000"/"1e5" /
  * WEBSOCKET  / receipts∥ping / read∥receipt / close∥receipt / broadcast∥ping /
@@ -5298,7 +5298,7 @@ describe('RoomDurableObject hibernation vicenary typing/upgrade leftovers after 
   }
 
   for (let i = 0; i < 8; i++) {
-    it(`Upgrade " websocket" 426∥WS ping isolation flood-${i}`, async () => {
+    it(`Upgrade "web space" 426∥WS ping isolation flood-${i}`, async () => {
       const { state, do: room } = makeRacingRoomDo();
       const a = new FakeWebSocket();
       a.serializeAttachment({ userId: '@a:example.com', id: '1' });
@@ -5306,7 +5306,8 @@ describe('RoomDurableObject hibernation vicenary typing/upgrade leftovers after 
 
       const [bad] = await Promise.all([
         room.fetch(
-          new Request('https://do/websocket', { headers: { Upgrade: ' websocket' } })
+          // Internal space survives Headers trim; leading/trailing WS is stripped
+          new Request('https://do/websocket', { headers: { Upgrade: 'web socket' } })
         ),
         wsMsg(room, a, JSON.stringify({ type: 'ping' })),
       ]);
