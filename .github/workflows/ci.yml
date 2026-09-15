@@ -67,7 +67,7 @@ jobs:
       - run: npm run test:crypto-db
 
   # Fail-fast canary for filters + appservice + auth concurrent leftovers
-  # (septenary #304 + octonary #312 + nonary #319 + denary #338 + undecenary deepen).
+  # (septenary #304 + octonary #312 + nonary #319 + denary #338 + undecenary #350 + duodenary deepen).
   # Isolates flake attribution before the full vitest suite.
   filters-appservice-auth:
     name: Filters/Appservice/Auth Concurrent Canary
