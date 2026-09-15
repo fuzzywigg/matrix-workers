@@ -452,8 +452,6 @@ const UIA_INVALID_WITH_PERIOD = 'Invalid username or password.';
 const UIA_USERNAME_REQUIRED = 'Username and password are required.';
 const UIA_CREDENTIALS_DESC = 'Please enter your credentials to approve this request.';
 const UIA_PARSE_BODY = 'Could not parse request.';
-const UIA_ACCOUNT_MISMATCH =
-  'You must approve with the same account that started this request.';
 const UIA_MISSING_BODY = 'No UIA session specified.';
 const UIA_EXPIRED_BODY = 'This session has expired. Please try again.';
 const UIA_DEFAULT_DESC = 'An application is requesting your approval.';
