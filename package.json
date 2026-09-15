@@ -19,6 +19,7 @@
     "test:admin-federation": "vitest run test/admin-api-quinary-concurrent-race-leftovers.test.ts test/admin-api-senary-concurrent-race-leftovers.test.ts test/admin-api-octonary-concurrent-race-leftovers.test.ts test/federation-api-quinary-concurrent-race-leftovers.test.ts test/federation-api-senary-concurrent-race-leftovers.test.ts test/federation-api-octonary-concurrent-race-leftovers.test.ts",
     "test:turn-concurrent": "vitest run test/turn-concurrent-race-leftovers.test.ts test/turn-second-wave-concurrent-race-leftovers.test.ts test/turn-third-wave-concurrent-race-leftovers.test.ts test/turn-fourth-wave-concurrent-race-leftovers.test.ts",
     "test:oauth-devices": "vitest run test/oauth-api-denary-concurrent-race-leftovers.test.ts test/oauth-api-undecenary-concurrent-race-leftovers.test.ts test/oauth-api-duodenary-concurrent-race-leftovers.test.ts test/devices-keys-soft-residual-seventh-wave-concurrent-race-leftovers.test.ts test/devices-keys-soft-residual-eighth-wave-concurrent-race-leftovers.test.ts test/devices-keys-soft-residual-ninth-wave-concurrent-race-leftovers.test.ts",
+    "test:room-cache": "vitest run test/room-cache-tridecenary-concurrent-race-leftovers.test.ts test/room-cache-quattuordecenary-concurrent-race-leftovers.test.ts test/room-cache-quindecenary-concurrent-race-leftovers.test.ts test/room-cache-sexdecenary-concurrent-race-leftovers.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/ test/",
     "worker:check": "wrangler deploy --dry-run --outdir=.wrangler-dry-run"
