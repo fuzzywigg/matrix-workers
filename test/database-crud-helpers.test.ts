@@ -5277,7 +5277,12 @@ describe('database CRUD TOKENMAXX residual nonary leftovers after #372', () => {
     expect(joined.length).toBeLessThanOrEqual(1);
     expect(joined.every((m) => m.membership === 'join')).toBe(true);
     await expect(getRoomMembers(db, ROOM, 'join')).resolves.toEqual([
-      expect.objectContaining({ user_id: USER, membership: 'join' }),
+      {
+        userId: USER,
+        membership: 'join',
+        displayName: 'Alice',
+        avatarUrl: undefined,
+      },
     ]);
     await expect(getMembership(db, ROOM, USER)).resolves.toEqual({
       membership: 'join',
