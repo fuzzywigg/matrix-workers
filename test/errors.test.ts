@@ -1152,3 +1152,135 @@ describe('errors TOKENMAXX residual senary leftovers after #330', () => {
     await expect(empty.json()).resolves.toEqual({});
   });
 });
+
+describe('errors TOKENMAXX residual septenary leftovers after #336', () => {
+  it('unknown/notFound/badJson/notJson/unknownToken default exacts under race', async () => {
+    const [unk, nf, bj, nj, ut] = await Promise.all([
+      Promise.resolve(Errors.unknown().toResponse()),
+      Promise.resolve(Errors.notFound().toResponse()),
+      Promise.resolve(Errors.badJson().toResponse()),
+      Promise.resolve(Errors.notJson().toResponse()),
+      Promise.resolve(Errors.unknownToken().toResponse()),
+    ]);
+    expect(new Set([unk, nf, bj, nj, ut]).size).toBe(5);
+    expect(unk.status).toBe(500);
+    expect(nf.status).toBe(404);
+    expect(bj.status).toBe(400);
+    expect(nj.status).toBe(400);
+    expect(ut.status).toBe(401);
+    await expect(unk.json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN',
+      error: 'An unknown error occurred',
+    });
+    await expect(nf.json()).resolves.toEqual({
+      errcode: 'M_NOT_FOUND',
+      error: 'Not found',
+    });
+    await expect(bj.json()).resolves.toEqual({
+      errcode: 'M_BAD_JSON',
+      error: 'Could not parse request body as JSON',
+    });
+    await expect(nj.json()).resolves.toEqual({
+      errcode: 'M_NOT_JSON',
+      error: 'Content-Type must be application/json',
+    });
+    await expect(ut.json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN_TOKEN',
+      error: 'Unknown token',
+    });
+  });
+
+  it('withErrorHandler races unknown + notFound + badJson + unknownToken customs', async () => {
+    const [a, b, c, d] = await Promise.all([
+      withErrorHandler(async () => {
+        throw Errors.unknown('boom');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.notFound('gone');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.badJson('parse');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.unknownToken('revoked');
+      }),
+    ]);
+    expect((a as Response).status).toBe(500);
+    expect((b as Response).status).toBe(404);
+    expect((c as Response).status).toBe(400);
+    expect((d as Response).status).toBe(401);
+    await expect((a as Response).json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN',
+      error: 'boom',
+    });
+    await expect((b as Response).json()).resolves.toEqual({
+      errcode: 'M_NOT_FOUND',
+      error: 'gone',
+    });
+    await expect((c as Response).json()).resolves.toEqual({
+      errcode: 'M_BAD_JSON',
+      error: 'parse',
+    });
+    await expect((d as Response).json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN_TOKEN',
+      error: 'revoked',
+    });
+  });
+
+  it('toResponse Content-Type ∥ status stay independent under race', async () => {
+    const [a, b, c] = await Promise.all([
+      Promise.resolve(Errors.forbidden('x').toResponse()),
+      Promise.resolve(Errors.notFound('y').toResponse()),
+      Promise.resolve(Errors.unknown('z').toResponse()),
+    ]);
+    expect(a.headers.get('Content-Type')).toBe('application/json');
+    expect(b.headers.get('Content-Type')).toBe('application/json');
+    expect(c.headers.get('Content-Type')).toBe('application/json');
+    expect(a.status).toBe(403);
+    expect(b.status).toBe(404);
+    expect(c.status).toBe(500);
+  });
+
+  it('limitExceeded default omit retry ∥ custom include toJSON under race', async () => {
+    const [def, withRetry, zero] = await Promise.all([
+      Promise.resolve(Errors.limitExceeded().toJSON()),
+      Promise.resolve(Errors.limitExceeded('slow', 1200).toJSON()),
+      Promise.resolve(Errors.limitExceeded('zero', 0).toJSON()),
+    ]);
+    expect(def).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'Rate limit exceeded',
+    });
+    expect(Object.prototype.hasOwnProperty.call(def, 'retry_after_ms')).toBe(false);
+    expect(withRetry).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'slow',
+      retry_after_ms: 1200,
+    });
+    expect(zero).toEqual({
+      errcode: 'M_LIMIT_EXCEEDED',
+      error: 'zero',
+    });
+    expect(Object.prototype.hasOwnProperty.call(zero, 'retry_after_ms')).toBe(false);
+  });
+
+  it('jsonResponse default 200 ∥ emptyResponse default 200 stay independent under race', async () => {
+    const [j, e, j2, e2] = await Promise.all([
+      Promise.resolve(jsonResponse({ ok: true })),
+      Promise.resolve(emptyResponse()),
+      Promise.resolve(jsonResponse({})),
+      Promise.resolve(emptyResponse()),
+    ]);
+    expect(new Set([j, e, j2, e2]).size).toBe(4);
+    expect(j.status).toBe(200);
+    expect(e.status).toBe(200);
+    expect(j2.status).toBe(200);
+    expect(e2.status).toBe(200);
+    await expect(j.json()).resolves.toEqual({ ok: true });
+    await expect(e.json()).resolves.toEqual({});
+    await expect(j2.json()).resolves.toEqual({});
+    await expect(e2.json()).resolves.toEqual({});
+    expect(j.headers.get('Content-Type')).toBe('application/json');
+    expect(e.headers.get('Content-Type')).toBe('application/json');
+  });
+});
