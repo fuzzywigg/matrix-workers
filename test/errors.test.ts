@@ -1399,3 +1399,103 @@ describe('errors TOKENMAXX residual octonary leftovers after #356', () => {
     await expect(nul.json()).resolves.toBeNull();
   });
 });
+
+describe('errors TOKENMAXX residual denary leftovers after #380', () => {
+  it('forbidden/unknownToken/missingToken/unauthorized customs under race', async () => {
+    const [forb, unk, miss, unauth] = await Promise.all([
+      Promise.resolve(Errors.forbidden('nope-den').toResponse()),
+      Promise.resolve(Errors.unknownToken('bad-tok').toResponse()),
+      Promise.resolve(Errors.missingToken('need-tok').toResponse()),
+      Promise.resolve(Errors.unauthorized('who').toResponse()),
+    ]);
+    expect(new Set([forb, unk, miss, unauth]).size).toBe(4);
+    expect(forb.status).toBe(403);
+    expect(unk.status).toBe(401);
+    expect(miss.status).toBe(401);
+    expect(unauth.status).toBe(401);
+    await expect(forb.json()).resolves.toEqual({ errcode: 'M_FORBIDDEN', error: 'nope-den' });
+    await expect(unk.json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN_TOKEN',
+      error: 'bad-tok',
+    });
+    await expect(miss.json()).resolves.toEqual({
+      errcode: 'M_MISSING_TOKEN',
+      error: 'need-tok',
+    });
+    await expect(unauth.json()).resolves.toEqual({
+      errcode: 'M_UNAUTHORIZED',
+      error: 'who',
+    });
+  });
+
+  it('badJson/notJson/notFound/userDeactivated customs under race', async () => {
+    const [bad, nj, nf, deact] = await Promise.all([
+      Promise.resolve(Errors.badJson('parse-fail').toResponse()),
+      Promise.resolve(Errors.notJson('ctype').toResponse()),
+      Promise.resolve(Errors.notFound('gone-den').toResponse()),
+      Promise.resolve(Errors.userDeactivated('bye').toResponse()),
+    ]);
+    expect(bad.status).toBe(400);
+    expect(nj.status).toBe(400);
+    expect(nf.status).toBe(404);
+    expect(deact.status).toBe(403);
+    await expect(bad.json()).resolves.toEqual({ errcode: 'M_BAD_JSON', error: 'parse-fail' });
+    await expect(nj.json()).resolves.toEqual({ errcode: 'M_NOT_JSON', error: 'ctype' });
+    await expect(nf.json()).resolves.toEqual({ errcode: 'M_NOT_FOUND', error: 'gone-den' });
+    await expect(deact.json()).resolves.toEqual({
+      errcode: 'M_USER_DEACTIVATED',
+      error: 'bye',
+    });
+  });
+
+  it('withErrorHandler success ∥ unknownToken ∥ notFound customs under race', async () => {
+    const [ok, tok, nf] = await Promise.all([
+      withErrorHandler(async () => ({ denary: true })),
+      withErrorHandler(async () => {
+        throw Errors.unknownToken('tok-den');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.notFound('nf-den');
+      }),
+    ]);
+    expect(ok).toEqual({ denary: true });
+    expect((tok as Response).status).toBe(401);
+    expect((nf as Response).status).toBe(404);
+    await expect((tok as Response).json()).resolves.toEqual({
+      errcode: 'M_UNKNOWN_TOKEN',
+      error: 'tok-den',
+    });
+    await expect((nf as Response).json()).resolves.toEqual({
+      errcode: 'M_NOT_FOUND',
+      error: 'nf-den',
+    });
+  });
+
+  it('userInUse/roomInUse/guestAccessForbidden/unrecognized toJSON under race', async () => {
+    const [use, room, guest, unr] = await Promise.all([
+      Promise.resolve(Errors.userInUse('taken-den').toJSON()),
+      Promise.resolve(Errors.roomInUse('alias-den').toJSON()),
+      Promise.resolve(Errors.guestAccessForbidden('no-guest').toJSON()),
+      Promise.resolve(Errors.unrecognized('huh').toJSON()),
+    ]);
+    expect(use).toEqual({ errcode: 'M_USER_IN_USE', error: 'taken-den' });
+    expect(room).toEqual({ errcode: 'M_ROOM_IN_USE', error: 'alias-den' });
+    expect(guest).toEqual({ errcode: 'M_GUEST_ACCESS_FORBIDDEN', error: 'no-guest' });
+    expect(unr).toEqual({ errcode: 'M_UNRECOGNIZED', error: 'huh' });
+  });
+
+  it('jsonResponse string ∥ emptyResponse 202 ∥ jsonResponse 0 under race', async () => {
+    const [str, empty, zero] = await Promise.all([
+      Promise.resolve(jsonResponse('denary', 201)),
+      Promise.resolve(emptyResponse(202)),
+      Promise.resolve(jsonResponse(0, 200)),
+    ]);
+    expect(new Set([str, empty, zero]).size).toBe(3);
+    expect(str.status).toBe(201);
+    expect(empty.status).toBe(202);
+    expect(zero.status).toBe(200);
+    await expect(str.json()).resolves.toBe('denary');
+    await expect(empty.json()).resolves.toEqual({});
+    await expect(zero.json()).resolves.toBe(0);
+  });
+});
