@@ -2517,3 +2517,239 @@ describe('federation signing TOKENMAXX residual denary leftovers after #356', ()
     });
   }
 });
+
+describe('crypto TOKENMAXX residual duodenary leftovers after #380', () => {
+  it('verifyPassword wrong-scheme ∥ iters-too-low ∥ ok stay isolated under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const real = await hashPassword('duodenary-ok-1');
+    const parts = real.split('$');
+    const wrongScheme = `$pbkdf2-sha1$100000$${parts[3]}$${parts[4]}`;
+    const lowIters = `$pbkdf2-sha256$99999$${parts[3]}$${parts[4]}`;
+    const [ok, schemeBad, low, emptyPw] = await Promise.all([
+      verifyPassword('duodenary-ok-1', real),
+      verifyPassword('duodenary-ok-1', wrongScheme),
+      verifyPassword('duodenary-ok-1', lowIters),
+      verifyPassword('', real),
+    ]);
+    expect(ok).toBe(true);
+    expect(schemeBad).toBe(false);
+    expect(low).toBe(false);
+    expect(emptyPw).toBe(false);
+    expect(
+      spy.mock.calls.some((c) => String(c[0]).includes('invalid iteration count'))
+    ).toBe(true);
+    spy.mockRestore();
+  });
+
+  it('timingSafeEqual last-char diff ∥ leading space ∥ equal under race', async () => {
+    const base = 'pqrs';
+    const [eq, last, lead, emptyNe, longEq] = await Promise.all([
+      Promise.resolve(timingSafeEqual(base, base)),
+      Promise.resolve(timingSafeEqual('pqrX', base)),
+      Promise.resolve(timingSafeEqual(' pqrs', base)),
+      Promise.resolve(timingSafeEqual('', 'a')),
+      Promise.resolve(timingSafeEqual('Ω'.repeat(16), 'Ω'.repeat(16))),
+    ]);
+    expect(eq).toBe(true);
+    expect(last).toBe(false);
+    expect(lead).toBe(false);
+    expect(emptyNe).toBe(false);
+    expect(longEq).toBe(true);
+  });
+
+  it('canonicalJson unicode keys ∥ mixed primitives ∥ empty array stay deterministic', async () => {
+    const [uni, mixed, emptyArr, boolTop] = await Promise.all([
+      Promise.resolve(canonicalJson({ ζ: 1, α: 2, a: 3 })),
+      Promise.resolve(canonicalJson({ z: [null, false, 0, ''], a: true })),
+      Promise.resolve(canonicalJson({ items: [] })),
+      Promise.resolve(canonicalJson(false)),
+    ]);
+    expect(uni).toBe('{"a":3,"α":2,"ζ":1}');
+    expect(mixed).toBe('{"a":true,"z":[null,false,0,""]}');
+    expect(emptyArr).toBe('{"items":[]}');
+    expect(boolTop).toBe('false');
+  });
+
+  it('validatePasswordStrength exact-1000 ok ∥ 1001 fail ∥ digit+letter under race', async () => {
+    const at1000 = 'a1' + 'x'.repeat(998);
+    const over1000 = 'a1' + 'x'.repeat(999);
+    const [at, over, digitLetter, shortSym, empty] = await Promise.all([
+      Promise.resolve(validatePasswordStrength(at1000)),
+      Promise.resolve(validatePasswordStrength(over1000)),
+      Promise.resolve(validatePasswordStrength('Abcd1234')),
+      Promise.resolve(validatePasswordStrength('!!!!!!!')),
+      Promise.resolve(validatePasswordStrength('')),
+    ]);
+    expect(at1000).toHaveLength(1000);
+    expect(over1000).toHaveLength(1001);
+    expect(at).toBeNull();
+    expect(over).toBe('Password must be at most 1000 characters long');
+    expect(digitLetter).toBeNull();
+    expect(shortSym).toBe('Password must be at least 8 characters long');
+    expect(empty).toBe('Password must be at least 8 characters long');
+  });
+
+  it('calculateContentHash type-mutate ∥ unsigned-strip equality under race', async () => {
+    const body = { type: 'm.test', content: { v: 1 }, unsigned: { age: 2 } };
+    const stripped = { type: 'm.test', content: { v: 1 } };
+    const typed = { type: 'm.other', content: { v: 1 } };
+    const expected = await calculateContentHash(body);
+    const [hBody, hStrip, hTyped, vOk, vTyped] = await Promise.all([
+      calculateContentHash(body),
+      calculateContentHash(stripped),
+      calculateContentHash(typed),
+      verifyContentHash(body, expected),
+      verifyContentHash(typed, expected),
+    ]);
+    expect(hBody).toBe(hStrip);
+    expect(hBody).toBe(expected);
+    expect(hTyped).not.toBe(expected);
+    expect(vOk).toBe(true);
+    expect(vTyped).toBe(false);
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`hashPassword∥verify low-iters∥timingSafeEqual∥hashToken flood-${i}`, async () => {
+      const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const [hash, tok, eq] = await Promise.all([
+        hashPassword(`duo-flood-${i}-1`),
+        hashToken(`syt_duo_${i}`),
+        Promise.resolve(timingSafeEqual(`duo-${i}`, `duo-${i}`)),
+      ]);
+      const parts = hash.split('$');
+      const lowIters = `$pbkdf2-sha256$99999$${parts[3]}$${parts[4]}`;
+      const [ok, low] = await Promise.all([
+        verifyPassword(`duo-flood-${i}-1`, hash),
+        verifyPassword(`duo-flood-${i}-1`, lowIters),
+      ]);
+      expect(ok).toBe(true);
+      expect(low).toBe(false);
+      expect(tok).toBe(await sha256(`syt_duo_${i}`));
+      expect(eq).toBe(true);
+      expect(
+        spy.mock.calls.some((c) => String(c[0]).includes('invalid iteration count'))
+      ).toBe(true);
+      spy.mockRestore();
+    });
+  }
+});
+
+describe('federation signing TOKENMAXX residual duodenary leftovers after #380', () => {
+  let restore: (() => void) | undefined;
+
+  beforeAll(() => {
+    restore = installNodeEd25519Shim();
+  });
+
+  afterAll(() => {
+    restore?.();
+  });
+
+  it('cross-server dual sign ∥ wrong server pubkey false under race', async () => {
+    const a = await generateSigningKeyPair();
+    const b = await generateSigningKeyPair();
+    const base = { type: 'm.test', content: { path: 'duo-cross' }, unsigned: { age: 4 } };
+    const once = await signJson(base, 'a.example.com', a.keyId, a.privateKeyJwk);
+    const twice = await signJson(once, 'b.example.com', b.keyId, b.privateKeyJwk);
+    const sigs = twice.signatures as Record<string, Record<string, string>>;
+    expect(Object.keys(sigs).sort()).toEqual(['a.example.com', 'b.example.com']);
+    expect(twice.unsigned).toEqual({ age: 4 });
+    const [okA, okB, wrongServer, miss] = await Promise.all([
+      verifySignature(twice, 'a.example.com', a.keyId, a.publicKey),
+      verifySignature(twice, 'b.example.com', b.keyId, b.publicKey),
+      verifySignature(twice, 'a.example.com', a.keyId, b.publicKey),
+      verifySignature(twice, 'c.example.com', a.keyId, a.publicKey),
+    ]);
+    expect(okA).toBe(true);
+    expect(okB).toBe(true);
+    expect(wrongServer).toBe(false);
+    expect(miss).toBe(false);
+  });
+
+  it('verifySignature truncated sig ∥ valid ∥ empty keyId map stay isolated under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.test', content: { ok: true } },
+      'ex.com',
+      keyId,
+      privateKeyJwk
+    );
+    const truncated = {
+      ...signed,
+      signatures: { 'ex.com': { [keyId]: 'YQ' } }, // too-short base64url
+    };
+    const emptyKeyMap = { ...signed, signatures: { 'ex.com': {} } };
+    const [ok, trunc, emptyMap] = await Promise.all([
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(truncated, 'ex.com', keyId, publicKey),
+      verifySignature(emptyKeyMap, 'ex.com', keyId, publicKey),
+    ]);
+    expect(ok).toBe(true);
+    expect(trunc).toBe(false);
+    expect(emptyMap).toBe(false);
+    expect(
+      spy.mock.calls.some((c) => String(c[0]).includes('Signature verification failed'))
+    ).toBe(true);
+    spy.mockRestore();
+  });
+
+  it('type mutate after sign fails; signatures field mutate fails under race', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { publicKey, privateKeyJwk, keyId } = await generateSigningKeyPair();
+    const signed = await signJson(
+      { type: 'm.test', content: { v: 1 }, unsigned: { age: 1 } },
+      'ex.com',
+      keyId,
+      privateKeyJwk
+    );
+    const origSig = (signed.signatures as Record<string, Record<string, string>>)['ex.com'][keyId];
+    const flipped = (origSig.endsWith('A') ? 'B' : 'A') + origSig.slice(1);
+    const typeMut = { ...signed, type: 'm.other' };
+    const sigMut = {
+      ...signed,
+      signatures: { 'ex.com': { [keyId]: flipped } },
+    };
+    const [okOrig, badType, badSig, hashOk] = await Promise.all([
+      verifySignature(signed, 'ex.com', keyId, publicKey),
+      verifySignature(typeMut, 'ex.com', keyId, publicKey),
+      verifySignature(sigMut, 'ex.com', keyId, publicKey),
+      verifyContentHash(
+        { type: 'm.test', content: { v: 1 } },
+        await calculateContentHash({ type: 'm.test', content: { v: 1 }, unsigned: { age: 1 } })
+      ),
+    ]);
+    expect(okOrig).toBe(true);
+    expect(badType).toBe(false);
+    expect(badSig).toBe(false);
+    expect(hashOk).toBe(true);
+    expect(flipped).not.toBe(origSig);
+    spy.mockRestore();
+  });
+
+  for (let i = 0; i < 6; i++) {
+    it(`cross-server∥wrong-pub∥missing-server∥content-hash flood-${i}`, async () => {
+      const a = await generateSigningKeyPair();
+      const b = await generateSigningKeyPair();
+      const obj = { type: 'm.test', content: { n: i }, unsigned: { age: i } };
+      const once = await signJson(obj, 'a.example.com', a.keyId, a.privateKeyJwk);
+      const [twice, hash] = await Promise.all([
+        signJson(once, 'b.example.com', b.keyId, b.privateKeyJwk),
+        calculateContentHash(obj),
+      ]);
+      const [okA, okB, wrongPub, miss, hashOk] = await Promise.all([
+        verifySignature(twice, 'a.example.com', a.keyId, a.publicKey),
+        verifySignature(twice, 'b.example.com', b.keyId, b.publicKey),
+        verifySignature(twice, 'a.example.com', a.keyId, b.publicKey),
+        verifySignature(twice, 'gone.example.com', a.keyId, a.publicKey),
+        verifyContentHash(obj, hash),
+      ]);
+      expect(okA).toBe(true);
+      expect(okB).toBe(true);
+      expect(wrongPub).toBe(false);
+      expect(miss).toBe(false);
+      expect(hashOk).toBe(true);
+      expect(twice.unsigned).toEqual({ age: i });
+    });
+  }
+});
