@@ -22,7 +22,6 @@ import {
   getBatchRoomMetadata,
   getRoomCacheGeneration,
   getRoomMetadata,
-  invalidateBatchRoomCache,
   invalidateRoomCache,
   type RoomMetadata,
 } from '../src/services/room-cache';
