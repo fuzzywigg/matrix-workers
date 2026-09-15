@@ -599,20 +599,26 @@ describe('race septendecenary getBatch putHold∥getThrow∥inv deleteThrow afte
         expect(ctl.events.some((e) => e.includes(`put-wait:${metaKey(ROOM_A)}`))).toBe(true);
       });
 
-      const inv = await invP;
-      expect(inv).toBeUndefined();
-      // deleteThrow swallowed; stale C may remain
-      expect(ctl.deleteCount.get(metaKey(ROOM_C)) ?? 0).toBe(1);
-
-      releasePut(metaKey(ROOM_A));
+      // getBatch returns before fire-and-forget put settles
       const map = await batchP;
       expect(map.get(ROOM_A)?.name).toBe('FreshA');
       expect(map.get(ROOM_B)?.name).toBe('FreshB');
       expect(db.batchCalls).toBe(2);
-      expect(JSON.parse(ctl.data[metaKey(ROOM_A)]).name).toBe('FreshA');
       expect(JSON.parse(ctl.data[metaKey(ROOM_B)]).name).toBe('FreshB');
-      expect(ctl.putTtl.get(metaKey(ROOM_A))).toBe(TTL_SECONDS);
       expect(ctl.putTtl.get(metaKey(ROOM_B))).toBe(TTL_SECONDS);
+      // A put still held — key not written yet
+      expect(ctl.data[metaKey(ROOM_A)]).toBeUndefined();
+
+      const inv = await invP;
+      expect(inv).toBeUndefined();
+      expect(ctl.deleteCount.get(metaKey(ROOM_C)) ?? 0).toBe(1);
+
+      releasePut(metaKey(ROOM_A));
+      await vi.waitFor(() => {
+        expect(ctl.data[metaKey(ROOM_A)]).toBeDefined();
+      });
+      expect(JSON.parse(ctl.data[metaKey(ROOM_A)]).name).toBe('FreshA');
+      expect(ctl.putTtl.get(metaKey(ROOM_A))).toBe(TTL_SECONDS);
     });
   }
 });
