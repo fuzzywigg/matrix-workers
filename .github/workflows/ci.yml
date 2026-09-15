@@ -113,8 +113,8 @@ jobs:
       - run: npm run test:turn-concurrent
 
   # Fail-fast canary for oauth + devices/keys soft concurrent leftovers
-  # (denary/undecenary/duodenary oauth + seventh/eighth/ninth-wave devices).
-  # Isolates flake attribution before the full vitest suite.
+  # (denary–duodenary/quattuordecenary oauth + seventh–ninth/eleventh-wave
+  # devices). Isolates flake attribution before the full vitest suite.
   oauth-devices:
     name: OAuth/Devices Concurrent Canary
     runs-on: ubuntu-latest
