@@ -1284,3 +1284,118 @@ describe('errors TOKENMAXX residual septenary leftovers after #336', () => {
     expect(e.headers.get('Content-Type')).toBe('application/json');
   });
 });
+
+describe('errors TOKENMAXX residual octonary leftovers after #356', () => {
+  it('forbidden/missingToken/unauthorized/userDeactivated default exacts under race', async () => {
+    const [forb, miss, unauth, deact] = await Promise.all([
+      Promise.resolve(Errors.forbidden().toResponse()),
+      Promise.resolve(Errors.missingToken().toResponse()),
+      Promise.resolve(Errors.unauthorized().toResponse()),
+      Promise.resolve(Errors.userDeactivated().toResponse()),
+    ]);
+    expect(new Set([forb, miss, unauth, deact]).size).toBe(4);
+    expect(forb.status).toBe(403);
+    expect(miss.status).toBe(401);
+    expect(unauth.status).toBe(401);
+    expect(deact.status).toBe(403);
+    await expect(forb.json()).resolves.toEqual({ errcode: 'M_FORBIDDEN', error: 'Forbidden' });
+    await expect(miss.json()).resolves.toEqual({
+      errcode: 'M_MISSING_TOKEN',
+      error: 'Missing access token',
+    });
+    await expect(unauth.json()).resolves.toEqual({
+      errcode: 'M_UNAUTHORIZED',
+      error: 'Unauthorized',
+    });
+    await expect(deact.json()).resolves.toEqual({
+      errcode: 'M_USER_DEACTIVATED',
+      error: 'User account has been deactivated',
+    });
+  });
+
+  it('invalidUsername/userInUse/roomInUse/guestAccessForbidden defaults under race', async () => {
+    const [inv, use, room, guest] = await Promise.all([
+      Promise.resolve(Errors.invalidUsername().toResponse()),
+      Promise.resolve(Errors.userInUse().toResponse()),
+      Promise.resolve(Errors.roomInUse().toResponse()),
+      Promise.resolve(Errors.guestAccessForbidden().toResponse()),
+    ]);
+    expect(inv.status).toBe(400);
+    expect(use.status).toBe(400);
+    expect(room.status).toBe(400);
+    expect(guest.status).toBe(403);
+    await expect(inv.json()).resolves.toEqual({
+      errcode: 'M_INVALID_USERNAME',
+      error: 'Invalid username',
+    });
+    await expect(use.json()).resolves.toEqual({
+      errcode: 'M_USER_IN_USE',
+      error: 'User ID already taken',
+    });
+    await expect(room.json()).resolves.toEqual({
+      errcode: 'M_ROOM_IN_USE',
+      error: 'Room alias already taken',
+    });
+    await expect(guest.json()).resolves.toEqual({
+      errcode: 'M_GUEST_ACCESS_FORBIDDEN',
+      error: 'Guest access forbidden',
+    });
+  });
+
+  it('withErrorHandler success pass-through ∥ forbidden ∥ missingToken customs', async () => {
+    const [ok, forb, miss] = await Promise.all([
+      withErrorHandler(async () => ({ ok: true })),
+      withErrorHandler(async () => {
+        throw Errors.forbidden('nope');
+      }),
+      withErrorHandler(async () => {
+        throw Errors.missingToken('gone');
+      }),
+    ]);
+    expect(ok).toEqual({ ok: true });
+    expect((forb as Response).status).toBe(403);
+    expect((miss as Response).status).toBe(401);
+    await expect((forb as Response).json()).resolves.toEqual({
+      errcode: 'M_FORBIDDEN',
+      error: 'nope',
+    });
+    await expect((miss as Response).json()).resolves.toEqual({
+      errcode: 'M_MISSING_TOKEN',
+      error: 'gone',
+    });
+  });
+
+  it('invalidRoomState/unsupportedRoomVersion customs ∥ toJSON under race', async () => {
+    const [irs, urv, irsDef, urvDef] = await Promise.all([
+      Promise.resolve(Errors.invalidRoomState('bad-state').toJSON()),
+      Promise.resolve(Errors.unsupportedRoomVersion('99').toJSON()),
+      Promise.resolve(Errors.invalidRoomState().toJSON()),
+      Promise.resolve(Errors.unsupportedRoomVersion().toJSON()),
+    ]);
+    expect(irs).toEqual({ errcode: 'M_INVALID_ROOM_STATE', error: 'bad-state' });
+    expect(urv).toEqual({ errcode: 'M_UNSUPPORTED_ROOM_VERSION', error: '99' });
+    expect(irsDef).toEqual({
+      errcode: 'M_INVALID_ROOM_STATE',
+      error: 'Invalid room state',
+    });
+    expect(urvDef).toEqual({
+      errcode: 'M_UNSUPPORTED_ROOM_VERSION',
+      error: 'Unsupported room version',
+    });
+  });
+
+  it('jsonResponse nested ∥ emptyResponse 203 ∥ jsonResponse null under race', async () => {
+    const [nested, empty, nul] = await Promise.all([
+      Promise.resolve(jsonResponse({ a: { b: [1, null] } }, 201)),
+      Promise.resolve(emptyResponse(203)),
+      Promise.resolve(jsonResponse(null, 200)),
+    ]);
+    expect(new Set([nested, empty, nul]).size).toBe(3);
+    expect(nested.status).toBe(201);
+    expect(empty.status).toBe(203);
+    expect(nul.status).toBe(200);
+    await expect(nested.json()).resolves.toEqual({ a: { b: [1, null] } });
+    await expect(empty.json()).resolves.toEqual({});
+    await expect(nul.json()).resolves.toBeNull();
+  });
+});
