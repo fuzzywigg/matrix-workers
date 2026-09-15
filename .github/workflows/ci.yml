@@ -39,7 +39,7 @@ jobs:
       - run: npm run lint
 
   # Fail-fast canary for media + presence/receipts/typing soft∥success
-  # concurrent leftovers (first wave #301 + residual second/third/fourth/fifth waves).
+  # concurrent leftovers (first wave #301 + residual second/third/fourth/fifth + eighth waves).
   # Isolates flake attribution before the full vitest suite.
   media-presence-soft-concurrent:
     name: Media/Presence Soft Concurrent Canary
