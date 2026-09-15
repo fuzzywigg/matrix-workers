@@ -2677,17 +2677,23 @@ describe('federation signing TOKENMAXX residual duodenary leftovers after #380',
     );
     const truncated = {
       ...signed,
-      signatures: { 'ex.com': { [keyId]: 'YQ' } }, // too-short base64url
+      signatures: { 'ex.com': { [keyId]: 'YQ' } }, // too-short base64url → verify false (may or may not log)
     };
     const emptyKeyMap = { ...signed, signatures: { 'ex.com': {} } };
-    const [ok, trunc, emptyMap] = await Promise.all([
+    const garbage = {
+      ...signed,
+      signatures: { 'ex.com': { [keyId]: '!!!not-valid-b64!!!' } },
+    };
+    const [ok, trunc, emptyMap, garb] = await Promise.all([
       verifySignature(signed, 'ex.com', keyId, publicKey),
       verifySignature(truncated, 'ex.com', keyId, publicKey),
       verifySignature(emptyKeyMap, 'ex.com', keyId, publicKey),
+      verifySignature(garbage, 'ex.com', keyId, publicKey),
     ]);
     expect(ok).toBe(true);
     expect(trunc).toBe(false);
     expect(emptyMap).toBe(false);
+    expect(garb).toBe(false);
     expect(
       spy.mock.calls.some((c) => String(c[0]).includes('Signature verification failed'))
     ).toBe(true);

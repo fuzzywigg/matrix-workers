@@ -1484,15 +1484,15 @@ describe('errors TOKENMAXX residual denary leftovers after #380', () => {
     expect(unr).toEqual({ errcode: 'M_UNRECOGNIZED', error: 'huh' });
   });
 
-  it('jsonResponse string ∥ emptyResponse 204 ∥ jsonResponse 0 under race', async () => {
+  it('jsonResponse string ∥ emptyResponse 202 ∥ jsonResponse 0 under race', async () => {
     const [str, empty, zero] = await Promise.all([
       Promise.resolve(jsonResponse('denary', 201)),
-      Promise.resolve(emptyResponse(204)),
+      Promise.resolve(emptyResponse(202)),
       Promise.resolve(jsonResponse(0, 200)),
     ]);
     expect(new Set([str, empty, zero]).size).toBe(3);
     expect(str.status).toBe(201);
-    expect(empty.status).toBe(204);
+    expect(empty.status).toBe(202);
     expect(zero.status).toBe(200);
     await expect(str.json()).resolves.toBe('denary');
     await expect(empty.json()).resolves.toEqual({});
