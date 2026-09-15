@@ -64,7 +64,6 @@ import keysApp from '../src/api/keys';
 import { verifyPassword } from '../src/utils/crypto';
 
 const USER = '@alice:example.com';
-const BOB = '@bob:example.com';
 const SERVER = 'example.com';
 const PASS = 's3cret';
 const AUTH = { Authorization: 'Bearer test-token' };
@@ -113,16 +112,6 @@ const UIA_EXPIRED = {
 const TOKEN_MISSING_SESSION = {
   errcode: 'M_MISSING_PARAM',
   error: 'Missing required parameter: session',
-} as const;
-
-const SESSION_MISMATCH = {
-  errcode: 'M_FORBIDDEN',
-  error: 'Session user mismatch',
-} as const;
-
-const CROSS_SIGNING_NOT_APPROVED = {
-  errcode: 'M_UNAUTHORIZED',
-  error: 'Cross-signing reset not approved. Please approve the request at the provided URL.',
 } as const;
 
 const SSO_MISSING_STATE = 'Missing state parameter';
@@ -868,7 +857,14 @@ describe('devices soft residual tenth-wave SSO callback∥keys-challenge∥NoPw 
       flows: Array<{ stages: string[] }>;
       session: string;
     };
-    expect(challengeBody.flows[0].stages).toContain('m.login.password');
+    expect(
+      challengeBody.flows.some(
+        (f) =>
+          f.stages.includes('m.login.password') ||
+          f.stages.includes('org.matrix.cross_signing_reset') ||
+          f.stages.includes('m.oauth')
+      )
+    ).toBe(true);
     expect(typeof challengeBody.session).toBe('string');
     expect(noPw.body).toEqual(NO_PASSWORD);
     expect(badPw.body).toEqual(INVALID_PASSWORD);

@@ -456,10 +456,6 @@ const UIA_ACCOUNT_MISMATCH =
 const UIA_MISSING_BODY = 'No UIA session specified.';
 const UIA_EXPIRED_BODY = 'This session has expired. Please try again.';
 const UIA_DEFAULT_DESC = 'An application is requesting your approval.';
-const UIA_CROSS_SIGNING_DESC =
-  'An application is requesting to reset your encryption identity. This will allow you to set up encryption again, but you may lose access to old encrypted messages.';
-const UIA_SENSITIVE =
-  'This is a sensitive operation. Please verify this is what you intended.';
 const AUTH_REQUEST_EXPIRED = 'Authorization request expired';
 const LOGIN_MISSING_CREDS = 'Missing username or password';
 
@@ -471,10 +467,6 @@ function hasLoginNoPeriod(htmls: string[]): boolean {
   return htmls.some(
     (h) => h.includes(LOGIN_INVALID_NO_PERIOD) && !h.includes(UIA_INVALID_WITH_PERIOD)
   );
-}
-
-function hasUiaPeriod(htmls: string[]): boolean {
-  return htmls.some((h) => h.includes(UIA_INVALID_WITH_PERIOD));
 }
 
 beforeEach(() => {
@@ -493,128 +485,41 @@ afterEach(() => {
 
 
 // ---------------------------------------------------------------------------
-// account-mismatch ∥ Session Expired ∥ Missing Session ∥ Request Approved
+// Username required ∥ Cancelled ∥ AUTH expired JSON ∥ login Missing
 // ---------------------------------------------------------------------------
 
-describe('duodenary oauth mismatch∥Expired∥Missing∥Approved after #324', () => {
-  it('account-mismatch ∥ Session Expired ∥ Missing Session ∥ Request Approved under race', async () => {
-    const cache = mockKv();
-    seedUiaSession(cache, 'uia-mm');
-    seedUiaSession(cache, 'uia-ok');
-    const env = makeEnv({ cache, db: aliceDb() });
-    const results = await Promise.all([
-      request(
-        '/oauth/authorize/uia',
-        formInit({ session: 'uia-mm', username: 'bob', password: 'bobpass' }),
-        env
-      ),
-      request('/oauth/authorize/uia?session=gone', {}, env),
-      request('/oauth/authorize/uia', {}, env),
-      request(
-        '/oauth/authorize/uia',
-        formInit({ session: 'uia-ok', username: 'alice', password: 'secret' }),
-        env
-      ),
-    ]);
-    expect(results.every((r) => r.status === 200)).toBe(true);
-    const htmls = htmlOf(results);
-    expect(htmls.some((h) => h.includes(UIA_ACCOUNT_MISMATCH))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_EXPIRED_BODY))).toBe(true);
-    expect(htmls.some((h) => h.includes('Session Expired'))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_MISSING_BODY))).toBe(true);
-    expect(htmls.some((h) => h.includes('Missing Session'))).toBe(true);
-    expect(htmls.some((h) => h.includes('Request Approved'))).toBe(true);
-  });
-
-  it('mismatch ∥ Expired ∥ Missing ∥ Approved ∥ credentials-desc penta', async () => {
-    const cache = mockKv();
-    seedUiaSession(cache, 'uia-mm');
-    seedUiaSession(cache, 'uia-ok');
-    seedUiaSession(cache, 'uia-cred');
-    const env = makeEnv({ cache, db: aliceDb() });
-    const results = await Promise.all([
-      request(
-        '/oauth/authorize/uia',
-        formInit({ session: 'uia-mm', username: 'bob', password: 'bobpass' }),
-        env
-      ),
-      request('/oauth/authorize/uia?session=gone', {}, env),
-      request('/oauth/authorize/uia', {}, env),
-      request(
-        '/oauth/authorize/uia',
-        formInit({ session: 'uia-ok', username: 'alice', password: 'secret' }),
-        env
-      ),
-      request(
-        '/oauth/authorize/uia',
-        formInit({ session: 'uia-cred', password: 'x' }),
-        env
-      ),
-    ]);
-    const htmls = htmlOf(results);
-    expect(htmls.some((h) => h.includes(UIA_ACCOUNT_MISMATCH))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_EXPIRED_BODY))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_MISSING_BODY))).toBe(true);
-    expect(htmls.some((h) => h.includes('Request Approved'))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_CREDENTIALS_DESC))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_USERNAME_REQUIRED))).toBe(true);
-  });
-
-  for (let i = 0; i < 8; i++) {
-    it(`mismatch ∥ Expired ∥ Missing ∥ Approved flood-${i}`, async () => {
-      const cache = mockKv();
-      seedUiaSession(cache, `uia-mm-${i}`);
-      seedUiaSession(cache, `uia-ok-${i}`);
-      const env = makeEnv({ cache, db: aliceDb() });
-      const results = await Promise.all([
-        request(
-          '/oauth/authorize/uia',
-          formInit({
-            session: `uia-mm-${i}`,
-            username: 'bob',
-            password: 'bobpass',
-          }),
-          env
-        ),
-        request(`/oauth/authorize/uia?session=gone-${i}`, {}, env),
-        request('/oauth/authorize/uia', {}, env),
-        request(
-          '/oauth/authorize/uia',
-          formInit({
-            session: `uia-ok-${i}`,
-            username: 'alice',
-            password: 'secret',
-          }),
-          env
-        ),
-      ]);
-      const htmls = htmlOf(results);
-      expect(htmls.some((h) => h.includes(UIA_ACCOUNT_MISMATCH))).toBe(true);
-      expect(htmls.some((h) => h.includes(UIA_EXPIRED_BODY))).toBe(true);
-      expect(htmls.some((h) => h.includes(UIA_MISSING_BODY))).toBe(true);
-      expect(htmls.some((h) => h.includes('Request Approved'))).toBe(true);
-    });
-  }
-});
-
-
-// ---------------------------------------------------------------------------
-// cross-signing ∥ sensitive ∥ login Missing ∥ Username required
-// ---------------------------------------------------------------------------
-
-describe('duodenary oauth cross-signing∥sensitive∥Missing∥Username after #324', () => {
-  it('cross-signing desc ∥ sensitive ∥ login Missing ∥ Username required under race', async () => {
+describe('tridecenary oauth Username∥Cancelled∥AUTH-expired∥Missing after #340', () => {
+  it('Username required ∥ Request Cancelled ∥ Authorization request expired ∥ login Missing under race', async () => {
     const cache = mockKv();
     seedClient(cache, 'cid-1');
-    seedUiaSession(cache, 'uia-xr');
     seedUiaSession(cache, 'uia-cred');
+    seedUiaSession(cache, 'uia-cancel');
     const sessions = mockKv();
     seedAuthRequest(sessions, 'ar-miss');
     const env = makeEnv({ cache, sessions, db: aliceDb() });
     const results = await Promise.all([
       request(
-        '/oauth/authorize/uia?session=uia-xr&action=org.matrix.cross_signing_reset',
-        {},
+        '/oauth/authorize/uia',
+        formInit({ session: 'uia-cred', password: 'x' }),
+        env
+      ),
+      request(
+        '/oauth/authorize/uia',
+        formInit({
+          session: 'uia-cancel',
+          username: 'alice',
+          password: 'secret',
+          action: 'cancel',
+        }),
+        env
+      ),
+      request(
+        '/oauth/authorize',
+        formInit({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: 'gone',
+        }),
         env
       ),
       request(
@@ -622,36 +527,50 @@ describe('duodenary oauth cross-signing∥sensitive∥Missing∥Username after #
         formInit({ password: 'secret', auth_request_id: 'ar-miss' }),
         env
       ),
-      request(
-        '/oauth/authorize/uia',
-        formInit({ session: 'uia-cred', password: 'x' }),
-        env
-      ),
-      request('/oauth/authorize/uia?session=uia-xr&action=org.matrix.cross_signing_reset', {}, env),
     ]);
-    expect(results.every((r) => r.status === 200)).toBe(true);
-    const htmls = htmlOf(results);
-    expect(htmls.some((h) => h.includes(UIA_CROSS_SIGNING_DESC))).toBe(true);
-    expect(htmls.some((h) => h.includes('Reset Encryption Keys'))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_SENSITIVE))).toBe(true);
-    expect(htmls.some((h) => h.includes(LOGIN_MISSING_CREDS))).toBe(true);
+    expect(results[2].body).toMatchObject({
+      error_description: AUTH_REQUEST_EXPIRED,
+    });
+    const htmls = htmlOf(results.filter((_, i) => i !== 2));
     expect(htmls.some((h) => h.includes(UIA_USERNAME_REQUIRED))).toBe(true);
     expect(htmls.some((h) => h.includes(UIA_CREDENTIALS_DESC))).toBe(true);
+    expect(htmls.some((h) => h.includes('Request Cancelled'))).toBe(true);
+    expect(htmls.some((h) => h.includes(LOGIN_MISSING_CREDS))).toBe(true);
+    expect(cache.data['uia_session:uia-cancel']).toBeUndefined();
   });
 
-  it('cross-signing ∥ sensitive ∥ Missing ∥ Username ∥ default desc penta', async () => {
+  it('Username ∥ Cancelled ∥ AUTH expired ∥ Missing ∥ credentials-desc penta', async () => {
     const cache = mockKv();
     seedClient(cache, 'cid-1');
-    seedUiaSession(cache, 'uia-xr');
     seedUiaSession(cache, 'uia-cred');
-    seedUiaSession(cache, 'uia-def');
+    seedUiaSession(cache, 'uia-cancel');
+    seedUiaSession(cache, 'uia-cred2');
     const sessions = mockKv();
     seedAuthRequest(sessions, 'ar-miss');
     const env = makeEnv({ cache, sessions, db: aliceDb() });
     const results = await Promise.all([
       request(
-        '/oauth/authorize/uia?session=uia-xr&action=org.matrix.cross_signing_reset',
-        {},
+        '/oauth/authorize/uia',
+        formInit({ session: 'uia-cred', username: 'alice' }),
+        env
+      ),
+      request(
+        '/oauth/authorize/uia',
+        formInit({
+          session: 'uia-cancel',
+          username: 'alice',
+          password: 'secret',
+          action: 'cancel',
+        }),
+        env
+      ),
+      request(
+        '/oauth/authorize',
+        formInit({
+          username: 'alice',
+          password: 'secret',
+          auth_request_id: 'gone',
+        }),
         env
       ),
       request(
@@ -661,38 +580,56 @@ describe('duodenary oauth cross-signing∥sensitive∥Missing∥Username after #
       ),
       request(
         '/oauth/authorize/uia',
-        formInit({ session: 'uia-cred', password: 'x' }),
-        env
-      ),
-      request('/oauth/authorize/uia?session=uia-def', {}, env),
-      request(
-        '/oauth/authorize',
-        formInit({ password: 'x', auth_request_id: 'ar-miss' }),
+        formInit({ session: 'uia-cred2', password: 'x' }),
         env
       ),
     ]);
-    const htmls = htmlOf(results);
-    expect(htmls.some((h) => h.includes(UIA_CROSS_SIGNING_DESC))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_SENSITIVE))).toBe(true);
-    expect(htmls.some((h) => h.includes(LOGIN_MISSING_CREDS))).toBe(true);
+    expect(results[2].body).toMatchObject({
+      error_description: AUTH_REQUEST_EXPIRED,
+    });
+    const htmls = htmlOf(results.filter((_, i) => i !== 2));
     expect(htmls.some((h) => h.includes(UIA_USERNAME_REQUIRED))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_DEFAULT_DESC))).toBe(true);
-    expect(htmls.some((h) => h.includes('Approve Request'))).toBe(true);
+    expect(htmls.some((h) => h.includes('Request Cancelled'))).toBe(true);
+    expect(htmls.some((h) => h.includes(LOGIN_MISSING_CREDS))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_CREDENTIALS_DESC))).toBe(true);
   });
 
   for (let i = 0; i < 8; i++) {
-    it(`cross-signing ∥ sensitive ∥ Missing ∥ Username flood-${i}`, async () => {
+    it(`Username ∥ Cancelled ∥ AUTH expired ∥ Missing flood-${i}`, async () => {
       const cache = mockKv();
       seedClient(cache, 'cid-1');
-      seedUiaSession(cache, `uia-xr-${i}`);
       seedUiaSession(cache, `uia-cred-${i}`);
+      seedUiaSession(cache, `uia-cancel-${i}`);
       const sessions = mockKv();
       seedAuthRequest(sessions, `ar-miss-${i}`);
       const env = makeEnv({ cache, sessions, db: aliceDb() });
       const results = await Promise.all([
         request(
-          `/oauth/authorize/uia?session=uia-xr-${i}&action=org.matrix.cross_signing_reset`,
-          {},
+          '/oauth/authorize/uia',
+          formInit(
+            i % 2 === 0
+              ? { session: `uia-cred-${i}`, password: 'x' }
+              : { session: `uia-cred-${i}`, username: 'alice' }
+          ),
+          env
+        ),
+        request(
+          '/oauth/authorize/uia',
+          formInit({
+            session: `uia-cancel-${i}`,
+            username: 'alice',
+            password: 'secret',
+            action: 'cancel',
+          }),
+          env
+        ),
+        request(
+          '/oauth/authorize',
+          formInit({
+            username: 'alice',
+            password: 'secret',
+            auth_request_id: `gone-${i}`,
+          }),
           env
         ),
         request(
@@ -704,49 +641,172 @@ describe('duodenary oauth cross-signing∥sensitive∥Missing∥Username after #
           ),
           env
         ),
-        request(
-          '/oauth/authorize/uia',
-          formInit({ session: `uia-cred-${i}`, password: 'x' }),
-          env
-        ),
       ]);
-      const htmls = htmlOf(results);
-      expect(htmls.some((h) => h.includes(UIA_CROSS_SIGNING_DESC))).toBe(true);
-      expect(htmls.some((h) => h.includes(UIA_SENSITIVE))).toBe(true);
-      expect(htmls.some((h) => h.includes(LOGIN_MISSING_CREDS))).toBe(true);
+      expect(results[2].body).toMatchObject({
+        error_description: AUTH_REQUEST_EXPIRED,
+      });
+      const htmls = htmlOf(results.filter((_, i2) => i2 !== 2));
       expect(htmls.some((h) => h.includes(UIA_USERNAME_REQUIRED))).toBe(true);
+      expect(htmls.some((h) => h.includes('Request Cancelled'))).toBe(true);
+      expect(htmls.some((h) => h.includes(LOGIN_MISSING_CREDS))).toBe(true);
     });
   }
 });
 
 
 // ---------------------------------------------------------------------------
-// Cancelled ∥ OIDC Approved ∥ UIA period ∥ login no-period
+// default desc ∥ parse fail ∥ Session Expired ∥ login no-period
 // ---------------------------------------------------------------------------
 
-describe('duodenary oauth Cancelled∥OIDC-approve∥period∥no-period after #324', () => {
-  it('Request Cancelled ∥ OIDC Approved ∥ UIA period ∥ login no-period under race', async () => {
+describe('tridecenary oauth default∥parse∥Expired∥no-period after #340', () => {
+  it('default desc ∥ parse fail ∥ Session Expired ∥ login no-period under race', async () => {
+    const spy = vi
+      .spyOn(HonoRequest.prototype, 'parseBody')
+      .mockRejectedValueOnce(new Error('tridecenary-parse'));
     const cache = mockKv();
     seedClient(cache, 'cid-1');
-    seedUiaSession(cache, 'uia-cancel');
-    seedUiaSession(cache, 'uia-oidc', { user_id: OIDC_ID });
-    seedUiaSession(cache, 'uia-bad');
+    seedUiaSession(cache, 'uia-def');
+    seedUiaSession(cache, 'uia-parse');
     const sessions = mockKv();
     seedAuthRequest(sessions, 'ar-bad');
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request('/oauth/authorize/uia?session=uia-def', {}, env),
+      request(
+        '/oauth/authorize/uia',
+        formInit({ session: 'uia-parse', username: 'alice', password: 'secret' }),
+        env
+      ),
+      request('/oauth/authorize/uia?session=gone', {}, env),
+      request(
+        '/oauth/authorize',
+        formInit({
+          username: 'alice',
+          password: 'wrong',
+          auth_request_id: 'ar-bad',
+        }),
+        env
+      ),
+    ]);
+    spy.mockRestore();
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    const htmls = htmlOf(results);
+    expect(htmls.some((h) => h.includes(UIA_DEFAULT_DESC))).toBe(true);
+    expect(htmls.some((h) => h.includes('Approve Request'))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_PARSE_BODY))).toBe(true);
+    expect(htmls.some((h) => h.includes('Invalid Request'))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_EXPIRED_BODY))).toBe(true);
+    expect(htmls.some((h) => h.includes('Session Expired'))).toBe(true);
+    expect(hasLoginNoPeriod(htmls)).toBe(true);
+  });
+
+  it('default ∥ parse ∥ Expired ∥ no-period ∥ Username required penta', async () => {
+    const spy = vi
+      .spyOn(HonoRequest.prototype, 'parseBody')
+      .mockRejectedValueOnce(new Error('tridecenary-parse-penta'));
+    const cache = mockKv();
+    seedClient(cache, 'cid-1');
+    seedUiaSession(cache, 'uia-def');
+    seedUiaSession(cache, 'uia-parse');
+    seedUiaSession(cache, 'uia-cred');
+    const sessions = mockKv();
+    seedAuthRequest(sessions, 'ar-bad');
+    const env = makeEnv({ cache, sessions, db: aliceDb() });
+    const results = await Promise.all([
+      request('/oauth/authorize/uia?session=uia-def', {}, env),
+      request(
+        '/oauth/authorize/uia',
+        formInit({ session: 'uia-parse', username: 'alice', password: 'secret' }),
+        env
+      ),
+      request('/oauth/authorize/uia?session=gone', {}, env),
+      request(
+        '/oauth/authorize',
+        formInit({
+          username: 'alice',
+          password: 'nope',
+          auth_request_id: 'ar-bad',
+        }),
+        env
+      ),
+      request(
+        '/oauth/authorize/uia',
+        formInit({ session: 'uia-cred', password: 'x' }),
+        env
+      ),
+    ]);
+    spy.mockRestore();
+    const htmls = htmlOf(results);
+    expect(htmls.some((h) => h.includes(UIA_DEFAULT_DESC))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_PARSE_BODY))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_EXPIRED_BODY))).toBe(true);
+    expect(hasLoginNoPeriod(htmls)).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_USERNAME_REQUIRED))).toBe(true);
+  });
+
+  for (let i = 0; i < 8; i++) {
+    it(`default ∥ parse ∥ Expired ∥ no-period flood-${i}`, async () => {
+      const spy = vi
+        .spyOn(HonoRequest.prototype, 'parseBody')
+        .mockRejectedValueOnce(new Error(`tridecenary-parse-${i}`));
+      const cache = mockKv();
+      seedClient(cache, 'cid-1');
+      seedUiaSession(cache, `uia-def-${i}`);
+      seedUiaSession(cache, `uia-parse-${i}`);
+      const sessions = mockKv();
+      seedAuthRequest(sessions, `ar-bad-${i}`);
+      const env = makeEnv({ cache, sessions, db: aliceDb() });
+      const results = await Promise.all([
+        request(`/oauth/authorize/uia?session=uia-def-${i}`, {}, env),
+        request(
+          '/oauth/authorize/uia',
+          formInit({
+            session: `uia-parse-${i}`,
+            username: 'alice',
+            password: 'secret',
+          }),
+          env
+        ),
+        request(`/oauth/authorize/uia?session=gone-${i}`, {}, env),
+        request(
+          '/oauth/authorize',
+          formInit({
+            username: 'alice',
+            password: `bad-${i}`,
+            auth_request_id: `ar-bad-${i}`,
+          }),
+          env
+        ),
+      ]);
+      spy.mockRestore();
+      const htmls = htmlOf(results);
+      expect(htmls.some((h) => h.includes(UIA_DEFAULT_DESC))).toBe(true);
+      expect(htmls.some((h) => h.includes(UIA_PARSE_BODY))).toBe(true);
+      expect(htmls.some((h) => h.includes(UIA_EXPIRED_BODY))).toBe(true);
+      expect(hasLoginNoPeriod(htmls)).toBe(true);
+    });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// password mismatch ∥ OIDC Approved ∥ Missing Session ∥ credentials-desc
+// ---------------------------------------------------------------------------
+
+describe('tridecenary oauth mismatch∥OIDC-approve∥Missing∥credentials after #340', () => {
+  it('password mismatch ∥ OIDC Approved ∥ Missing Session ∥ credentials-desc under race', async () => {
+    const cache = mockKv();
+    seedUiaSession(cache, 'uia-mm');
+    seedUiaSession(cache, 'uia-oidc', { user_id: OIDC_ID });
+    seedUiaSession(cache, 'uia-cred');
     const env = makeEnv({
       cache,
-      sessions,
       db: aliceDb(undefined, [OIDC_ID]),
     });
     const results = await Promise.all([
       request(
         '/oauth/authorize/uia',
-        formInit({
-          session: 'uia-cancel',
-          username: 'alice',
-          password: 'secret',
-          action: 'cancel',
-        }),
+        formInit({ session: 'uia-mm', username: 'bob', password: 'bobpass' }),
         env
       ),
       request(
@@ -754,48 +814,36 @@ describe('duodenary oauth Cancelled∥OIDC-approve∥period∥no-period after #3
         formInit({ session: 'uia-oidc', username: 'oidc', password: 'x' }),
         env
       ),
+      request('/oauth/authorize/uia', {}, env),
       request(
         '/oauth/authorize/uia',
-        formInit({ session: 'uia-bad', username: 'alice', password: 'wrong' }),
-        env
-      ),
-      request(
-        '/oauth/authorize',
-        formInit({ username: 'alice', password: 'wrong', auth_request_id: 'ar-bad' }),
+        formInit({ session: 'uia-cred', password: 'x' }),
         env
       ),
     ]);
     expect(results.every((r) => r.status === 200)).toBe(true);
     const htmls = htmlOf(results);
-    expect(htmls.some((h) => h.includes('Request Cancelled'))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_ACCOUNT_MISMATCH))).toBe(true);
     expect(htmls.some((h) => h.includes('Request Approved'))).toBe(true);
-    expect(hasUiaPeriod(htmls)).toBe(true);
-    expect(hasLoginNoPeriod(htmls)).toBe(true);
-    expect(cache.data['uia_session:uia-cancel']).toBeUndefined();
+    expect(htmls.some((h) => h.includes(UIA_MISSING_BODY))).toBe(true);
+    expect(htmls.some((h) => h.includes('Missing Session'))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_CREDENTIALS_DESC))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_USERNAME_REQUIRED))).toBe(true);
   });
 
-  it('Cancelled ∥ OIDC approve ∥ period ∥ no-period ∥ Expired body penta', async () => {
+  it('mismatch ∥ OIDC approve ∥ Missing ∥ credentials ∥ Expired body penta', async () => {
     const cache = mockKv();
-    seedClient(cache, 'cid-1');
-    seedUiaSession(cache, 'uia-cancel');
+    seedUiaSession(cache, 'uia-mm');
     seedUiaSession(cache, 'uia-oidc', { user_id: OIDC_ID });
-    seedUiaSession(cache, 'uia-bad');
-    const sessions = mockKv();
-    seedAuthRequest(sessions, 'ar-bad');
+    seedUiaSession(cache, 'uia-cred');
     const env = makeEnv({
       cache,
-      sessions,
       db: aliceDb(undefined, [OIDC_ID]),
     });
     const results = await Promise.all([
       request(
         '/oauth/authorize/uia',
-        formInit({
-          session: 'uia-cancel',
-          username: 'alice',
-          password: 'secret',
-          action: 'cancel',
-        }),
+        formInit({ session: 'uia-mm', username: 'bob', password: 'bobpass' }),
         env
       ),
       request(
@@ -803,48 +851,39 @@ describe('duodenary oauth Cancelled∥OIDC-approve∥period∥no-period after #3
         formInit({ session: 'uia-oidc', username: 'oidc', password: 'x' }),
         env
       ),
+      request('/oauth/authorize/uia', {}, env),
       request(
         '/oauth/authorize/uia',
-        formInit({ session: 'uia-bad', username: 'ghost', password: 'x' }),
-        env
-      ),
-      request(
-        '/oauth/authorize',
-        formInit({ username: 'alice', password: 'nope', auth_request_id: 'ar-bad' }),
+        formInit({ session: 'uia-cred', username: 'alice' }),
         env
       ),
       request('/oauth/authorize/uia?session=gone', {}, env),
     ]);
     const htmls = htmlOf(results);
-    expect(htmls.some((h) => h.includes('Request Cancelled'))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_ACCOUNT_MISMATCH))).toBe(true);
     expect(htmls.some((h) => h.includes('Request Approved'))).toBe(true);
-    expect(hasUiaPeriod(htmls)).toBe(true);
-    expect(hasLoginNoPeriod(htmls)).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_MISSING_BODY))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_CREDENTIALS_DESC))).toBe(true);
     expect(htmls.some((h) => h.includes(UIA_EXPIRED_BODY))).toBe(true);
   });
 
   for (let i = 0; i < 8; i++) {
-    it(`Cancelled ∥ OIDC approve ∥ period ∥ no-period flood-${i}`, async () => {
+    it(`mismatch ∥ OIDC approve ∥ Missing ∥ credentials flood-${i}`, async () => {
       const cache = mockKv();
-      seedClient(cache, 'cid-1');
-      seedUiaSession(cache, `uia-cancel-${i}`);
+      seedUiaSession(cache, `uia-mm-${i}`);
       seedUiaSession(cache, `uia-oidc-${i}`, { user_id: OIDC_ID });
-      seedUiaSession(cache, `uia-bad-${i}`);
-      const sessions = mockKv();
-      seedAuthRequest(sessions, `ar-bad-${i}`);
+      seedUiaSession(cache, `uia-cred-${i}`);
       const env = makeEnv({
         cache,
-        sessions,
         db: aliceDb(undefined, [OIDC_ID]),
       });
       const results = await Promise.all([
         request(
           '/oauth/authorize/uia',
           formInit({
-            session: `uia-cancel-${i}`,
-            username: 'alice',
-            password: 'secret',
-            action: 'cancel',
+            session: `uia-mm-${i}`,
+            username: 'bob',
+            password: 'bobpass',
           }),
           env
         ),
@@ -857,43 +896,34 @@ describe('duodenary oauth Cancelled∥OIDC-approve∥period∥no-period after #3
           }),
           env
         ),
+        request('/oauth/authorize/uia', {}, env),
         request(
           '/oauth/authorize/uia',
-          formInit({
-            session: `uia-bad-${i}`,
-            username: 'alice',
-            password: 'wrong',
-          }),
-          env
-        ),
-        request(
-          '/oauth/authorize',
-          formInit({
-            username: 'alice',
-            password: `bad-${i}`,
-            auth_request_id: `ar-bad-${i}`,
-          }),
+          formInit(
+            i % 2 === 0
+              ? { session: `uia-cred-${i}`, password: 'x' }
+              : { session: `uia-cred-${i}`, username: 'alice' }
+          ),
           env
         ),
       ]);
       const htmls = htmlOf(results);
-      expect(htmls.some((h) => h.includes('Request Cancelled'))).toBe(true);
+      expect(htmls.some((h) => h.includes(UIA_ACCOUNT_MISMATCH))).toBe(true);
       expect(htmls.some((h) => h.includes('Request Approved'))).toBe(true);
-      expect(hasUiaPeriod(htmls)).toBe(true);
-      expect(hasLoginNoPeriod(htmls)).toBe(true);
+      expect(htmls.some((h) => h.includes(UIA_MISSING_BODY))).toBe(true);
+      expect(htmls.some((h) => h.includes(UIA_CREDENTIALS_DESC))).toBe(true);
     });
   }
 
-  it('mismatch∥Expired∥cross-signing∥Cancelled∥OIDC∥period mega race', async () => {
+  it('Username∥Cancelled∥default∥mismatch∥OIDC∥Missing mega race', async () => {
     const cache = mockKv();
     seedClient(cache, 'cid-1');
-    seedUiaSession(cache, 'uia-mm');
-    seedUiaSession(cache, 'uia-xr');
+    seedUiaSession(cache, 'uia-cred');
     seedUiaSession(cache, 'uia-cancel');
+    seedUiaSession(cache, 'uia-def');
+    seedUiaSession(cache, 'uia-mm');
     seedUiaSession(cache, 'uia-oidc', { user_id: OIDC_ID });
-    seedUiaSession(cache, 'uia-bad');
     const sessions = mockKv();
-    seedAuthRequest(sessions, 'ar-bad');
     const env = makeEnv({
       cache,
       sessions,
@@ -902,13 +932,7 @@ describe('duodenary oauth Cancelled∥OIDC-approve∥period∥no-period after #3
     const results = await Promise.all([
       request(
         '/oauth/authorize/uia',
-        formInit({ session: 'uia-mm', username: 'bob', password: 'bobpass' }),
-        env
-      ),
-      request('/oauth/authorize/uia?session=gone', {}, env),
-      request(
-        '/oauth/authorize/uia?session=uia-xr&action=org.matrix.cross_signing_reset',
-        {},
+        formInit({ session: 'uia-cred', password: 'x' }),
         env
       ),
       request(
@@ -921,24 +945,25 @@ describe('duodenary oauth Cancelled∥OIDC-approve∥period∥no-period after #3
         }),
         env
       ),
+      request('/oauth/authorize/uia?session=uia-def', {}, env),
+      request(
+        '/oauth/authorize/uia',
+        formInit({ session: 'uia-mm', username: 'bob', password: 'bobpass' }),
+        env
+      ),
       request(
         '/oauth/authorize/uia',
         formInit({ session: 'uia-oidc', username: 'oidc', password: 'x' }),
         env
       ),
-      request(
-        '/oauth/authorize/uia',
-        formInit({ session: 'uia-bad', username: 'alice', password: 'wrong' }),
-        env
-      ),
+      request('/oauth/authorize/uia', {}, env),
     ]);
     const htmls = htmlOf(results);
-    expect(htmls.some((h) => h.includes(UIA_ACCOUNT_MISMATCH))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_EXPIRED_BODY))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_CROSS_SIGNING_DESC))).toBe(true);
-    expect(htmls.some((h) => h.includes(UIA_SENSITIVE))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_USERNAME_REQUIRED))).toBe(true);
     expect(htmls.some((h) => h.includes('Request Cancelled'))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_DEFAULT_DESC))).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_ACCOUNT_MISMATCH))).toBe(true);
     expect(htmls.some((h) => h.includes('Request Approved'))).toBe(true);
-    expect(hasUiaPeriod(htmls)).toBe(true);
+    expect(htmls.some((h) => h.includes(UIA_MISSING_BODY))).toBe(true);
   });
 });
