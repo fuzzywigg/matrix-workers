@@ -13,7 +13,7 @@ I was assisted by Claude Code Opus 4.5 for this implementation to speed up showi
 
 ## Live Demo
 
-A live instance is running at `m.easydemo.org`. You can verify federation compatibility using the [Matrix Federation Tester](https://federationtester.matrix.org/#m.easydemo.org) or view the [full JSON report](https://federationtester.matrix.org/api/report?server_name=m.easydemo.org).
+This fork's live instance is at `matrix.fuzzywigg.com` (upstream demo: `m.easydemo.org`). You can verify federation compatibility using the [Matrix Federation Tester](https://federationtester.matrix.org/#matrix.fuzzywigg.com) or view the [full JSON report](https://federationtester.matrix.org/api/report?server_name=matrix.fuzzywigg.com).
 
 ## Quick Start
 
@@ -63,7 +63,7 @@ For 3PID email verification support, configure [Cloudflare Email Service](https:
 
 ```bash
 npx wrangler secret put EMAIL_FROM
-# Example: noreply@m.easydemo.org
+# Example: noreply@matrix.fuzzywigg.com
 ```
 
 ## Spec Compliance
@@ -234,7 +234,7 @@ The following endpoints were added to achieve full Matrix Specification v1.17 co
 
 ## Admin Dashboard
 
-Access the admin dashboard at `/admin` on your server (e.g., `https://m.easydemo.org/admin`).
+Access the admin dashboard at `/admin` on your server (e.g., `https://matrix.fuzzywigg.com/admin`).
 
 **Features:**
 - **Dashboard** - Server stats, activity charts, user breakdown visualization
@@ -328,7 +328,7 @@ Tested with:
 - Element X (Android)
 
 Federation tested with:
-- matrix.org ([view test results](https://federationtester.matrix.org/api/report?server_name=m.easydemo.org))
+- matrix.org ([view test results](https://federationtester.matrix.org/api/report?server_name=matrix.fuzzywigg.com))
 
 ## Limitations
 
