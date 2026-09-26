@@ -15,9 +15,10 @@ npm run typecheck        # TypeScript type checking (tsc --noEmit)
 npm run lint             # ESLint on src/ and test/
 npm run test             # Vitest (single run)
 npm run worker:check     # wrangler deploy --dry-run (bundle without upload)
-npm run db:migrate       # Run D1 migrations (remote)
-npm run db:migrate:local # Run D1 migrations (local)
+npm run db:migrate       # Apply migrations/schema.sql only (remote; not 002–019)
+npm run db:migrate:local # Apply migrations/schema.sql only (local; not 002–019)
 ```
+Numbered files `migrations/002_*.sql` … `migrations/019_*.sql` are separate — see `DEPLOY.md` / `scripts/setup.sh`.
 
 ## Architecture
 
