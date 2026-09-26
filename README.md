@@ -277,7 +277,6 @@ npm run db:migrate:local
 ```
 Numbered files `migrations/002_*.sql` … `migrations/019_*.sql` are separate — see `DEPLOY.md` / `scripts/setup.sh`.
 
-
 ## Cloudflare Bindings
 
 | Binding | Type | Purpose |
