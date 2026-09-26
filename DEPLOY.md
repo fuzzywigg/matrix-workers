@@ -131,8 +131,8 @@ For `smtp.eth` — this requires an ENS text record or an HTTP gateway that serv
 | Resource | Free Tier | Paid ($5/mo plan) |
 |---|---|---|
 | Workers | 100K req/day | No daily limit |
-| D1 reads | 5M/day | 25M+/day |
-| D1 writes | 100K/day | 50M+/day |
+| D1 reads | 5M/day | 25 billion/month |
+| D1 writes | 100K/day | 50M/month |
 | KV reads | 100K/day | 10M/month |
 | KV writes | 1K/day | 1M/month |
 | R2 storage | 10GB | 10GB + $0.015/GB |
