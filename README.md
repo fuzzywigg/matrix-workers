@@ -335,7 +335,7 @@ Federation tester (look for `"FederationOK": true`):
 
 | Constraint | Limit | Notes |
 |------------|-------|-------|
-| Worker CPU | 30s | Use Workflows for long operations |
+| Worker CPU time | Free: 10 ms; Paid: 5 min | Cloudflare CPU-time limits (not wall-clock). `waitUntil` may continue ~30s after the response; use Workflows for long operations |
 | Worker Memory | 128MB | Stream large responses |
 | D1 Database | 10GB | Archive old events if needed |
 | R2 Object | 5GB | Chunked upload supported |
