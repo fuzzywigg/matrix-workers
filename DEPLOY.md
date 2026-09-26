@@ -130,7 +130,7 @@ For `smtp.eth` — this requires an ENS text record or an HTTP gateway that serv
 
 | Resource | Free Tier | Paid ($5/mo plan) |
 |---|---|---|
-| Workers | 100K req/day | 10M req/day |
+| Workers | 100K req/day | No daily limit |
 | D1 reads | 5M/day | 25M+/day |
 | D1 writes | 100K/day | 50M+/day |
 | KV reads | 100K/day | 10M/day |
