@@ -327,8 +327,9 @@ Tested with:
 - Element X (iOS)
 - Element X (Android)
 
-Federation tested with:
-- matrix.org ([view test results](https://federationtester.matrix.org/api/report?server_name=matrix.fuzzywigg.com))
+Federation tester (look for `"FederationOK": true`):
+- This fork: [matrix.fuzzywigg.com report](https://federationtester.matrix.org/api/report?server_name=matrix.fuzzywigg.com) — currently `"FederationOK": false` (federation key hygiene is HITL; do not treat the link as a pass)
+- Upstream demo: [m.easydemo.org report](https://federationtester.matrix.org/api/report?server_name=m.easydemo.org) — currently `"FederationOK": true`
 
 ## Limitations
 
