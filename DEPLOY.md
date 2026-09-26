@@ -7,7 +7,7 @@ This guide covers deploying a personal Matrix homeserver to your own Cloudflare 
 - Cloudflare account (free tier works for small personal deployments)
 - Wrangler CLI: `npm install -g wrangler && wrangler login`
 - Domain with Cloudflare DNS (e.g., `matrix.fuzzywigg.com`)
-- Node.js 20+
+- Node.js 22+ (matches `package.json` `engines.node` and CI)
 
 ## Step 1: Clone and Install
 

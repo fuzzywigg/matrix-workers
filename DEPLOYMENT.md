@@ -133,9 +133,9 @@ For more control, deploy manually using the steps below.
    - Required for Durable Objects, which are essential for real-time sync
    - Sign up at [cloudflare.com](https://cloudflare.com)
 
-2. **Node.js 18+**
+2. **Node.js 22+** (matches `package.json` `engines.node` and CI)
    ```bash
-   node --version  # Should be v18.0.0 or higher
+   node --version  # Should be v22.0.0 or higher
    ```
 
 3. **Wrangler CLI**
