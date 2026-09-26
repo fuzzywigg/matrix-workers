@@ -272,9 +272,11 @@ npm run typecheck
 # Run tests
 npm run test
 
-# Apply migrations locally
+# Apply migrations/schema.sql only (local; not 002–019)
 npm run db:migrate:local
 ```
+Numbered files `migrations/002_*.sql` … `migrations/019_*.sql` are separate — see `DEPLOY.md` / `scripts/setup.sh`.
+
 
 ## Cloudflare Bindings
 
