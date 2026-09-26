@@ -337,7 +337,7 @@ Federation tester (look for `"FederationOK": true`):
 |------------|-------|-------|
 | Worker CPU time | Free: 10 ms; Paid: 5 min | Cloudflare CPU-time limits (not wall-clock). `waitUntil` may continue ~30s after the response; use Workflows for long operations |
 | Worker Memory | 128MB | Stream large responses |
-| D1 Database | 10GB | Archive old events if needed |
+| D1 Database | Free: 500 MB; Paid: 10 GB | Per-database max size (Cloudflare D1 limits). Archive or shard if needed |
 | R2 Object | 5GB | Chunked upload supported |
 | KV Value | 25MB | Split large datasets |
 
