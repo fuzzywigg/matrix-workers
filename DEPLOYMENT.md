@@ -126,8 +126,10 @@ For more control, deploy manually using the steps below.
 
 ### Required
 
-1. **Cloudflare Account** with Workers Paid plan ($5/month)
-   - Required for Durable Objects, which are essential for real-time sync
+1. **Cloudflare Account** (Workers Free is enough for this repo)
+   - Durable Objects are essential for real-time sync. This codebase declares them with `new_sqlite_classes` (SQLite-backed), which Workers Free can create and use — same fact as `DEPLOY.md` Cost Estimate and the README Durable Object Migrations note
+   - Legacy `new_classes` (KV-backed) DOs require Workers Paid and are not what this tree uses
+   - Upgrade to Workers Paid ($5/month) only if you need higher request/storage limits
    - Sign up at [cloudflare.com](https://cloudflare.com)
 
 2. **Node.js 22+** (matches `package.json` `engines.node` and CI)
@@ -494,8 +496,7 @@ npx wrangler secret put OIDC_ENCRYPTION_KEY
 
 ### "Workers Paid plan required"
 
-Durable Objects require the Workers Paid plan ($5/month). Upgrade at:
-Cloudflare Dashboard → Workers & Pages → Plans
+That message usually means a Durable Object class was declared with legacy `new_classes` (KV-backed), which requires Workers Paid. This repo uses `new_sqlite_classes` only — Workers Free can run those (see Prerequisites and README Durable Object Migrations). If you hit this after editing `wrangler.jsonc` migrations, switch back to `new_sqlite_classes`. Upgrade at Cloudflare Dashboard → Workers & Pages → Plans only for higher limits, not to unlock this stack.
 
 ### "Database not found"
 
