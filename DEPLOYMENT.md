@@ -70,18 +70,15 @@ cd matrix-workers
 # Authenticate wrangler
 npx wrangler login
 
-# Run all migrations in order
+# Run base schema, then numbered migrations 002–019 in order
 npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/schema.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/002_phase1_e2ee.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/003_account_management.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/004_reports_and_notices.sql
-# Note: Two migrations share the 005 prefix (both must be run)
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/005_server_config.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/005_idp_providers.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/006_query_optimization.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/007_secure_server_keys.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/008_federation_transactions.sql
+for f in $(ls migrations/0*.sql | sort); do
+  npx wrangler d1 execute YOUR_DB_NAME --remote --file="$f"
+done
 ```
+
+(Note: two files share the `005` prefix and two share `017` — the loop runs all of them. Stopping at `008_*` leaves later tables such as appservice, FTS, and admin audit missing.)
+
 
 #### 3. Configure Custom Domain
 
@@ -321,17 +318,14 @@ Apply all migrations to your D1 database:
 ```bash
 # Replace 'my-matrix-db' with your actual database name
 
+# Base schema, then numbered migrations 002–019 in order
 npx wrangler d1 execute my-matrix-db --remote --file=migrations/schema.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/002_phase1_e2ee.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/003_account_management.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/004_reports_and_notices.sql
-# Note: Two migrations share the 005 prefix (both must be run)
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/005_server_config.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/005_idp_providers.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/006_query_optimization.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/007_secure_server_keys.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/008_federation_transactions.sql
+for f in $(ls migrations/0*.sql | sort); do
+  npx wrangler d1 execute my-matrix-db --remote --file="$f"
+done
 ```
+
+(Note: two files share the `005` prefix and two share `017` — the loop runs all of them. The tree currently includes files through `019_admin_audit_log.sql`; an explicit list that stops at `008_*` is incomplete.)
 
 Each migration should complete with "success": true.
 
