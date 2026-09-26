@@ -14,6 +14,36 @@ permissions:
   contents: read
 
 jobs:
+  # Fail if package.json engines.node is missing or its major does not match
+  # the Node major installed by setup-node (keeps engines ↔ CI in lockstep).
+  engines-node:
+    name: Engines Node Assert
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Assert package.json engines.node major matches setup-node
+        run: |
+          set -euo pipefail
+          ENGINES="$(jq -r '.engines.node // empty' package.json)"
+          if [ -z "$ENGINES" ]; then
+            echo "FAIL: package.json engines.node is missing"
+            exit 1
+          fi
+          ENG_MAJOR="$(printf '%s' "$ENGINES" | grep -oE '[0-9]+' | head -1)"
+          if [ -z "$ENG_MAJOR" ]; then
+            echo "FAIL: cannot parse major from engines.node=$ENGINES"
+            exit 1
+          fi
+          RUNTIME_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
+          if [ "$ENG_MAJOR" != "$RUNTIME_MAJOR" ]; then
+            echo "FAIL: engines.node major $ENG_MAJOR != setup-node major $RUNTIME_MAJOR (v$(node -v))"
+            exit 1
+          fi
+          echo "OK: engines.node=$ENGINES matches Node $(node -v)"
+
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest
