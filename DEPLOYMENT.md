@@ -23,7 +23,7 @@ Complete guide to deploying your own Matrix homeserver on Cloudflare Workers.
 
 The fastest way to deploy is using the Deploy to Cloudflare button:
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nkuntz1934/matrix-workers)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/fuzzywigg/matrix-workers)
 
 ### What the Deploy Button Does
 
@@ -158,7 +158,7 @@ For more control, deploy manually using the steps below.
 ## Step 1: Clone and Install
 
 ```bash
-git clone https://github.com/nkuntz1934/matrix-workers
+git clone https://github.com/fuzzywigg/matrix-workers
 cd matrix-workers
 npm install
 ```
@@ -571,6 +571,6 @@ Your deployed Matrix server uses:
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/nkuntz1934/matrix-workers/issues)
+- **Issues**: [GitHub Issues](https://github.com/fuzzywigg/matrix-workers/issues)
 - **Matrix Spec**: [spec.matrix.org](https://spec.matrix.org)
 - **Cloudflare Docs**: [developers.cloudflare.com](https://developers.cloudflare.com)
