@@ -1,0 +1,5 @@
+{
+  "name": "matrix-workers",
+  "install": "npm ci",
+  "start": "npm test"
+}
