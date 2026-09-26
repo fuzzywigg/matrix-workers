@@ -136,7 +136,7 @@ For `smtp.eth` — this requires an ENS text record or an HTTP gateway that serv
 | KV reads | 100K/day | 10M/month |
 | KV writes | 1K/day | 1M/month |
 | R2 storage | 10GB | 10GB + $0.015/GB |
-| R2 reads | 1M/month | 10M/month |
+| R2 Class B (reads) | 10M/month | 10M/month |
 
 **Verdict**: Free tier is suitable for personal/family use with a few active users. Upgrade to $5/mo Workers Paid if you plan to run a small community.
 
