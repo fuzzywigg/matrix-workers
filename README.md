@@ -338,7 +338,7 @@ Federation tester (look for `"FederationOK": true`):
 | Worker CPU time | Free: 10 ms; Paid: 5 min | Cloudflare CPU-time limits (not wall-clock). `waitUntil` may continue ~30s after the response; use Workflows for long operations |
 | Worker Memory | 128MB | Stream large responses |
 | D1 Database | Free: 500 MB; Paid: 10 GB | Per-database max size (Cloudflare D1 limits). Archive or shard if needed |
-| R2 Object | 5GB | Chunked upload supported |
+| R2 Object | Single-part: 5 GiB; Multipart: 5 TiB | Cloudflare R2 platform max. This homeserver media API caps uploads at 50 MB (`MAX_UPLOAD_SIZE`); no multipart chunked upload |
 | KV Value | 25MB | Split large datasets |
 
 ## License
