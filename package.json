@@ -25,8 +25,8 @@
     "worker:check": "wrangler deploy --dry-run --outdir=.wrangler-dry-run"
   },
   "dependencies": {
-    "@cloudflare/workers-types": "^5.20261028.1",
-    "hono": "^4.13.14",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "hono": "^4.13.16",
     "uuid": "^14.0.3"
   },
   "devDependencies": {
@@ -34,7 +34,7 @@
     "@typescript-eslint/parser": "^8.70.0",
     "eslint": "^9.39.5",
     "typescript": "^6.0.3",
-    "vitest": "^5.0.5",
-    "wrangler": "^4.155.0"
+    "vitest": "^5.1.0",
+    "wrangler": "^4.157.0"
   }
 }
